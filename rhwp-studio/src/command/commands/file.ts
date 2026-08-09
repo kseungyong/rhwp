@@ -48,6 +48,7 @@ import {
 import { openDocumentViaPicker } from '../file-open-picker';
 import { getFileSystemWindow } from '@/command/desktop-file-system';
 import { singleFlight } from '@/command/single-flight';
+import { logLifecycle } from '@/core/diagnostics-log';
 import { PdfPrintDialog } from '@/ui/pdf-print-dialog';
 import { userSettings } from '@/core/user-settings';
 import { showToast } from '@/ui/toast';
@@ -210,6 +211,13 @@ function completeHandleSave(
   services.wasm.fileName = result.fileName;
   services.wasm.requiresPasswordForSave = passwordProtected;
   services.documentState.markClean(reason);
+  // 진단 로그. 파일명·경로는 넣지 않는다 — 어떤 경로로 저장됐는지(method)와 형식만 남긴다.
+  logLifecycle('document-save', {
+    reason,
+    format: sourceFormat,
+    method: result.method,
+    passwordProtected,
+  });
 }
 
 function downloadBlob(blob: Blob, fileName: string): void {

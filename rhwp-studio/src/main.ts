@@ -33,6 +33,7 @@ import { showLocalFontsModalIfNeeded } from '@/ui/local-fonts-modal';
 import { showToast } from '@/ui/toast';
 import { addRecentDoc, listRecentDocs } from '@/recent/recent-store';
 import { setupDesktopFileOpen } from '@/core/desktop-file-open';
+import { installDiagnosticsLog, logLifecycle } from '@/core/diagnostics-log';
 import { showDropConfirmDialog } from '@/ui/drop-confirm-dialog';
 import { showHwpPasswordDialog } from '@/ui/hwp-password-dialog';
 import { initRhwpDev } from '@/core/rhwp-dev';
@@ -493,6 +494,19 @@ async function initialize(): Promise<void> {
     setupZoomControls();
     setupEventListeners();
     setupGlobalShortcuts();
+    // 진단 로그 퍼널을 가장 먼저 건다 — 이후 초기화에서 나는 오류부터 파일에 남아야 한다.
+    void installDiagnosticsLog().then((installed) => {
+      if (!installed) return;
+      // 세션 헤더. 진단의 절반이 이 한 줄에서 나온다. 문서 관련 값은 넣지 않는다.
+      logLifecycle('session', {
+        appVersion: __APP_VERSION__,
+        userAgent: navigator.userAgent,
+        renderBackend: renderBackendRequest.backend,
+        renderFallback: renderBackendFallbackReason ?? 'none',
+        language: navigator.language,
+      });
+    });
+
     // 데스크톱(Tauri)에서 .hwp/.hwpx 더블클릭으로 전달된 문서를 연다. 웹에서는 no-op.
     const desktopLaunchDocument = setupDesktopFileOpen(
       (payload) => eventBus.emit('open-document-bytes', payload),
@@ -1125,6 +1139,13 @@ async function loadBytes(
   const elapsed = performance.now() - startTime;
   await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`, {
     suppressDialogs: options.suppressDialogs,
+  });
+  // 진단 로그. 파일명은 넣지 않는다 — 구조 정보만으로 충분하고, 문서에서 온 값은 남기지 않는다.
+  logLifecycle('document-open', {
+    format: wasm.getSourceFormat(),
+    bytes: data.byteLength,
+    pages: docInfo.pageCount,
+    ms: Math.round(elapsed),
   });
 }
 

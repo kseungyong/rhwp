@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tauri::ipc::{InvokeBody, Request};
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Runtime, State};
 use tauri_plugin_fs::FsExt;
 
 /// 발급된 저장 토큰 → 대상 경로.

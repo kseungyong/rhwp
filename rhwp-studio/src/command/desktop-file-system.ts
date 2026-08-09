@@ -169,6 +169,16 @@ const tauriPluginBridge: TauriFileSystemBridge = {
   },
 };
 
+/**
+ * 경로 하나로 데스크톱 파일 핸들을 만든다.
+ *
+ * 다이얼로그를 거치지 않고 경로가 먼저 주어지는 경우(파일 연결로 실행, 최근 문서 등)에 쓴다.
+ * 해당 경로가 fs 스코프에 등록돼 있어야 읽기가 성공한다 — 등록은 경로를 건네는 쪽 책임이다.
+ */
+export function createDesktopFileHandle(path: string): DesktopFileHandle {
+  return new DesktopFileHandle(path, tauriPluginBridge);
+}
+
 /** 데스크톱용 `FileSystemWindowLike` 구현체를 만든다. */
 export function createDesktopFileSystemWindow(
   bridge: TauriFileSystemBridge = tauriPluginBridge,

@@ -32,6 +32,7 @@ import { showHmlImportWarning } from '@/ui/hml-import-warning';
 import { showLocalFontsModalIfNeeded } from '@/ui/local-fonts-modal';
 import { showToast } from '@/ui/toast';
 import { addRecentDoc, listRecentDocs } from '@/recent/recent-store';
+import { setupDesktopFileOpen } from '@/core/desktop-file-open';
 import { showDropConfirmDialog } from '@/ui/drop-confirm-dialog';
 import { showHwpPasswordDialog } from '@/ui/hwp-password-dialog';
 import { initRhwpDev } from '@/core/rhwp-dev';
@@ -492,8 +493,13 @@ async function initialize(): Promise<void> {
     setupZoomControls();
     setupEventListeners();
     setupGlobalShortcuts();
+    // 데스크톱(Tauri)에서 .hwp/.hwpx 더블클릭으로 전달된 문서를 연다. 웹에서는 no-op.
+    const desktopLaunchDocument = setupDesktopFileOpen(
+      (payload) => eventBus.emit('open-document-bytes', payload),
+      (error) => showLoadError(error),
+    );
     void loadFromUrlParam();
-    void offerAutosaveRecoveryIfIdle();
+    void offerAutosaveRecoveryIfIdle(desktopLaunchDocument);
     installPwaFileHandling(window as FileHandlingWindowLike, {
       openDocumentBytes(payload) {
         eventBus.emit('open-document-bytes', payload);
@@ -1195,8 +1201,13 @@ function shouldSkipInitialAutosaveRecovery(): boolean {
   return params.has('url');
 }
 
-async function offerAutosaveRecoveryIfIdle(): Promise<void> {
+async function offerAutosaveRecoveryIfIdle(
+  desktopLaunchDocument: Promise<boolean> = Promise.resolve(false),
+): Promise<void> {
   if (shouldSkipInitialAutosaveRecovery()) return;
+  // 파일 연결(.hwp 더블클릭)로 시작한 경우 복구 제안을 건너뛴다. 문서 로드는 비동기라
+  // 아래 pageCount 검사만으로는 늦다 — 복구본이 더블클릭한 문서를 덮어쓴다.
+  if (await desktopLaunchDocument) return;
 
   try {
     const drafts = (await listAutosaveDrafts()).filter((draft) => draft.data.byteLength > 0);

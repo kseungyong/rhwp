@@ -28,7 +28,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -42,25 +44,14 @@
     "resources": {
       "packaging/cert/rhwp-studio-cert.cer": "rhwp-studio-cert.cer"
     },
-    "fileAssociations": [
-      {
-        "ext": ["hwp"],
-        "name": "HWP Document",
-        "description": "아래한글 HWP 문서",
-        "role": "Editor"
-      },
-      {
-        "ext": ["hwpx"],
-        "name": "HWPX Document",
-        "description": "아래한글 HWPX 문서",
-        "role": "Editor"
-      }
-    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
         "installerHooks": "packaging/installer-hooks.nsh",
-        "languages": ["Korean", "English"],
+        "languages": [
+          "Korean",
+          "English"
+        ],
         "displayLanguageSelector": false
       },
       "webviewInstallMode": {

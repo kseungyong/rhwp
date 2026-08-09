@@ -15,6 +15,11 @@ import {
   type LocalFontState,
 } from '@/core/local-fonts';
 import type { EventBus } from '@/core/event-bus';
+import {
+  isFileAssociationEnabled,
+  isFileAssociationSupported,
+  setFileAssociation,
+} from '@/core/desktop-file-association';
 
 export class OptionsDialog extends ModalDialog {
   private showRecentCheck!: HTMLInputElement;
@@ -24,6 +29,9 @@ export class OptionsDialog extends ModalDialog {
   private idleSaveEnabledCheck!: HTMLInputElement;
   private idleDelayInput!: HTMLInputElement;
   private pdfPrintGuidanceCheck!: HTMLInputElement;
+  private fileAssocCheck: HTMLInputElement | null = null;
+  /** 대화상자를 열 때의 연결 상태. 바뀐 경우에만 레지스트리를 건드린다. */
+  private fileAssocInitial = false;
 
   constructor(private readonly eventBus?: EventBus) {
     super('환경 설정', 480);
@@ -328,7 +336,56 @@ export class OptionsDialog extends ModalDialog {
     pdfSection.appendChild(pdfRow);
     panel.appendChild(pdfSection);
 
+    panel.appendChild(this.createFileAssociationSection());
+
     return panel;
+  }
+
+  /**
+   * 파일 연결 섹션 — 데스크톱에서만 보인다.
+   *
+   * 지원 여부와 현재 상태는 셸에 물어야 알 수 있어 비동기다. 대화상자 본문은 동기로 만들어야
+   * 하므로 섹션을 숨긴 채 만들고, 확인되면 그때 드러낸다. 웹에서는 끝까지 숨은 상태로 남는다.
+   */
+  private createFileAssociationSection(): HTMLElement {
+    const section = document.createElement('div');
+    section.className = 'dialog-section';
+    section.hidden = true;
+
+    const title = document.createElement('div');
+    title.className = 'dialog-section-title';
+    title.textContent = '파일 연결';
+    section.appendChild(title);
+
+    const desc = document.createElement('p');
+    desc.className = 'opt-desc';
+    desc.textContent =
+      '탐색기에서 .hwp/.hwpx 파일을 더블클릭하면 RHWP Studio로 엽니다. 끄면 이전에 연결돼 있던 프로그램으로 되돌립니다. 이 설정은 현재 사용자에게만 적용됩니다.';
+    section.appendChild(desc);
+
+    const row = document.createElement('div');
+    row.className = 'dialog-row opt-row';
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.id = 'opt-file-association';
+    this.fileAssocCheck = check;
+
+    const label = document.createElement('label');
+    label.htmlFor = check.id;
+    label.textContent = '.hwp / .hwpx 파일을 RHWP Studio로 열기';
+
+    row.append(check, label);
+    section.appendChild(row);
+
+    void (async () => {
+      if (!await isFileAssociationSupported()) return;
+      this.fileAssocInitial = await isFileAssociationEnabled();
+      check.checked = this.fileAssocInitial;
+      section.hidden = false;
+    })();
+
+    return section;
   }
 
   protected onConfirm(): void {
@@ -345,6 +402,20 @@ export class OptionsDialog extends ModalDialog {
     });
     userSettings.setShowPdfPrintGuidance(this.pdfPrintGuidanceCheck.checked);
     this.eventBus?.emit('autosave-settings-changed', { source: 'options-dialog' });
+    this.applyFileAssociationChange();
+  }
+
+  /** 연결 설정이 바뀐 경우에만 레지스트리를 건드린다. 실패하면 사용자에게 알린다. */
+  private applyFileAssociationChange(): void {
+    const check = this.fileAssocCheck;
+    if (!check || check.checked === this.fileAssocInitial) return;
+
+    const enabled = check.checked;
+    void setFileAssociation(enabled).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[options] 파일 연결 변경 실패:', message);
+      alert(`파일 연결을 바꾸지 못했습니다:\n${message}`);
+    });
   }
 }
 

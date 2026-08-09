@@ -1,4 +1,5 @@
 mod atomic_save;
+mod file_association;
 mod file_open;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -20,6 +21,9 @@ pub fn run() {
       atomic_save::begin_atomic_save,
       atomic_save::commit_atomic_save,
       file_open::take_pending_open_path,
+      file_association::file_association_supported,
+      file_association::file_association_enabled,
+      file_association::set_file_association,
     ])
     // 데스크톱 셸은 File System Access API 대신 네이티브 다이얼로그로 파일을 고른다.
     // WebView2에서 FSA picker도 동작하기는 하지만(2026-08-09 실측), 경로 대신 핸들만

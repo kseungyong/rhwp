@@ -2,6 +2,38 @@ mod atomic_save;
 mod file_association;
 mod file_open;
 
+use tauri::Runtime;
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
+
+/// 진단 로그 플러그인.
+///
+/// **릴리스 빌드에서도 파일로 남긴다.** 사내 배포판에서 문제가 생기면 직원이 로그 파일 하나만
+/// 보내면 원인을 좁힐 수 있어야 한다 — 예전에는 이 플러그인이 `debug_assertions` 로 감싸여
+/// 있어 릴리스에는 로그가 아예 없었다.
+///
+/// 레벨을 `Info` 로 여는 것은 의도적이다. 세션 헤더와 문서 열기·저장 결과가 INFO 인데,
+/// 여기서 `Warn` 으로 자르면 그것들이 기록 단계에서 통째로 버려진다. **볼륨 억제는 프론트엔드
+/// 게이트에서 한다**(`src/core/diagnostics-log.ts`) — 무엇을 보낼지는 보내는 쪽이 정하고,
+/// 여기서는 받은 것을 기록한다.
+fn build_log_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
+  let mut targets = vec![Target::new(TargetKind::LogDir {
+    file_name: Some("rhwp-studio".into()),
+  })];
+  if cfg!(debug_assertions) {
+    targets.push(Target::new(TargetKind::Stdout));
+  }
+
+  tauri_plugin_log::Builder::default()
+    .targets(targets)
+    // 파일당 2MB × 3개 = 최대 약 6MB. 사내 배포에서 디스크를 잠식하지 않을 정도로 두되,
+    // 재현까지 며칠 걸리는 문제도 뒤져볼 수 있게 한 세대는 남긴다.
+    .rotation_strategy(RotationStrategy::KeepSome(3))
+    .max_file_size(2 * 1024 * 1024)
+    .timezone_strategy(TimezoneStrategy::UseLocal)
+    .level(log::LevelFilter::Info)
+    .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -34,14 +66,13 @@ pub fn run() {
     // fs 런타임 스코프에 등록하므로 별도 정적 스코프 설정은 두지 않는다.
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_fs::init())
+    // 진단 로그 폴더를 탐색기로 여는 데 쓴다(도구 > 진단 로그 폴더 열기).
+    .plugin(tauri_plugin_opener::init())
+    .plugin(build_log_plugin())
     .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
+      // 0.8.4 이하 설치 관리자가 등록한 옛 파일 연결을 새 방식으로 옮긴다.
+      // 덮어 설치해도 옛 등록은 자동으로 사라지지 않아, 앱이 기동 시 한 번 정리한다.
+      file_association::migrate_legacy_associations_on_startup();
 
       // 파일 연결로 실행된 경우의 문서 경로. 웹뷰가 아직 이벤트를 들을 수 없으므로
       // 대기열에 넣고, 프론트엔드가 준비된 뒤 take_pending_open_path 로 가져간다.

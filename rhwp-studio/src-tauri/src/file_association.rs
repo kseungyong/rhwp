@@ -26,6 +26,30 @@ mod windows_impl {
 
     const BACKUP_VALUE: &str = "RhwpStudio_backup";
 
+    /// 0.8.4 이하의 설치 관리자(NSIS `APP_ASSOCIATE`)가 등록하던 ProgID.
+    /// `(확장자, 옛 ProgID, 옛 백업 값 이름)`.
+    const LEGACY_PROG_IDS: [(&str, &str, &str); 2] = [
+        ("hwp", "HWP Document", "HWP Document_backup"),
+        ("hwpx", "HWPX Document", "HWPX Document_backup"),
+    ];
+
+    /// 옛 ProgID 가 우리 것인지 판별하는 표지. 설치 경로는
+    /// `%LOCALAPPDATA%\RHWP Studio\app.exe` 였다.
+    const LEGACY_COMMAND_MARKER: &str = r"\rhwp studio\app.exe";
+
+    /// 옛 등록 처리 결과. 테스트가 분기별로 확인한다.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LegacyOutcome {
+        /// 옛 등록이 없다.
+        NotFound,
+        /// 이름은 같지만 다른 프로그램의 등록이다 — 건드리지 않았다.
+        NotOurs,
+        /// 새 방식으로 옮겼다(기본값 승계 포함).
+        Migrated,
+        /// 기본값은 이미 남이 가져갔다 — 옛 키만 정리했다.
+        RemovedOnly,
+    }
+
     fn classes() -> std::io::Result<RegKey> {
         RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags("Software\\Classes", KEY_READ | KEY_WRITE)
@@ -105,6 +129,93 @@ mod windows_impl {
         Ok(())
     }
 
+    /// 옛 등록(설치 관리자가 만든 것) 하나를 새 방식으로 옮긴다.
+    ///
+    /// 옛 ProgID 이름(`HWP Document`)은 한컴 같은 다른 제품도 쓸 법한 일반적인 이름이라,
+    /// **이름만 보고 지우면 남의 등록을 파괴한다.** `shell\open\command` 가 우리 설치 경로를
+    /// 가리킬 때만 우리 것으로 판단한다.
+    pub fn migrate_legacy_one(
+        classes: &RegKey,
+        ext: &str,
+        legacy_id: &str,
+        legacy_backup: &str,
+        prog_id: &str,
+        description: &str,
+        exe: &Path,
+    ) -> LegacyOutcome {
+        let Ok(legacy_key) = classes.open_subkey(legacy_id) else {
+            return LegacyOutcome::NotFound;
+        };
+
+        let command = legacy_key
+            .open_subkey("shell\\open\\command")
+            .and_then(|k| k.get_value::<String, _>(""))
+            .unwrap_or_default()
+            .to_lowercase();
+        if !command.contains(LEGACY_COMMAND_MARKER) {
+            return LegacyOutcome::NotOurs;
+        }
+
+        // 옛 키가 들고 있던 "진짜 원본" 값. 이걸 새 백업으로 승계해야, 나중에 사용자가
+        // 설정에서 껐을 때 이미 삭제된 옛 ProgID 로 복원되는 사고를 막는다.
+        let original = classes
+            .open_subkey(format!(".{ext}"))
+            .and_then(|k| k.get_value::<String, _>(legacy_backup))
+            .unwrap_or_default();
+
+        let owns_default = current_prog_id(classes, ext) == legacy_id;
+        let outcome = if owns_default {
+            // 사용자는 지금 이 연결을 쓰고 있다. 끊지 말고 새 방식으로 옮긴다.
+            if register(classes, ext, prog_id, description, exe).is_err() {
+                return LegacyOutcome::NotOurs;
+            }
+            if let Ok(ext_key) =
+                classes.open_subkey_with_flags(format!(".{ext}"), KEY_READ | KEY_WRITE)
+            {
+                let _ = ext_key.set_value(BACKUP_VALUE, &original);
+            }
+            LegacyOutcome::Migrated
+        } else {
+            // 그 사이 다른 프로그램이 기본값을 가져갔다 — 기본값은 그대로 두고 잔재만 지운다.
+            LegacyOutcome::RemovedOnly
+        };
+
+        if let Ok(ext_key) = classes.open_subkey_with_flags(format!(".{ext}"), KEY_READ | KEY_WRITE)
+        {
+            let _ = ext_key.delete_value(legacy_backup);
+        }
+        let _ = classes.delete_subkey_all(legacy_id);
+
+        outcome
+    }
+
+    /// 설치 관리자가 남긴 옛 연결을 정리한다. 실패는 무시한다 — 기동을 막지 않는다.
+    pub fn migrate_legacy_associations(exe: &Path) -> Vec<LegacyOutcome> {
+        let Ok(classes) = classes() else {
+            return Vec::new();
+        };
+        let outcomes: Vec<LegacyOutcome> = LEGACY_PROG_IDS
+            .iter()
+            .zip(PROG_IDS.iter())
+            .map(|((ext, legacy_id, legacy_backup), (_, prog_id, description))| {
+                migrate_legacy_one(
+                    &classes,
+                    ext,
+                    legacy_id,
+                    legacy_backup,
+                    prog_id,
+                    description,
+                    exe,
+                )
+            })
+            .collect();
+
+        if outcomes.iter().any(|o| *o != LegacyOutcome::NotFound) {
+            notify_shell();
+        }
+        outcomes
+    }
+
     /// 탐색기에 연결 변경을 알린다. 없으면 아이콘·기본 프로그램이 한동안 갱신되지 않는다.
     fn notify_shell() {
         const SHCNE_ASSOCCHANGED: u32 = 0x0800_0000;
@@ -116,6 +227,153 @@ mod windows_impl {
                 std::ptr::null(),
                 std::ptr::null(),
             );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::path::Path;
+
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::RegKey;
+
+    use super::windows_impl::{migrate_legacy_one, LegacyOutcome};
+
+    const OUR_EXE: &str = r"C:\Users\tester\AppData\Local\RHWP Studio\app.exe";
+
+    /// 실제 HKCU\Software\Classes 를 건드리지 않도록 테스트 전용 하위 트리를 쓴다.
+    struct TestClasses {
+        root: String,
+        key: RegKey,
+    }
+
+    impl TestClasses {
+        fn new(name: &str) -> Self {
+            let root = format!("Software\\RhwpStudioTest\\{name}");
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let _ = hkcu.delete_subkey_all(&root);
+            let (key, _) = hkcu.create_subkey(&root).unwrap();
+            let key = hkcu
+                .open_subkey_with_flags(&root, KEY_READ | KEY_WRITE)
+                .unwrap_or(key);
+            Self { root, key }
+        }
+
+        /// 옛 설치 관리자가 만들던 모양 그대로 등록한다.
+        fn seed_legacy(&self, ext: &str, legacy_id: &str, backup_name: &str, command: &str, original: &str) {
+            let (ext_key, _) = self.key.create_subkey(format!(".{ext}")).unwrap();
+            ext_key.set_value("", &legacy_id).unwrap();
+            ext_key.set_value(backup_name, &original).unwrap();
+            let (class_key, _) = self.key.create_subkey(legacy_id).unwrap();
+            class_key
+                .create_subkey("shell\\open\\command")
+                .unwrap()
+                .0
+                .set_value("", &command)
+                .unwrap();
+        }
+
+        fn ext_value(&self, ext: &str, name: &str) -> String {
+            self.key
+                .open_subkey(format!(".{ext}"))
+                .and_then(|k| k.get_value::<String, _>(name))
+                .unwrap_or_default()
+        }
+
+        fn has_key(&self, name: &str) -> bool {
+            self.key.open_subkey(name).is_ok()
+        }
+    }
+
+    impl Drop for TestClasses {
+        fn drop(&mut self) {
+            let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&self.root);
+        }
+    }
+
+    fn migrate(t: &TestClasses) -> LegacyOutcome {
+        migrate_legacy_one(
+            &t.key,
+            "hwp",
+            "HWP Document",
+            "HWP Document_backup",
+            "RhwpStudio.hwp",
+            "아래한글 HWP 문서",
+            Path::new(OUR_EXE),
+        )
+    }
+
+    #[test]
+    fn 옛_등록이_없으면_아무것도_하지_않는다() {
+        let t = TestClasses::new("none");
+        assert_eq!(migrate(&t), LegacyOutcome::NotFound);
+    }
+
+    #[test]
+    fn 우리_등록이면_새_방식으로_옮기고_원본_백업을_승계한다() {
+        let t = TestClasses::new("migrate");
+        // 설치 전 원래 연결이 한컴이었다고 가정한다.
+        t.seed_legacy("hwp", "HWP Document", "HWP Document_backup",
+            &format!("\"{OUR_EXE}\" \"%1\""), "Hwp.Document.8");
+
+        assert_eq!(migrate(&t), LegacyOutcome::Migrated);
+
+        assert_eq!(t.ext_value("hwp", ""), "RhwpStudio.hwp");
+        // 새 백업은 "HWP Document" 가 아니라 진짜 원본이어야 한다 — 그러지 않으면
+        // 나중에 연결을 끌 때 이미 삭제된 옛 ProgID 로 복원된다.
+        assert_eq!(t.ext_value("hwp", "RhwpStudio_backup"), "Hwp.Document.8");
+        assert_eq!(t.ext_value("hwp", "HWP Document_backup"), "");
+        assert!(!t.has_key("HWP Document"), "옛 ProgID 키가 남았다");
+        assert!(t.has_key("RhwpStudio.hwp"));
+    }
+
+    #[test]
+    fn 다른_프로그램의_같은_이름_등록은_건드리지_않는다() {
+        let t = TestClasses::new("not-ours");
+        t.seed_legacy("hwp", "HWP Document", "HWP Document_backup",
+            r#""C:\Program Files\Hnc\Hwp.exe" "%1""#, "");
+
+        assert_eq!(migrate(&t), LegacyOutcome::NotOurs);
+
+        // 기본값도 ProgID 키도 그대로여야 한다.
+        assert_eq!(t.ext_value("hwp", ""), "HWP Document");
+        assert!(t.has_key("HWP Document"));
+        assert!(!t.has_key("RhwpStudio.hwp"));
+    }
+
+    #[test]
+    fn 기본값을_남이_가져갔으면_잔재만_지운다() {
+        let t = TestClasses::new("removed-only");
+        t.seed_legacy("hwp", "HWP Document", "HWP Document_backup",
+            &format!("\"{OUR_EXE}\" \"%1\""), "");
+        // 그 뒤 다른 프로그램이 기본값을 가져간 상황.
+        let ext_key = t.key.open_subkey_with_flags(".hwp", KEY_READ | KEY_WRITE).unwrap();
+        ext_key.set_value("", &"Hwp.Document.8").unwrap();
+
+        assert_eq!(migrate(&t), LegacyOutcome::RemovedOnly);
+
+        // 남의 기본값을 빼앗지 않는다.
+        assert_eq!(t.ext_value("hwp", ""), "Hwp.Document.8");
+        assert!(!t.has_key("HWP Document"), "옛 ProgID 키가 남았다");
+        assert!(!t.has_key("RhwpStudio.hwp"), "임의로 우리 등록을 만들면 안 된다");
+    }
+}
+
+/// 설치 관리자(0.8.4 이하)가 등록한 옛 파일 연결을 새 방식으로 옮긴다.
+///
+/// 기동 시 한 번 호출한다. 이관 후 옛 키가 사라지므로 다음 기동에는 자동으로 무동작이다.
+/// 실패해도 조용히 넘어간다 — 파일 연결 정리가 앱 기동을 막아서는 안 된다.
+pub fn migrate_legacy_associations_on_startup() {
+    #[cfg(windows)]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        for outcome in windows_impl::migrate_legacy_associations(&exe) {
+            if outcome != windows_impl::LegacyOutcome::NotFound {
+                log::info!("[file-association] 옛 등록 처리: {outcome:?}");
+            }
         }
     }
 }

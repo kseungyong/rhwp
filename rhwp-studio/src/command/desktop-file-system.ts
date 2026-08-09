@@ -49,7 +49,11 @@ export interface TauriFileSystemBridge {
     filters?: { name: string; extensions: string[] }[];
   }): Promise<string | null>;
   readFile(path: string): Promise<Uint8Array>;
-  writeFile(path: string, data: Uint8Array): Promise<void>;
+  /**
+   * 대상 경로를 **원자적으로** 교체한다 — 같은 디렉터리 임시 파일에 기록·flush 후 rename.
+   * 실패하면 원본은 변경되지 않아야 한다. 구현은 `src-tauri/src/atomic_save.rs`.
+   */
+  writeFileAtomic(path: string, data: Uint8Array): Promise<void>;
 }
 
 /** Tauri 런타임(데스크톱 셸) 안에서 실행 중인지 여부. */
@@ -106,8 +110,11 @@ export class DesktopFileHandle implements FileSystemFileHandleLike {
   }
 
   /**
-   * 웹 writable stream과 달리 부분 쓰기를 파일에 바로 흘리지 않는다.
-   * close() 시점에 한 번에 쓴다 — 쓰기 도중 실패해도 원본이 잘린 채 남지 않는다.
+   * 부분 쓰기를 모아 close() 시점에 한 번에 넘기고, 실제 기록은 원자적 교체로 처리한다.
+   *
+   * 모으는 것만으로는 원본이 보호되지 않는다 — 원본 경로에 직접 쓰는 한, 그 쓰기가 도중에
+   * 실패하면 원본이 잘린 채 남는다. 그래서 기록은 임시 파일 경유 교체를 수행하는
+   * `writeFileAtomic` 에 위임한다.
    */
   async createWritable(): Promise<FileSystemWritableFileStreamLike> {
     const chunks: Blob[] = [];
@@ -118,7 +125,7 @@ export class DesktopFileHandle implements FileSystemFileHandleLike {
       },
       async close(): Promise<void> {
         const merged = new Blob(chunks);
-        await bridge.writeFile(path, new Uint8Array(await merged.arrayBuffer()));
+        await bridge.writeFileAtomic(path, new Uint8Array(await merged.arrayBuffer()));
       },
     };
   }
@@ -151,9 +158,14 @@ const tauriPluginBridge: TauriFileSystemBridge = {
     const { readFile } = await import('@tauri-apps/plugin-fs');
     return readFile(path);
   },
-  async writeFile(path, data) {
-    const { writeFile } = await import('@tauri-apps/plugin-fs');
-    await writeFile(path, data);
+  async writeFileAtomic(path, data) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // 경로는 헤더에 실을 수 없어(비ASCII 경로가 흔하다) 토큰을 먼저 받고,
+    // 바이트는 raw IPC body 로 보낸다 — JSON 배열 직렬화를 피한다.
+    const token = await invoke<string>('begin_atomic_save', { path });
+    await invoke('commit_atomic_save', data, {
+      headers: { 'x-rhwp-save-token': token },
+    });
   },
 };
 

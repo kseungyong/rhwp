@@ -44,7 +44,7 @@ function createBridge(options: {
       if (!bytes) throw new Error(`no such file: ${path}`);
       return bytes;
     },
-    async writeFile(path, data) {
+    async writeFileAtomic(path, data) {
       bridge.written.set(path, data);
     },
   };
@@ -131,7 +131,7 @@ test('저장 다이얼로그는 제안 파일명을 defaultPath로 넘긴다', a
   }]);
 });
 
-test('writable은 close 시점에 한 번만 경로에 기록한다', async () => {
+test('writable은 close 시점에 원자적 기록 경로로 한 번만 넘긴다', async () => {
   const bridge = createBridge();
   const handle = new DesktopFileHandle('C:\\문서\\출력.hwp', bridge);
 

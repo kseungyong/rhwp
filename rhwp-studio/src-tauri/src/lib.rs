@@ -1,6 +1,15 @@
+mod atomic_save;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // 문서 저장은 fs 플러그인의 writeFile 이 아니라 이 커맨드를 쓴다 — 원본 경로에 직접
+    // 쓰면 쓰기 도중 실패했을 때 원본이 잘린 채 남는다. 자세한 배경은 atomic_save 모듈 주석.
+    .manage(atomic_save::SaveTokens::default())
+    .invoke_handler(tauri::generate_handler![
+      atomic_save::begin_atomic_save,
+      atomic_save::commit_atomic_save,
+    ])
     // 데스크톱 셸은 File System Access API 대신 네이티브 다이얼로그로 파일을 고른다.
     // WebView2에서 FSA picker도 동작하기는 하지만(2026-08-09 실측), 경로 대신 핸들만
     // 주어 저장이 원본 경로 덮어쓰기로 확정되지 않고, 창 단위 "picker active" 플래그

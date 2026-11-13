@@ -153,6 +153,8 @@ export interface NoteEditInfo {
 
 /** 구역 정의 (SectionDef) */
 export interface SectionDef {
+  /** 구역 개요 번호 정의 ID. 생략하면 현재 정의를 유지한다. */
+  outlineNumberingId?: number;
   pageNum: number;
   /** 쪽 번호 종류: 0=이어서, 1=홀수, 2=짝수 (사용자 지정은 pageNum > 0) */
   pageNumType: number;
@@ -169,9 +171,10 @@ export interface SectionDef {
   hideEmptyLine: boolean;
 }
 
-/** 중첩 표 경로 엔트리 (1레벨 = 단일 표, 2레벨 이상 = 중첩 표) */
+/** 표·글상자 편집 경로 엔트리. 각 레벨은 실제 문단을 소유한 컨테이너 하나를 나타낸다. */
 export interface CellPathEntry {
   controlIndex: number;
+  /** 표의 셀 번호. 독립 글상자는 0, 묶음은 원본 자식 순서의 깊이 우선 글상자 번호. */
   cellIndex: number;
   cellParaIndex: number;
 }
@@ -989,6 +992,9 @@ export interface PageLayerTree {
   unit?: 'px';
   coordinateSystem?: string;
   profile?: LayerRenderProfile;
+  /** Print 재생에서 지정된 글자 기하와 clip 장치 포함 정책이다. */
+  rasterTextGeometry?: boolean;
+  rasterClipCoverage?: boolean;
   buildOptions?: {
     showTransparentBorders?: boolean;
     clipEnabled?: boolean;
@@ -1117,7 +1123,7 @@ export interface LayerClipNode {
   visualBounds?: LayerBounds;
   layer?: LayerInfo;
   clip: LayerBounds;
-  clipKind: 'body' | 'tableCell' | 'textBox' | 'generic';
+  clipKind: 'body' | 'tableCell' | 'textBox' | 'generic' | 'printBitmapFill';
   child: LayerNode;
 }
 
@@ -1182,6 +1188,13 @@ export interface LayerPageBackgroundOp {
 }
 
 export interface LayerTextStyle {
+  /** Rust의 공통 한컴 Print pen 결과. 명시 textPaint에는 적용하지 않는다. */
+  outlineStroke?: { width: number; intervals: number[] };
+  textPaint?: {
+    width: number;
+    paint: { fill: boolean; width_mpt: number; stroke_color: number; fill_alpha: number;
+      stroke_alpha: number; line_join: number; miter_limit_milli: number };
+  };
   /** 줄 전체에서 해소한 방향. 논리 positions와 원문 주소는 유지한다. */
   bidiLayout?: {
     scalarCount: number;
@@ -1205,8 +1218,12 @@ export interface LayerTextStyle {
   shadowColor?: string;
   shadowOffsetX?: number;
   shadowOffsetY?: number;
+  /** 공통 paint가 해소한 순서 그대로 재생한다. 글꼴·보간을 여기서 추정하지 않는다. */
+  shadowOffsets?: [number, number][];
   emboss?: boolean;
   engrave?: boolean;
+  /** producer가 확정한 첨자 크기와 본문 기준선에서의 이동이다. */
+  scriptMetrics?: { fontSize: number; baselineShift: number };
   superscript?: boolean;
   subscript?: boolean;
   underlineColor?: string;
@@ -1279,6 +1296,8 @@ export interface LayerTextRunOp {
 }
 
 export interface LayerFootnoteMarkerOp {
+  style?: LayerTextStyle;
+  positions?: number[];
   type: 'footnoteMarker';
   baseline?: number;
   bbox: LayerBounds;
@@ -1316,6 +1335,7 @@ export interface LayerLineStyle {
   lineType?: string;
   /** A decomposed multiple/overpainted stroke keeps its parent's subpixel geometry. */
   compoundComponent?: boolean;
+  preserveFractionalPosition?: boolean;
   startArrow?: string;
   endArrow?: string;
   startArrowSize?: number;
@@ -1368,6 +1388,10 @@ export interface LayerRectangleOp {
   cornerRadius?: number;
   style?: LayerShapeStyle;
   gradient?: LayerGradientFill;
+  /** Rust가 판정한 Print 단색 사각형의 장치 채움 정책. */
+  printFillCoverage?: 'device';
+  /** Print의 물리 채운 띠와 외곽 pen. raster 폭은 공통 WASM에서 계산한다. */
+  printPicturePen?: [number, number];
 }
 
 export interface LayerEllipseOp {
@@ -1424,9 +1448,11 @@ export interface LayerImageOp {
   /** Explicit source sampling; absent preserves the output profile policy. */
   imageInterpolation?: 'nearest' | 'linear';
   /** 실제 Print 색 전달 payload의 축소 재구성 계약. */
-  imageReconstruction?: 'catmullRom';
+  imageReconstruction?: 'catmullRom' | 'printArea' | 'printMaskedArea';
   imageAnisotropicReduction?: boolean;
   imagePrintFrame?: number[];
+  /** Print bitmap 채움의 실제 장치 외접 영역. 필터 선택과 별개다. */
+  printImageCoverage?: 'device';
   mime?: string;
   base64?: string;
   imageRef?: number | string;
@@ -1616,7 +1642,7 @@ export interface LayerTextDecorationOp {
       browserOffset: number;
       browserAlignEnd?: boolean;
     };
-    /** 실제 글줄 메트릭과 독립 Print로 해소한 기하. 클라이언트에서 크기를 다시 추정하지 않는다. */
+    /** 기존 키를 유지하며 위 밑줄·아래 일점쇄선의 공통 기하를 전달한다. 크기를 다시 추정하지 않는다. */
     topUnderline?: {
       phase?: number;
       strokes: Array<{ offset: number; width: number; dash: number[] }>;
@@ -1657,6 +1683,7 @@ export interface LayerCharOverlapOp {
   type: 'charOverlap';
   bbox: LayerBounds;
   text: string;
+  displayText?: string;
   baseline: number;
   rotation: number;
   isVertical: boolean;

@@ -21,7 +21,9 @@ use crate::paint::{
 use crate::renderer::render_tree::BoundingBox;
 use crate::renderer::{svg_arc_to_beziers, PathCommand};
 
-use super::renderer::{colorref_to_skia, NativeGlyphRunReplayProofReason as FontFailure};
+use super::renderer::{
+    colorref_to_skia, NativeGlyphPreparationFailure, NativeGlyphRunReplayProofReason as FontFailure,
+};
 
 pub(super) const MAX_PREPARED_GLYPH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_COMMANDS: usize = 100_000;
@@ -49,13 +51,13 @@ impl GlyphPreparationBudget {
     pub fn prepare<T: std::borrow::Borrow<PreparedGlyph>>(
         &mut self,
         minimum_bytes: usize,
-        prepare: impl FnOnce() -> Option<T>,
-    ) -> Option<T> {
+        prepare: impl FnOnce() -> Result<T, NativeGlyphPreparationFailure>,
+    ) -> Result<T, NativeGlyphPreparationFailure> {
         if self.remaining_entries == 0
             || self.remaining_bytes == 0
             || minimum_bytes > self.remaining_bytes
         {
-            return None;
+            return Err(NativeGlyphPreparationFailure::PreparationBudgetExceeded);
         }
         // Charge before parsing/copying. A failed candidate must not restore
         // the work allowance and repeatedly prepare the same large resource.
@@ -67,10 +69,10 @@ impl GlyphPreparationBudget {
             // Outline costs are known only after preparation. Stop further
             // preparation if this candidate exhausted the remaining allowance.
             self.remaining_bytes = 0;
-            return None;
+            return Err(NativeGlyphPreparationFailure::PreparationBudgetExceeded);
         };
         self.remaining_bytes = remaining;
-        Some(prepared)
+        Ok(prepared)
     }
 }
 
@@ -101,6 +103,8 @@ struct PreparedDraw {
     /// enclosing graph clip. The renderer's outer layer transform still applies.
     clips: Vec<Path>,
     paint: Paint,
+    /// 외곽선 효과 획. raster 출력에서 장치 한 칸보다 가늘게 긋지 않는다.
+    floor_stroke: bool,
     content: DrawContent,
 }
 
@@ -120,7 +124,13 @@ enum DrawContent {
 }
 
 impl PreparedGlyph {
-    pub fn draw(&self, canvas: &Canvas, antialias: bool, sampling: SamplingOptions) {
+    pub fn draw(
+        &self,
+        canvas: &Canvas,
+        antialias: bool,
+        sampling: SamplingOptions,
+        raster_target: bool,
+    ) {
         for draw in &self.draws {
             canvas.save();
             for clip in &draw.clips {
@@ -140,6 +150,13 @@ impl PreparedGlyph {
                     canvas.draw_glyphs_at(glyphs, positions.as_slice(), (0.0, 0.0), font, &paint);
                 }
                 DrawContent::Path(path) => {
+                    if draw.floor_stroke {
+                        super::line_replay::floor_stroke_to_device(
+                            canvas,
+                            &mut paint,
+                            raster_target,
+                        );
+                    }
                     canvas.draw_path(path, &paint);
                 }
                 DrawContent::Image {
@@ -312,6 +329,7 @@ pub(super) fn construct_glyph_font(
             transforms,
             clips: Vec::new(),
             paint: fill_paint(colorref_to_skia(run.paint_style.color, 1.0)),
+            floor_stroke: false,
             content: DrawContent::Glyphs {
                 font,
                 glyphs: run.glyph_ids.iter().map(|glyph| *glyph as u16).collect(),
@@ -372,16 +390,30 @@ fn prepare_glyph_effects(
         passes.push((fill, (0.0, 0.0)));
     } else {
         if style.shadow_type > 0 {
-            passes.push((
-                fill_paint(colorref_to_skia(style.shadow_color, 1.0)),
-                (style.shadow_offset_x as f32, style.shadow_offset_y as f32),
-            ));
+            for [x, y] in crate::paint::text_shadow::offsets_for(
+                style.shadow_type,
+                [style.shadow_offset_x, style.shadow_offset_y],
+                style.continuous_shadow.as_ref(),
+            ) {
+                passes.push((
+                    fill_paint(colorref_to_skia(style.shadow_color, 1.0)),
+                    (x as f32, y as f32),
+                ));
+            }
         }
-        if style.outline_type > 0 {
+        // 외곽선 글자는 SVG·Canvas와 같은 굵기·반복 구간으로 윤곽만 긋는다.
+        if let Some((width, intervals)) =
+            crate::renderer::stroke_pattern::char_outline_stroke(style.outline_type)
+        {
             let mut stroke = fill;
             stroke.set_style(skia_safe::paint::Style::Stroke);
-            stroke.set_stroke_width((style.font_size as f32 / 25.0).max(0.5));
-            passes.push((highlight, (0.0, 0.0)));
+            stroke.set_stroke_width(width as f32);
+            stroke.set_stroke_cap(skia_safe::paint::Cap::Round);
+            stroke.set_stroke_join(skia_safe::paint::Join::Round);
+            if !intervals.is_empty() {
+                let intervals: Vec<f32> = intervals.iter().map(|v| *v as f32).collect();
+                stroke.set_path_effect(skia_safe::PathEffect::dash(&intervals, 0.0));
+            }
             passes.push((stroke, (0.0, 0.0)));
         } else {
             passes.push((fill, (0.0, 0.0)));
@@ -389,7 +421,7 @@ fn prepare_glyph_effects(
     }
     let mut draws = Vec::with_capacity(paths.len() * passes.len());
     // Preserve the branch's effect precedence and complete pass ordering:
-    // relief overrides shadow/outline; shadow precedes white fill and stroke.
+    // relief overrides shadow/outline; shadow precedes the outline stroke.
     for (paint, offset) in passes {
         for path in &paths {
             let shifted = path.with_offset(offset);
@@ -404,6 +436,7 @@ fn prepare_glyph_effects(
                 transforms: transforms.clone(),
                 clips: Vec::new(),
                 paint: paint.clone(),
+                floor_stroke: paint.style() == skia_safe::paint::Style::Stroke,
                 content: DrawContent::Path(shifted),
             });
         }
@@ -622,6 +655,7 @@ pub(super) fn prepare_glyph_outline(
                         transforms: vec![placement],
                         clips: Vec::new(),
                         paint,
+                        floor_stroke: false,
                         content: DrawContent::Path(path.clone()),
                     });
                 }
@@ -655,6 +689,7 @@ pub(super) fn prepare_glyph_outline(
                             layer.fill.as_ref()?,
                             layer.opacity.unwrap_or(1.0),
                         )?),
+                        floor_stroke: false,
                         content: DrawContent::Path(path),
                     });
                 }
@@ -829,6 +864,7 @@ pub(super) fn prepare_glyph_outline(
                         transforms,
                         clips,
                         paint,
+                        floor_stroke: false,
                         content: DrawContent::Path(path),
                     });
                 }
@@ -869,6 +905,7 @@ pub(super) fn prepare_glyph_outline(
                 transforms: transforms.into_iter().collect(),
                 clips: Vec::new(),
                 paint: fill_paint(Color::WHITE),
+                floor_stroke: false,
                 content: DrawContent::Image {
                     image,
                     destination: drawable_rect(payload.placement)?,
@@ -892,14 +929,20 @@ pub(super) fn prepare_glyph_outline(
                 return None;
             }
             let fragment = resources.svg_fragment(payload.svg_ref)?;
-            let (image, bytes) =
-                svg_glyph_image(fragment, payload.view_box, viewport, raster_scale)?;
+            let (image, bytes) = svg_glyph_image(
+                fragment,
+                payload.view_box,
+                viewport,
+                raster_scale,
+                outline.paint_style.color,
+            )?;
             let transforms = optional_matrix(payload.transform_to_run)?;
             result.byte_cost = bytes;
             result.draws.push(PreparedDraw {
                 transforms: transforms.into_iter().collect(),
                 clips: Vec::new(),
                 paint: fill_paint(Color::WHITE),
+                floor_stroke: false,
                 content: DrawContent::Image {
                     image,
                     destination: drawable_rect(viewport)?,
@@ -928,106 +971,27 @@ fn svg_glyph_image(
     view_box: BoundingBox,
     bbox: BoundingBox,
     scale: f32,
+    color: u32,
 ) -> Option<(Image, usize)> {
-    use quick_xml::{
-        events::{BytesEnd, Event},
-        Reader, Writer, XmlVersion,
-    };
-    use resvg::{tiny_skia, usvg};
-    if !crate::renderer::static_svg::static_svg_fragment_has_path_layer(fragment) {
-        return None;
-    }
-    drawable_rect(bbox)?;
-    drawable_rect(view_box)?;
-    let width = (bbox.width * f64::from(scale)).ceil();
-    let height = (bbox.height * f64::from(scale)).ceil();
-    if !width.is_finite()
-        || !height.is_finite()
-        || width < 1.0
-        || height < 1.0
-        || width * height > MAX_IMAGE_PIXELS as f64
-    {
-        return None;
-    }
-    // The payload viewBox replaces only the outer container's viewport.
-    // Nested SVG elements retain their own viewport, scaling and clipping.
-    let mut reader = Reader::from_str(fragment);
-    let mut writer = Writer::new(Vec::new());
-    let mut depth = 0usize;
-    loop {
-        let event = reader.read_event().ok()?;
-        let empty = matches!(&event, Event::Empty(_));
-        if let Event::Start(element) | Event::Empty(element) = &event {
-            if element.name().as_ref() == "path" {
-                if let Some(attribute) = element.try_get_attribute("d").ok()? {
-                    let commands = attribute.normalized_value(XmlVersion::Implicit1_0).ok()?;
-                    // usvg may discard a malformed path but retain valid siblings.
-                    // A strict alternative must not silently lose part of its ink.
-                    for (index, segment) in
-                        svgtypes::PathParser::from(commands.as_ref()).enumerate()
-                    {
-                        if index >= MAX_PATH_COMMANDS || segment.is_err() {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-
-        let rewrite_container = match &event {
-            Event::Start(element) | Event::Empty(element) => {
-                depth == 0 && element.name().as_ref() == "svg"
-            }
-            Event::End(element) => depth == 1 && element.name().as_ref() == "svg",
-            _ => false,
-        };
-        match &event {
-            Event::Start(_) => depth = depth.checked_add(1)?,
-            Event::End(_) => depth = depth.checked_sub(1)?,
-            _ => {}
-        }
-        match event {
-            Event::Eof => {
-                if depth != 0 {
-                    return None;
-                }
-                break;
-            }
-            Event::Start(mut element) | Event::Empty(mut element) if rewrite_container => {
-                element.set_name("g");
-                writer
-                    .write_event(if empty {
-                        Event::Empty(element)
-                    } else {
-                        Event::Start(element)
-                    })
-                    .ok()?;
-            }
-            Event::End(_) if rewrite_container => {
-                writer.write_event(Event::End(BytesEnd::new("g"))).ok()?;
-            }
-            event => {
-                writer.write_event(event).ok()?;
-            }
-        }
-    }
-    let inner = String::from_utf8(writer.into_inner()).ok()?;
-    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"{} {} {} {}\" preserveAspectRatio=\"none\">{inner}</svg>", view_box.x,view_box.y,view_box.width,view_box.height);
-    let mut options = usvg::Options::default();
-    options.image_href_resolver = usvg::ImageHrefResolver {
-        resolve_data: Box::new(|_, _, _| None),
-        resolve_string: Box::new(|_, _| None),
-    };
-    let tree = usvg::Tree::from_str(&svg, &options).ok()?;
-    if tree.root().children().is_empty() {
-        return None;
-    }
-    let mut pixels = tiny_skia::Pixmap::new(width as u32, height as u32)?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixels.as_mut());
-    let byte_cost = pixels.data().len();
-    let encoded = pixels.encode_png().ok()?;
-    let image = Image::from_encoded(Data::new_copy(&encoded))?.make_raster_image(None, None)?;
-    Some((image, byte_cost))
+    let foreground = format!(
+        "#{:02x}{:02x}{:02x}",
+        color & 255,
+        (color >> 8) & 255,
+        (color >> 16) & 255
+    );
+    let raster = crate::renderer::static_svg_raster::prepare_static_svg_raster(
+        fragment,
+        view_box,
+        bbox,
+        f64::from(scale),
+        &foreground,
+    )?;
+    let image = Image::from_encoded(Data::new_copy(&raster.png))?.make_raster_image(None, None)?;
+    debug_assert_eq!(
+        (image.width(), image.height()),
+        (raster.width as i32, raster.height as i32)
+    );
+    Some((image, raster.byte_cost))
 }
 
 fn optional_matrix(transform: Option<LayerAffineTransform>) -> Option<Option<Matrix>> {

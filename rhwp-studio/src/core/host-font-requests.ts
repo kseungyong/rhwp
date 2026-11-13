@@ -1,6 +1,6 @@
 import type { LayerEquationLayoutBox, LayerNode, LayerTextStyle, PageLayerTree } from './types.ts';
-import { resolveRendererLocalFont, localFontFaceKey, type LocalFontRecord } from './local-fonts.ts';
-import boxedDigitMetrics from '../../../assets/fonts/boxed-digit-metrics.json' with { type: 'json' };
+import { resolveRendererLocalFont, resolveRendererLocalFontCandidates, localFontFaceKey, type LocalFontRecord } from './local-fonts.ts';
+import { enclosedPua, enclosedPuaHasMetrics, enclosedPuaMetrics } from './enclosed-pua.ts';
 import { ordinaryTextFontFamilies, parseCssFontFamilyList } from './font-substitution.ts';
 
 export function hostFontStyle(style?: LayerTextStyle): { weight: number; slant: 'normal' | 'italic' } {
@@ -37,7 +37,7 @@ export function collectDocumentCanvasKitFontUsage(trees: Iterable<PageLayerTree>
       else if (node.kind === 'clipRect' || node.kind === 'clipPath') stack.push(node.child);
       else for (const op of node.ops) {
         if (op.type !== 'textRun' && op.type !== 'charOverlap' && op.type !== 'footnoteMarker') continue;
-        const style = op.type === 'footnoteMarker' ? { fontFamily: op.fontFamily } : op.style;
+        const style = op.type === 'footnoteMarker' ? (op.style ?? { fontFamily: op.fontFamily }) : op.style;
         const family = style?.fontFamily;
         if (!family) continue;
         const usage = { family, bold: style?.bold === true, italic: style?.italic === true };
@@ -137,8 +137,11 @@ export function collectHostFontRequests(tree: PageLayerTree): LocalFontRecord[] 
     else for (const op of node.ops) {
       if (op.type === 'equation') {
         for (const family of hancomEquationFamilies(op.layoutBox)) {
-          const record = resolveRendererLocalFont(family, { weight: 400, slant: 'normal' });
-          if (record?.hostReference) selected.set(localFontFaceKey(record), record);
+          for (const candidate of parseCssFontFamilyList(family)) {
+            for (const record of resolveRendererLocalFontCandidates(candidate, { weight: 400, slant: 'normal' })) {
+              if (record.hostReference) selected.set(localFontFaceKey(record), record);
+            }
+          }
         }
         continue;
       }
@@ -148,7 +151,7 @@ export function collectHostFontRequests(tree: PageLayerTree): LocalFontRecord[] 
         continue;
       }
       if (op.type !== 'textRun' && op.type !== 'charOverlap' && op.type !== 'footnoteMarker') continue;
-      const styles = [op.type === 'footnoteMarker' ? { fontFamily: op.fontFamily } : op.style];
+      const styles = [op.type === 'footnoteMarker' ? (op.style ?? { fontFamily: op.fontFamily }) : op.style];
       if (op.type === 'charOverlap' && op.composition && Array.isArray(op.composition.interior)) {
         if (op.composition.border) styles.push(op.composition.border.style);
         styles.push(...op.composition.interior.slice(0, 9).map(glyph => glyph.style));
@@ -159,12 +162,12 @@ export function collectHostFontRequests(tree: PageLayerTree): LocalFontRecord[] 
         selectTextFaces(family, style);
       }
       if ([...op.text].some(character => {
-        const code = character.codePointAt(0) ?? 0;
-        return code >= 0xf02b0 && code <= 0xf02b9;
+        const glyph = enclosedPua(character.codePointAt(0) ?? 0);
+        return glyph !== null && enclosedPuaHasMetrics(glyph);
       })) {
-        const numberFace = resolveRendererLocalFont(boxedDigitMetrics.numberFace,
+        const innerFace = resolveRendererLocalFont(enclosedPuaMetrics.innerFace,
           { weight: 400, slant: 'normal' });
-        if (numberFace?.hostReference) selected.set(localFontFaceKey(numberFace), numberFace);
+        if (innerFace?.hostReference) selected.set(localFontFaceKey(innerFace), innerFace);
       }
     }
   }

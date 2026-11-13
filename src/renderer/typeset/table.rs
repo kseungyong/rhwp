@@ -25,6 +25,7 @@ pub(super) mod deferred_float_flow;
 pub(super) mod footnotes;
 mod host_spacing;
 pub(super) mod scan;
+mod source_frame_fit;
 
 /// 포맷 경계의 기존 IR 참조와 관측값. 페이지/단의 가변 상태를 전달하지 않는다.
 pub(super) struct TableFormatInput<'a> {
@@ -48,6 +49,25 @@ pub(super) fn format(
     profile: impl Fn() -> LayoutCompatibilityProfile,
     uses_tac_flow: impl FnOnce() -> bool,
 ) -> FormattedTable {
+    match format_with_storage(
+        input,
+        dpi,
+        profile,
+        uses_tac_flow,
+        &crate::storage::Unbounded,
+    ) {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+pub(super) fn format_with_storage<S: crate::storage::Storage>(
+    input: TableFormatInput<'_>,
+    dpi: f64,
+    profile: impl Fn() -> LayoutCompatibilityProfile,
+    uses_tac_flow: impl FnOnce() -> bool,
+    storage: &S,
+) -> Result<FormattedTable, S::Error> {
     let TableFormatInput {
         para,
         para_idx,
@@ -63,7 +83,9 @@ pub(super) fn format(
     let mt = measured_tables
         .iter()
         .find(|mt| mt.para_index == para_idx && mt.control_index == ctrl_idx);
-    let fitted_visible_mt = fit_measured_for_host(para, table, mt, dpi, styles, &profile);
+    let fitted_visible_mt = fit_measured_for_host_with_storage(
+        para, next_para, table, mt, dpi, styles, &profile, storage,
+    )?;
     let mt = fitted_visible_mt.as_ref().or(mt);
 
     let is_tac = uses_tac_flow();
@@ -101,13 +123,13 @@ pub(super) fn format(
             0
         };
         (
-            mt.row_heights.clone(),
+            crate::storage::try_clone(&mt.row_heights, storage)?,
             mt.cell_spacing,
             mt.total_height,
             mt.caption_height,
-            mt.cumulative_heights.clone(),
+            crate::storage::try_clone(&mt.cumulative_heights, storage)?,
             mt.page_break,
-            mt.cells.clone(),
+            crate::storage::try_clone(&mt.cells, storage)?,
             hrc,
         )
     } else {
@@ -116,7 +138,7 @@ pub(super) fn format(
             0.0,
             0.0,
             0.0,
-            vec![0.0],
+            storage.collect([0.0])?,
             Default::default(),
             Vec::new(),
             0,
@@ -135,7 +157,8 @@ pub(super) fn format(
 
     // 표 셀 내 각주 높이 사전 계산 (Paginator engine.rs:565-581 동일)
     let mut table_footnote_height = 0.0;
-    let source_notes = crate::renderer::pagination::table_cell_footnotes(table);
+    let source_notes =
+        crate::renderer::pagination::table_cell_footnotes_with_storage(table, storage)?;
     let table_footnote_count = source_notes.len();
     let mut table_footnotes = Vec::new();
     for (cell_path, fn_ctrl) in source_notes {
@@ -149,17 +172,19 @@ pub(super) fn format(
             || (profile().hwpx_stored_layout() && !profile().session_edited()))
         .then(|| native_hwp5_footnote_reset_fragments(fn_ctrl, dpi))
         .flatten();
-        table_footnotes.push(TableCellFootnote {
-            number: fn_ctrl.number,
-            row: table.cells[owner.cell_index].row as usize,
-            cell_path,
-            content_height: queued_table_footnote_content_height(fn_ctrl, dpi),
-            fragment_split,
-        });
+        storage.push(
+            &mut table_footnotes,
+            TableCellFootnote {
+                number: fn_ctrl.number,
+                row: table.cells[owner.cell_index].row as usize,
+                cell_path,
+                content_height: queued_table_footnote_content_height(fn_ctrl, dpi),
+                fragment_split,
+            },
+        )?;
     }
 
-    FormattedTable {
-        external_flow,
+    Ok(FormattedTable {
         row_heights,
         cell_spacing,
         header_row_count,
@@ -175,7 +200,8 @@ pub(super) fn format(
         table_footnote_count,
         table_footnotes,
         strict_following_plain_text_fit,
-    }
+        external_flow,
+    })
 }
 
 /// 첫 조각의 세로 시작 기준(흐름 원점). 빈 호스트의 문단 기준 양수 오프셋 표는
@@ -207,49 +233,100 @@ pub(super) fn first_fragment_flow_origin(
 /// profile 관측은 기존 guard의 단락 평가 위치를 보존한다.
 pub(crate) fn fit_measured_for_host(
     para: &Paragraph,
+    next_para: Option<&Paragraph>,
     table: &Table,
     mt: Option<&MeasuredTable>,
     dpi: f64,
     styles: &ResolvedStyleSet,
     profile: impl Fn() -> LayoutCompatibilityProfile,
 ) -> Option<MeasuredTable> {
-    // An outer wrapper's height is a physical frame, not a target height for
-    // proportional rescaling of the unwrapped child's rows.
-    if crate::renderer::height_measurer::transparent_table_wrapper_child(table, styles).is_some_and(
-        |nested| {
-            profile().hwp5_stored_pagination_layout()
-                || profile().hwpx_stored_layout()
-                || crate::renderer::height_measurer::unrestricted_wrapper_frame(table, nested, dpi)
-                    .is_some()
-        },
+    match fit_measured_for_host_with_storage(
+        para,
+        next_para,
+        table,
+        mt,
+        dpi,
+        styles,
+        profile,
+        &crate::storage::Unbounded,
     ) {
-        return mt.cloned();
+        Ok(value) => value,
+        Err(never) => match never {},
     }
-    if profile().hwpx_stored_layout() && !profile().session_edited() {
-        if let Some(fitted) =
-            mt.and_then(|measured| fit_stored_inline_picture_frame(measured, table, dpi))
+}
+
+pub(crate) fn fit_measured_for_host_with_storage<S: crate::storage::Storage>(
+    para: &Paragraph,
+    next_para: Option<&Paragraph>,
+    table: &Table,
+    mt: Option<&MeasuredTable>,
+    dpi: f64,
+    styles: &ResolvedStyleSet,
+    profile: impl Fn() -> LayoutCompatibilityProfile,
+    storage: &S,
+) -> Result<Option<MeasuredTable>, S::Error> {
+    crate::storage::with_optional(|failure| {
+        // An outer wrapper's height is a physical frame, not a target height for
+        // proportional rescaling of the unwrapped child's rows.
+        if crate::renderer::height_measurer::transparent_table_wrapper_child(table, styles)
+            .is_some_and(|nested| {
+                profile().hwp5_stored_pagination_layout()
+                    || profile().hwpx_stored_layout()
+                    || crate::renderer::height_measurer::unrestricted_wrapper_frame(
+                        table, nested, dpi,
+                    )
+                    .is_some()
+            })
+        {
+            return crate::storage::optional(
+                mt.map(|value| crate::storage::try_clone(value, storage))
+                    .transpose(),
+                failure,
+            )?;
+        }
+        if profile().hwpx_stored_layout() && !profile().session_edited() {
+            if let Some(fitted) = mt.and_then(|measured| {
+                crate::storage::optional(
+                    crate::renderer::height_measurer::fit_stored_inline_picture_frame_with_storage(
+                        measured, table, dpi, storage,
+                    ),
+                    failure,
+                )?
+            }) {
+                return Some(fitted);
+            }
+            if let Some(fitted) =
+            mt.and_then(|measured| crate::storage::optional(crate::renderer::height_measurer::fit_stored_hwpx_no_adjust_rowspans_with_storage(measured, table, dpi, storage), failure)?)
         {
             return Some(fitted);
         }
-        if let Some(fitted) =
-            mt.and_then(|measured| fit_stored_hwpx_no_adjust_rowspans(measured, table, dpi))
+        }
+        if table.common.treat_as_char
+            && profile().hwpx_stored_layout()
+            && !profile().session_edited()
+        {
+            if let Some(fitted) = mt
+            .and_then(|measured| crate::storage::optional(crate::renderer::height_measurer::trim_stored_hwpx_inline_row_trailing_spacing_with_storage(measured, table, dpi, storage), failure)?)
         {
             return Some(fitted);
         }
-    }
-    if table.common.treat_as_char && profile().hwpx_stored_layout() && !profile().session_edited() {
-        if let Some(fitted) = mt
-            .and_then(|measured| trim_stored_hwpx_inline_row_trailing_spacing(measured, table, dpi))
-        {
-            return Some(fitted);
         }
-    }
-    // [#2195] 빈 앵커(자리차지 표 표준형)에도 선언높이 fit 적용 — 한글은 콘텐츠가
-    // 선언보다 작아도 표 선언높이를 유지한다 (80168 pi=419 행 걷기 151.1 = 선언,
-    // 콘텐츠 143.5 사용 시 페이지 끝 razor -1쪽). fit 자체의 0.75~1.35 가드(#1510)
-    // 가 과대 압축/팽창을 차단한다.
-    if is_para_topbottom_float(&table.common) {
-        mt.map(|measured| {
+        // [#2195] 빈 앵커(자리차지 표 표준형)에도 선언높이 fit 적용 — 한글은 콘텐츠가
+        // 선언보다 작아도 표 선언높이를 유지한다 (80168 pi=419 행 걷기 151.1 = 선언,
+        // 콘텐츠 143.5 사용 시 페이지 끝 razor -1쪽). fit 자체의 0.75~1.35 가드(#1510)
+        // 가 과대 압축/팽창을 차단한다.
+        if is_para_topbottom_float(&table.common) {
+            mt.and_then(|measured| {
+            // 개체 높이가 첫 조각만 기록한 경우 전체 행을 그 높이로 누르지 않는다.
+            // 뒤 원본 줄의 쪽 원점이 잔여를 정확히 증명할 때 format과 paint가 같은 행을 쓴다.
+            if crate::storage::optional(
+                source_frame_fit::stored_following_tail_owns_rows(
+                    para, next_para, table, measured, profile(), dpi, storage,
+                ),
+                failure,
+            )? {
+                return crate::storage::optional(crate::storage::try_clone(measured, storage), failure);
+            }
             let body_height = measured.row_heights.iter().sum::<f64>()
                 + measured.cell_spacing * measured.row_heights.len().saturating_sub(1) as f64;
             if !profile().session_edited()
@@ -262,10 +339,10 @@ pub(crate) fn fit_measured_for_host(
                 )
             {
                 // 실제 내용을 담은 행 선언을 개체의 낡은 전체 캐시로 다시 늘리지 않는다.
-                return measured.clone();
+                return crate::storage::optional(crate::storage::try_clone(measured, storage), failure);
             }
             let (fitted, shrink_blocked_by_content) =
-                crate::renderer::height_measurer::fit_measured_table_to_declared_height_with_outcome(measured, table, dpi);
+                crate::storage::optional(crate::renderer::height_measurer::fit_measured_table_to_declared_height_with_outcome_with_storage(measured, table, dpi, storage), failure)?;
             // 빈 앵커는 **확대 방향만**: 한글 규칙 = max(선언, 콘텐츠) — 콘텐츠가
             // 선언보다 큰 표(pi=15 조문대비표 929.6>928.4)를 압축하면 분할 경계가
             // 당겨져 pi16 -1쪽. 압축(fit-down)은 종전대로 비공백 텍스트 앵커 한정.
@@ -282,11 +359,11 @@ pub(crate) fn fit_measured_for_host(
             if shrunk
                 && para_has_non_whitespace_text(para)
                 && (profile().session_edited()
-                    || crate::renderer::height_measurer::measured_table_has_grown_text_row(
+                    || crate::storage::optional(crate::renderer::height_measurer::measured_table_has_grown_text_row_with_storage(
                         measured, table, dpi,
-                    ))
+                     storage), failure)?)
             {
-                return measured.clone();
+                return crate::storage::optional(crate::storage::try_clone(measured, storage), failure);
             }
             // The host's caption does not change the physical row frame.
             // Use the same authenticated closing-row plan for text and empty
@@ -295,19 +372,19 @@ pub(crate) fn fit_measured_for_host(
                 && (profile().hwp5_stored_pagination_layout()
                     || profile().hwpx_stored_layout())
                 && matches!(
-                    table.page_break,
+                    table.layout_page_break(),
                     crate::model::table::TablePageBreak::RowBreak
                         | crate::model::table::TablePageBreak::CellBreak
                 )
                 && table.row_count > 1;
             if (shrunk || shrink_blocked_by_content) && stored_declared_tail {
                 if let Some(closed) =
-                    fit_measured_table_declared_tail_to_declared_height(measured, table, dpi)
+                    crate::storage::optional(crate::renderer::height_measurer::fit_measured_table_declared_tail_to_declared_height_with_storage(measured, table, dpi, storage), failure)?
                 {
-                    return closed;
+                    return Some(closed);
                 }
             }
-            if (shrunk || shrink_blocked_by_content) && !para_has_non_whitespace_text(para) {
+            Some(if (shrunk || shrink_blocked_by_content) && !para_has_non_whitespace_text(para) {
                 // HWP5 빈 TopAndBottom host의 다행 RowBreak 표는 통상 콘텐츠가
                 // 선언높이를 넘으면 축소하지 않는다. 다만 마지막 행 하나가 비-TAC
                 // 1×1 자식 표이고, 그 parent viewport의 Center 정렬이 만든 작은
@@ -318,22 +395,24 @@ pub(crate) fn fit_measured_for_host(
                 let native_empty_rowbreak_nested_tail = profile().hwp5_stored_pagination_layout()
                     && !table.common.treat_as_char
                     && matches!(
-                        table.page_break,
+                        table.layout_page_break(),
                         crate::model::table::TablePageBreak::RowBreak
                     )
                     && table.row_count > 1
                     && table.cells.iter().all(|cell| cell.row_span == 1);
-                native_empty_rowbreak_nested_tail
-                    .then(|| {
-                        fit_measured_table_nested_tail_to_declared_height(measured, table, dpi)
-                    })
-                    .flatten()
-                    .unwrap_or_else(|| measured.clone())
+                let adjusted = if native_empty_rowbreak_nested_tail {
+                    crate::storage::optional(crate::renderer::height_measurer::fit_measured_table_nested_tail_to_declared_height_with_storage(measured, table, dpi, storage), failure)?
+                } else { None };
+                match adjusted {
+                    Some(adjusted) => adjusted,
+                    None => crate::storage::optional(crate::storage::try_clone(measured, storage), failure)?,
+                }
             } else {
                 fitted
-            }
+            })
         })
-    } else {
-        None
-    }
+        } else {
+            None
+        }
+    })
 }

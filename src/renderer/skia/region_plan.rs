@@ -2,9 +2,14 @@
 
 use crate::error::HwpError;
 use crate::renderer::layer_renderer::{LayerRenderResult, RasterRenderOptions};
-use crate::renderer::raster_pixels::RasterRegion;
+use crate::renderer::raster_pixels::{RasterRegion, MAX_RASTER_PIXEL_COORDINATE};
 
 use super::SkiaLayerRenderer;
+
+enum WorkingRaster {
+    FullPage,
+    Tiles,
+}
 
 /// A validated region on the scaled full-page pixel grid.
 ///
@@ -38,7 +43,7 @@ impl SkiaRegionPlan {
     /// Maximum simultaneous working N32 and requested RGBA bitmap bytes.
     pub const MAX_BITMAP_BYTES: u64 = 128 * 1024 * 1024;
     /// Inclusive absolute endpoint limit on the integer device-pixel grid.
-    pub const MAX_EXACT_PIXEL: i32 = 16_777_216;
+    pub const MAX_EXACT_PIXEL: i32 = MAX_RASTER_PIXEL_COORDINATE;
 
     /// Validate logical page/region geometry and compute the enclosing window.
     ///
@@ -50,6 +55,37 @@ impl SkiaRegionPlan {
         page_height: f64,
         region: RasterRegion,
         options: RasterRenderOptions,
+    ) -> LayerRenderResult<Self> {
+        Self::plan(
+            page_width,
+            page_height,
+            region,
+            options,
+            WorkingRaster::FullPage,
+        )
+    }
+
+    pub(super) fn for_tiles(
+        page_width: f64,
+        page_height: f64,
+        region: RasterRegion,
+        options: RasterRenderOptions,
+    ) -> LayerRenderResult<Self> {
+        Self::plan(
+            page_width,
+            page_height,
+            region,
+            options,
+            WorkingRaster::Tiles,
+        )
+    }
+
+    fn plan(
+        page_width: f64,
+        page_height: f64,
+        region: RasterRegion,
+        options: RasterRenderOptions,
+        working: WorkingRaster,
     ) -> LayerRenderResult<Self> {
         SkiaLayerRenderer::validate_raster_options(options)?;
         let invalid = || HwpError::RenderError("invalid raster region geometry".into());
@@ -67,61 +103,13 @@ impl SkiaRegionPlan {
         };
         let page_width = page_extent(page_width)?;
         let page_height = page_extent(page_height)?;
-        let right = region.x + region.width;
-        let bottom = region.y + region.height;
-        if [
-            region.x,
-            region.y,
-            region.width,
-            region.height,
-            right,
-            bottom,
-        ]
-        .into_iter()
-        .any(|value| !value.is_finite())
-            || region.width <= 0.0
-            || region.height <= 0.0
-            || right <= region.x
-            || bottom <= region.y
-        {
-            return Err(invalid());
-        }
-        let endpoints = [
-            (region.x * options.scale).floor(),
-            (region.y * options.scale).floor(),
-            (right * options.scale).ceil(),
-            (bottom * options.scale).ceil(),
-        ];
-        let exact = f64::from(Self::MAX_EXACT_PIXEL);
-        if endpoints
-            .iter()
-            .any(|value| !value.is_finite() || !(-exact..=exact).contains(value))
-        {
-            return Err(invalid());
-        }
-        let [origin_x, origin_y, right, bottom] = endpoints.map(|value| value as i32);
-        let width = right.checked_sub(origin_x).ok_or_else(invalid)?;
-        let height = bottom.checked_sub(origin_y).ok_or_else(invalid)?;
-        if width <= 0
-            || height <= 0
-            || width > options.max_dimension
-            || height > options.max_dimension
-        {
-            return Err(HwpError::RenderError(
-                "raster window dimensions out of range".into(),
-            ));
-        }
-        let pixels = (width as u64)
-            .checked_mul(height as u64)
-            .ok_or_else(|| HwpError::RenderError("raster pixel count overflow".into()))?;
-        if pixels > options.max_pixels {
-            return Err(HwpError::RenderError(format!(
-                "raster pixel count out of range: {pixels}"
-            )));
-        }
-        let byte_limit = || HwpError::ResourceLimit("raster byte count overflow".into());
-        let stride = (width as usize).checked_mul(4).ok_or_else(byte_limit)?;
-        let output_bytes = stride.checked_mul(height as usize).ok_or_else(byte_limit)?;
+        let window =
+            region.pixel_window(options.scale, options.max_dimension, options.max_pixels)?;
+        let (origin_x, origin_y) = (window.origin_x, window.origin_y);
+        let (width, height) = (window.width, window.height);
+        let (stride, output_bytes) = (window.stride, window.output_bytes);
+        let right = origin_x + width;
+        let bottom = origin_y + height;
         // Wide endpoints preserve the full-page clipping of negative windows.
         let left = i64::from(origin_x).max(0);
         let top = i64::from(origin_y).max(0);
@@ -135,11 +123,18 @@ impl SkiaRegionPlan {
         ));
         let limit = || HwpError::ResourceLimit("raster region working budget exceeded".into());
         let working_bytes = if intersection.is_some() {
-            let working_pixels = (page_width as u64)
-                .checked_mul(page_height as u64)
+            let (working_width, working_height) = match working {
+                WorkingRaster::FullPage => (page_width, page_height),
+                WorkingRaster::Tiles => {
+                    let dimension = super::tiled_region::SkiaTilePlan::MAX_WORKING_DIMENSION;
+                    (page_width.min(dimension), page_height.min(dimension))
+                }
+            };
+            let working_pixels = (working_width as u64)
+                .checked_mul(working_height as u64)
                 .ok_or_else(limit)?;
-            if page_width > Self::MAX_WORKING_DIMENSION
-                || page_height > Self::MAX_WORKING_DIMENSION
+            if working_width > Self::MAX_WORKING_DIMENSION
+                || working_height > Self::MAX_WORKING_DIMENSION
                 || working_pixels > Self::MAX_WORKING_PIXELS
             {
                 return Err(limit());

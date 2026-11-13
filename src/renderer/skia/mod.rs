@@ -4,6 +4,7 @@
 
 mod anisotropic_image;
 mod cache;
+mod culling;
 mod diagnostics;
 mod equation_conv;
 mod equation_glyph;
@@ -11,14 +12,18 @@ mod fill;
 mod fill_shader;
 mod font_catalog;
 mod font_lookup;
+mod font_program;
 mod glyph_replay;
 mod hft_outline;
 mod image_cache;
 mod image_conv;
+mod image_coverage;
 mod image_effect;
 mod line_replay;
 mod metafile_print;
 mod prepared_page;
+mod print_image_sampling;
+mod rectangle_fill;
 mod region_plan;
 mod renderer;
 mod replay_policy;
@@ -27,13 +32,17 @@ mod svg_bitmap_mask;
 mod synthetic_typeface;
 mod text_replay;
 mod text_shaping;
+mod tiled_region;
 
 pub use cache::{NativeSkiaCacheStats, NativeSkiaCacheUsage};
 pub use prepared_page::PreparedSkiaPage;
 pub use region_plan::SkiaRegionPlan;
 pub use renderer::{
-    native_skia_glyph_run_replay_proof, NativeGlyphRunReplayProof, NativeGlyphRunReplayProofReason,
+    native_skia_glyph_run_replay_proof, NativeGlyphPreparationFailure,
+    NativeGlyphReplayRejectReport, NativeGlyphRunReplayProof, NativeGlyphRunReplayProofReason,
     SkiaLayerRenderer,
 };
 
 pub use surface::SkiaSurfaceRenderOptions;
+pub use tiled_region::SkiaTilePlan;
+pub(crate) use tiled_region::{PreparedSkiaTile, SkiaTileBounds};

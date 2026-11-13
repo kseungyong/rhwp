@@ -1,6 +1,49 @@
 //! 그림의 외접 프레임과 회전 전 출력 크기를 구분한다.
-use super::render_tree::{BoundingBox, ShapeTransform};
+use super::render_tree::{BoundingBox, ImageNode, ShapeTransform};
 use crate::model::image::Picture;
+
+/// 전체 크기가 저장되지 않은 GIF의 자르기를 이미지 픽셀 영역으로 해소한다.
+/// GIF에는 물리 해상도가 없고, 한컴 Print는 픽셀당 75 HWPUNIT을 사용한다.
+/// 명시된 원본 크기는 우선하며 TIFF·JPEG 등의 별도 좌표계는 변경하지 않는다.
+pub(crate) fn normalize_gif_crop(image: &mut ImageNode) {
+    if image
+        .original_size_hu
+        .is_some_and(|(width, height)| width > 0 && height > 0)
+    {
+        return;
+    }
+    let Some((left, top, right, bottom)) = image.crop else {
+        return;
+    };
+    if right <= left || bottom <= top {
+        return;
+    }
+    let Some(data) = image.data.as_deref() else {
+        return;
+    };
+    if !data.starts_with(b"GIF87a") && !data.starts_with(b"GIF89a") {
+        return;
+    }
+    let Some((width, height)) = super::svg::parse_image_dimensions(data) else {
+        return;
+    };
+    let Some((width, height)) = width
+        .checked_mul(75)
+        .zip(height.checked_mul(75))
+        .filter(|&(w, h)| w > 0 && h > 0 && w <= i32::MAX as u32 && h <= i32::MAX as u32)
+    else {
+        return;
+    };
+    let width_i = width as i32;
+    let height_i = height as i32;
+    image.crop = Some((
+        left.clamp(0, width_i),
+        top.clamp(0, height_i),
+        right.clamp(0, width_i),
+        bottom.clamp(0, height_i),
+    ));
+    image.original_size_hu = Some((width, height));
+}
 
 /// 그림 좌표계의 viewport와 그 안에서 시작하는 bitmap 원점. 둘은 다른 값이다.
 #[derive(Debug, Clone, Copy, serde::Serialize)]

@@ -20,13 +20,49 @@ impl TypesetEngine {
         para_style_break: bool,
         force_page_break: bool,
     ) -> bool {
-        // 이 단계에서는 이미 확정한 각주 영역의 기존 빈 줄 이월만 준비한다.
-        // 새 물리 예약은 뒤의 실제 문단 원점 선택 후 paragraph::flow에서 조회한다.
-        st.prepare_saved_empty_run(para_idx, paragraphs, self.dpi, |_| None);
+        match self.absorb_section_tail_with_storage(
+            st,
+            para_idx,
+            para,
+            paragraphs,
+            styles,
+            has_table,
+            last_content_para_idx,
+            para_style_break,
+            force_page_break,
+            &crate::storage::Unbounded,
+        ) {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn absorb_section_tail_with_storage<S: crate::storage::Storage>(
+        &self,
+        st: &mut TypesetState,
+        para_idx: usize,
+        para: &Paragraph,
+        paragraphs: &[Paragraph],
+        styles: &ResolvedStyleSet,
+        has_table: bool,
+        last_content_para_idx: Option<usize>,
+        para_style_break: bool,
+        force_page_break: bool,
+        storage: &S,
+    ) -> Result<bool, S::Error> {
+        // 조기 흡수 전에 실제 paint와 같은 각주 경계를 조회한다.
+        // 원본 프레임의 소속과 현재 fit을 분리하며 뒤 flow도 같은 예약을 소비한다.
+        st.prepare_saved_empty_run(para_idx, paragraphs, self.dpi, |st| {
+            crate::renderer::typeset::notes::footnotes::measure::BodyFootnoteMeasure {
+                engine: self,
+                styles,
+            }
+            .stored_current_area_height(st, paragraphs)
+        });
         if st.saved_empty_run_contains(para_idx) {
             // 실제 줄 상자를 fit/이월한다. 저장 reset 앞이라는 이유로
             // 줄의 물리 점유를 감추지 않는다.
-            return false;
+            return Ok(false);
         }
         // 이어받기 컷이 이미 다음 쪽을 열었다면 빈 줄도 그 쪽의 점유다.
         // 뒤의 같은 저장 리셋을 앞 쪽 꼬리로 해석해 줄 상자를 숨기지 않는다.
@@ -35,7 +71,7 @@ impl TypesetEngine {
             && para_idx + 1 < paragraphs.len()
             && st.stored_paragraph_boundary_already_open(paragraphs, para_idx + 1)
         {
-            return false;
+            return Ok(false);
         }
         // [Task #359] 단독 항목 페이지 차단:
         // 다음 pi 가 vpos-reset 가드를 발동할 예정이고 현재 pi 가 잔여 공간 부족으로
@@ -104,7 +140,6 @@ impl TypesetEngine {
             };
         if tail_before_break_through_empty {
             st.allow_tail_safety_margin_once();
-            st.allow_tail_footnote_margin_once();
             st.reserve_saved_tail_bounds(paragraph_saved_visible_bounds(para, 0, self.dpi));
         }
 
@@ -131,8 +166,20 @@ impl TypesetEngine {
                 let mut idx = para_idx + 1;
                 let mut prev = para;
                 let mut found = false;
+                let mut empty_advance_hu: i32 = para
+                    .line_segs
+                    .iter()
+                    .map(|line| line.line_height.saturating_add(line.line_spacing))
+                    .sum();
                 while let Some(next_para) = paragraphs.get(idx) {
                     if next_para.text.is_empty() && next_para.controls.is_empty() {
+                        empty_advance_hu = empty_advance_hu.saturating_add(
+                            next_para
+                                .line_segs
+                                .iter()
+                                .map(|line| line.line_height.saturating_add(line.line_spacing))
+                                .sum(),
+                        );
                         prev = next_para;
                         idx += 1;
                         continue;
@@ -147,6 +194,18 @@ impl TypesetEngine {
                     // 글이 있는 문단은 앞 빈 줄의 뒤쪽 경계다. 그 문단 다음의
                     // reset을 앞당겨 적용하면 실제 본문 앞 빈 줄의 점유가 사라진다.
                     found = reset_after_empty_run
+                        && !(st.col_count == 1
+                            && crate::renderer::pagination::reconsider_synthetic_text_page_break(
+                                next_para,
+                                &st.current_items,
+                                &st.hidden_empty_paras,
+                                st.hide_empty_line,
+                                st.hidden_line_reflow_active,
+                                st.available_height()
+                                    - st.current_height
+                                    - hwpunit_to_px(empty_advance_hu, self.dpi),
+                                self.dpi,
+                            ))
                         && !stored_tail_boundary_invalidated_at_current_flow(
                             st, paragraphs, idx, styles,
                         );
@@ -155,11 +214,14 @@ impl TypesetEngine {
                 found
             };
         if empty_tail_bridge_to_reset {
-            st.hide_empty_paragraph(para_idx);
-            st.append_item(PageItem::FullParagraph {
-                para_index: para_idx,
-            });
-            return true;
+            st.hide_empty_paragraph_with_storage(para_idx, storage)?;
+            st.append_item_with_storage(
+                PageItem::FullParagraph {
+                    para_index: para_idx,
+                },
+                storage,
+            )?;
+            return Ok(true);
         }
 
         // [#7288] **앞 프레임에 속한 빈 문단이 새 프레임의 첫 줄을 밀지 않는다.**
@@ -211,11 +273,14 @@ impl TypesetEngine {
                     })
             });
         if stale_frame_empty_absorbed {
-            st.hide_empty_paragraph(para_idx);
-            st.append_item(PageItem::FullParagraph {
-                para_index: para_idx,
-            });
-            return true;
+            st.hide_empty_paragraph_with_storage(para_idx, storage)?;
+            st.append_item_with_storage(
+                PageItem::FullParagraph {
+                    para_index: para_idx,
+                },
+                storage,
+            )?;
+            return Ok(true);
         }
 
         if next_will_vpos_reset {
@@ -233,13 +298,16 @@ impl TypesetEngine {
                     seg.vertical_pos > body_h_hu * 70 / 100
                 });
                 if page_bottom_empty_reset_bridge {
-                    st.hide_empty_paragraph(para_idx);
+                    st.hide_empty_paragraph_with_storage(para_idx, storage)?;
                     if !st.current_items.is_empty() {
-                        st.append_item(PageItem::FullParagraph {
-                            para_index: para_idx,
-                        });
+                        st.append_item_with_storage(
+                            PageItem::FullParagraph {
+                                para_index: para_idx,
+                            },
+                            storage,
+                        )?;
                     }
-                    return true;
+                    return Ok(true);
                 }
 
                 // [#1648] 빈 문단이 현재 페이지에 들어가면 정상 배치한다(한글 동작 —
@@ -321,20 +389,19 @@ impl TypesetEngine {
                     // → drop 대신 현재 페이지에 0-높이로 흡수 기록(hide_empty_line 와 동일
                     //   시멘틱). 페이지를 advance 하지 않으므로 단독 빈 페이지 회귀(synam-001
                     //   등)는 발생하지 않는다.
-                    st.hide_empty_paragraph(para_idx);
-                    st.append_item(PageItem::FullParagraph {
-                        para_index: para_idx,
-                    });
-                    return true;
+                    st.hide_empty_paragraph_with_storage(para_idx, storage)?;
+                    st.append_item_with_storage(
+                        PageItem::FullParagraph {
+                            para_index: para_idx,
+                        },
+                        storage,
+                    )?;
+                    return Ok(true);
                 }
                 // height·vpos 둘 다 fit → 정상 emit (아래로 진행)
             } else {
                 // 일반 텍스트 또는 컨트롤 보유: 안전마진 1회 비활성화 (단독 텍스트 페이지 차단)
                 st.allow_tail_safety_margin_once();
-                // [Task #1725] 각주 있는 페이지의 tail 문단: 각주 안전마진(40px 버퍼)도 1회
-                // 비활성화. 한글은 tail 을 본문에 배치하는데 rhwp 각주 예약 버퍼가 tail 을 수 px
-                // 밀어 near-empty 페이지 over-pagination(국제고속선기준 258 vs 242) 을 만든다.
-                st.allow_tail_footnote_margin_once();
                 // [Task #1725 v2] 각주 없이 페이지가 수 px over-fill 되어 tail 이 밀리는 경우도
                 // 한글은 저장 tail의 본문 하단 좌표를 유지한다. 다음 fit에서 실제
                 // 저장 bottom까지의 차이만 허용하도록 bounds를 전달한다.
@@ -389,11 +456,14 @@ impl TypesetEngine {
                     // 어긋났다(rhwp_pNone). 한컴은 이 빈 문단을 현재 page 하단의 빈 줄로
                     // 흡수(위 주석)하므로, drop 대신 현재 페이지에 0-높이로 흡수 기록한다.
                     // 페이지를 advance 하지 않으므로 단독 page 회귀(sample18 등)는 없다.
-                    st.hide_empty_paragraph(para_idx);
-                    st.append_item(PageItem::FullParagraph {
-                        para_index: para_idx,
-                    });
-                    return true;
+                    st.hide_empty_paragraph_with_storage(para_idx, storage)?;
+                    st.append_item_with_storage(
+                        PageItem::FullParagraph {
+                            para_index: para_idx,
+                        },
+                        storage,
+                    )?;
+                    return Ok(true);
                 }
                 // fit 가능 — 정상 emit (기존 동작)
             }
@@ -447,7 +517,7 @@ impl TypesetEngine {
                 .unwrap_or(0.0);
             let avail = st.available_height() - st.current_height;
             if empty_h_px > avail {
-                return true;
+                return Ok(true);
             }
         }
 
@@ -473,7 +543,7 @@ impl TypesetEngine {
                         start_line: 0,
                         end_line: usize::MAX,
                     });
-                    return true;
+                    return Ok(true);
                 }
                 st.finish_behind_float_absorption();
             } else {
@@ -481,6 +551,6 @@ impl TypesetEngine {
             }
         }
 
-        false
+        Ok(false)
     }
 }

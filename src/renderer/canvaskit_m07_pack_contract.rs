@@ -163,6 +163,7 @@ fn op_from_matrix_row(row: &serde_json::Value) -> PaintOp {
         "footnoteMarker" => PaintOp::footnote_marker(
             bbox(),
             FootnoteMarkerNode {
+                source_run: None,
                 number: row["number"].as_u64().unwrap_or(1) as u16,
                 text: row["text"].as_str().unwrap_or("1)").to_string(),
                 base_font_size: row["fontSize"].as_f64().unwrap_or(7.0),
@@ -199,6 +200,7 @@ fn op_from_matrix_row(row: &serde_json::Value) -> PaintOp {
                         border_type: 1,
                         inner_char_size: 100,
                         composition: None,
+                        empty_ink: false,
                     });
                     PaintOp::char_overlap(bbox(), run)
                 }
@@ -364,6 +366,7 @@ fn m07_pack_visual_item_limit_stays_fail_closed_at_4096() {
         border_type: 1,
         inner_char_size: 100,
         composition: None,
+        empty_ink: false,
     });
     let bound_plan = analyze_canvaskit_replay_plan(
         &tree_with_ops(vec![PaintOp::char_overlap(bbox(), at_bound)]),
@@ -376,6 +379,7 @@ fn m07_pack_visual_item_limit_stays_fail_closed_at_4096() {
         border_type: 1,
         inner_char_size: 100,
         composition: None,
+        empty_ink: false,
     });
     let over_plan = analyze_canvaskit_replay_plan(
         &tree_with_ops(vec![PaintOp::char_overlap(bbox(), over)]),
@@ -392,6 +396,7 @@ fn m07_pack_footnote_marker_stays_direct_with_declared_detail() {
     let tree = tree_with_ops(vec![PaintOp::footnote_marker(
         bbox(),
         FootnoteMarkerNode {
+            source_run: None,
             number: 12,
             text: "12)".to_string(),
             base_font_size: 8.0,

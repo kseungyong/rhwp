@@ -23,7 +23,7 @@ use crate::paint::{
     SvgGlyphPayload, TextDecorationKind, TextSourceAnnotation, TextSourceEntry, TextSourceId,
     TextSourceRange, TextSourceSpan, TextSourceTable, TextV2Diagnostics, LAYER_TREE_SCHEMA,
 };
-use crate::renderer::composer::expand_pua_render_text;
+use crate::renderer::composer::expand_pua_render_text_in_style;
 use crate::renderer::equation::ast::MatrixStyle;
 use crate::renderer::equation::layout::{LayoutBox, LayoutKind};
 use crate::renderer::equation::symbols::{DecoKind, FontStyleKind};
@@ -116,6 +116,7 @@ struct JsonWriteContext<'a> {
     bin_data_epoch: u32,
     options: LayerJsonOptions,
     visual_bounds: &'a HashMap<*const LayerNode, BoundingBox>,
+    profile: RenderProfile,
 }
 
 impl PageLayerTree {
@@ -131,7 +132,7 @@ impl PageLayerTree {
         buf.push('{');
         let _ = write!(
             buf,
-            "\"schemaVersion\":{},\"schemaMinorVersion\":{},\"schema\":{{\"major\":{},\"minor\":{}}},\"resourceTableVersion\":{},\"resourceTableMinorVersion\":{},\"resourceTable\":{{\"major\":{},\"minor\":{}}},\"unit\":{},\"coordinateSystem\":{},\"profile\":{},\"imageBytes\":{},\"buildOptions\":{{\"showTransparentBorders\":{},\"clipEnabled\":{}}},\"debugOptions\":{{\"debugOverlay\":{}}},\"outputOptions\":{{\"showParagraphMarks\":{},\"showControlCodes\":{},\"showTransparentBorders\":{},\"clipEnabled\":{},\"debugOverlay\":{}}},\"pageWidth\":{:.3},\"pageHeight\":{:.3},\"root\":",
+            "\"schemaVersion\":{},\"schemaMinorVersion\":{},\"schema\":{{\"major\":{},\"minor\":{}}},\"resourceTableVersion\":{},\"resourceTableMinorVersion\":{},\"resourceTable\":{{\"major\":{},\"minor\":{}}},\"unit\":{},\"coordinateSystem\":{},\"profile\":{},\"rasterTextGeometry\":{},\"rasterClipCoverage\":{},\"imageBytes\":{},\"buildOptions\":{{\"showTransparentBorders\":{},\"clipEnabled\":{}}},\"debugOptions\":{{\"debugOverlay\":{}}},\"outputOptions\":{{\"showParagraphMarks\":{},\"showControlCodes\":{},\"showTransparentBorders\":{},\"clipEnabled\":{},\"debugOverlay\":{}}},\"pageWidth\":{:.3},\"pageHeight\":{:.3},\"root\":",
             LAYER_TREE_SCHEMA.schema_version,
             LAYER_TREE_SCHEMA.schema_minor_version,
             LAYER_TREE_SCHEMA.schema_version,
@@ -143,6 +144,8 @@ impl PageLayerTree {
             json_escape(LAYER_TREE_SCHEMA.unit),
             json_escape(LAYER_TREE_SCHEMA.coordinate_system),
             json_escape(render_profile_str(self.profile)),
+            self.preserves_raster_text_geometry(),
+            self.uses_raster_clip_coverage(),
             // [#3315] 이 문서를 어떤 **모드**로 요청했는지 — `inline` 이면 바이트가 op 안에,
             // `byKey` 면 키로 따로 받는다.
             //
@@ -174,6 +177,7 @@ impl PageLayerTree {
                 bin_data_epoch: self.resources.source_image_epoch(),
                 options,
                 visual_bounds: &visual_bounds,
+                profile: self.profile,
             },
         );
         buf.push_str(",\"textSources\":");
@@ -912,6 +916,9 @@ impl PaintOp {
                     run.is_vertical,
                     json_escape(text_orientation_str(run)),
                 );
+                if let Some(display) = &run.display_text {
+                    let _ = write!(buf, ",\"displayText\":{}", json_escape(display));
+                }
                 buf.push_str(",\"style\":");
                 write_text_style(buf, &run.style);
                 buf.push_str(",\"paintStyle\":");
@@ -1017,6 +1024,12 @@ impl PaintOp {
                     json_escape(&color_ref_to_css(marker.color)),
                     marker.baseline,
                 );
+                if let Some(run) = marker.source_run.as_deref() {
+                    buf.push_str(",\"style\":");
+                    write_text_style(buf, &run.style);
+                    buf.push_str(",\"positions\":");
+                    write_text_positions(buf, run);
+                }
                 buf.push('}');
             }
             PaintOp::Line { bbox, line } => {
@@ -1043,13 +1056,30 @@ impl PaintOp {
             PaintOp::Rectangle { bbox, rect } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"rectangle\",\"bbox\":");
-                write_bbox(buf, *bbox);
+                let device_fill = ctx.profile == RenderProfile::Print
+                    && crate::paint::device_fill::eligible(rect);
+                if device_fill || rect.print_picture_pen.is_some() {
+                    // 장치 픽셀 선택 전에 원본 끝점을 세 자리로 절삭하지 않는다.
+                    let _ = write!(
+                        buf,
+                        "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        bbox.x, bbox.y, bbox.width, bbox.height
+                    );
+                } else {
+                    write_bbox(buf, *bbox);
+                }
+                if device_fill {
+                    buf.push_str(",\"printFillCoverage\":\"device\"");
+                }
                 let _ = write!(
                     buf,
                     ",\"cornerRadius\":{:.3},\"style\":",
                     rect.corner_radius
                 );
                 write_shape_style(buf, &rect.style);
+                if let Some([band, outline]) = rect.print_picture_pen {
+                    let _ = write!(buf, ",\"printPicturePen\":[{band},{outline}]");
+                }
                 if rect.round_stroke_join {
                     buf.push_str(",\"strokeJoin\":\"round\"");
                 }
@@ -1115,8 +1145,23 @@ impl PaintOp {
                     .then(|| crate::renderer::image_resolver::resolve_image_payload(image))
                     .flatten();
                 let resolved = resolved.as_deref().or(fallback.as_ref());
+                let prepared =
+                    crate::renderer::image_resolver::image_for_resolved_window(image, resolved);
+                let image = prepared.as_ref();
                 // [#7193] 소비자가 그리는 자리 — 틀에서 그림 안쪽 여백을 뺀 사각형.
-                write_bbox(buf, image.paint_bbox(bbox));
+                let image_bbox = image.paint_bbox(bbox);
+                if ctx.profile == RenderProfile::Print
+                    && crate::paint::device_image::eligible(image)
+                {
+                    let _ = write!(
+                        buf,
+                        "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        image_bbox.x, image_bbox.y, image_bbox.width, image_bbox.height
+                    );
+                    buf.push_str(",\"printImageCoverage\":\"device\"");
+                } else {
+                    write_bbox(buf, image_bbox);
+                }
                 buf.push_str(",\"imagePaintBBox\":");
                 write_bbox(buf, image.transformed_paint_bbox(bbox));
                 if image.pre_rotation_ratio.is_some() || image.source_rect.is_some() {
@@ -1151,7 +1196,17 @@ impl PaintOp {
                         &serde_json::to_string(&image.source_clip_path(bbox).unwrap()).unwrap(),
                     );
                 }
-                if resolved
+                if crate::renderer::image_resolver::print_area_sampling(image, resolved) {
+                    if resolved.is_some_and(|payload| {
+                        crate::renderer::image_resolver::png_sampling::print_separate_alpha(
+                            &payload.data,
+                        )
+                    }) {
+                        buf.push_str(",\"imageReconstruction\":\"printMaskedArea\"");
+                    } else {
+                        buf.push_str(",\"imageReconstruction\":\"printArea\"");
+                    }
+                } else if resolved
                     .map(|payload| payload.data.as_slice())
                     .or(image.data.as_deref())
                     .is_some_and(
@@ -1176,16 +1231,11 @@ impl PaintOp {
                 // 그림(`bin_data_id == 0`)은 되찾을 길이 없으므로 종전대로 싣는다.
                 // 배치·장치에 맞춘 바이트는 원본 bin 키로 다시 얻을 수 없다.
                 // 이 op은 실제 출력 바이트를 싣고 내용 기반 이미지 캐시가 이를 구분한다.
-                let source_image_key = if resolved.is_some_and(|p| {
-                    matches!(
-                        p.kind,
-                        ResolvedImageKind::OutputDevice | ResolvedImageKind::SourceWindow
-                    )
-                }) {
-                    None
-                } else {
-                    crate::paint::source_image_key(ctx.bin_data_epoch, image)
-                };
+                let source_image_key = crate::paint::resources::source_image_key_for_payload(
+                    ctx.bin_data_epoch,
+                    image,
+                    resolved,
+                );
                 let omit_bytes = ctx.options.omit_image_bytes && source_image_key.is_some();
                 if let Some(payload) = resolved {
                     if omit_bytes {
@@ -1769,6 +1819,9 @@ fn write_group_kind(buf: &mut String, group_kind: &GroupKind) {
             if let Some(index) = cell.model_cell_index {
                 let _ = write!(buf, ",\"modelCellIndex\":{}", index);
             }
+            if let Some((start, end)) = cell.model_para_range {
+                let _ = write!(buf, ",\"modelParaRange\":[{start},{end}]");
+            }
             buf.push('}');
         }
         GroupKind::TextBox => buf.push_str("{\"kind\":\"textBox\"}"),
@@ -1806,6 +1859,7 @@ fn clip_kind_str(value: ClipKind) -> &'static str {
         ClipKind::TableCell => "tableCell",
         ClipKind::TextBox => "textBox",
         ClipKind::Generic => "generic",
+        ClipKind::PrintBitmapFill => "printBitmapFill",
     }
 }
 
@@ -1841,11 +1895,29 @@ fn write_text_style(buf: &mut String, style: &TextStyle) {
     if style.kerning {
         buf.push_str(",\"kerning\":true");
     }
+    if let Some(paint) = style.text_paint {
+        buf.push_str(",\"textPaint\":");
+        buf.push_str(&serde_json::to_string(&paint).expect("finite resolved text paint"));
+    } else {
+        write_char_outline_stroke(buf, style.outline_type);
+    }
     write_synthetic_italic_skew(buf, style.italic);
     if let Some(layout) = &style.bidi_layout {
         buf.push_str(",\"bidiLayout\":");
         buf.push_str(&serde_json::to_string(layout).expect("방향 결과의 유한 좌표"));
     }
+    style.script_metrics.write_json(
+        buf,
+        style.font_size,
+        style.superscript,
+        style.subscript,
+        style.font_position,
+    );
+    super::text_shadow::write_offsets_json(
+        buf,
+        style.shadow_type,
+        style.continuous_shadow.as_ref(),
+    );
     buf.push('}');
 }
 
@@ -1878,8 +1950,45 @@ fn write_paint_text_style(buf: &mut String, style: &PaintTextStyle) {
         json_escape(&color_ref_to_css(style.shade_color)),
         style.emphasis_dot,
     );
+    if let Some(paint) = style.text_paint {
+        buf.push_str(",\"textPaint\":");
+        buf.push_str(&serde_json::to_string(&paint).expect("finite resolved text paint"));
+    } else {
+        write_char_outline_stroke(buf, style.outline_type);
+    }
     write_synthetic_italic_skew(buf, style.italic);
+    style.script_metrics.write_json(
+        buf,
+        style.font_size,
+        style.superscript,
+        style.subscript,
+        style.font_position,
+    );
+    super::text_shadow::write_offsets_json(
+        buf,
+        style.shadow_type,
+        style.continuous_shadow.as_ref(),
+    );
     buf.push('}');
+}
+
+// Native·SVG·Canvas2D가 쓰는 같은 pen 결과를 CanvasKit에도 전달한다.
+// 소비자가 종류 번호에서 다시 굵기·반복 구간을 추측하지 않는다.
+fn write_char_outline_stroke(buf: &mut String, outline_type: u8) {
+    let Some((width, intervals)) = crate::renderer::char_outline_stroke(outline_type) else {
+        return;
+    };
+    let _ = write!(
+        buf,
+        ",\"outlineStroke\":{{\"width\":{width},\"intervals\":["
+    );
+    for (index, value) in intervals.iter().enumerate() {
+        if index > 0 {
+            buf.push(',');
+        }
+        let _ = write!(buf, "{value}");
+    }
+    buf.push_str("]}");
 }
 
 fn write_synthetic_italic_skew(buf: &mut String, italic: bool) {
@@ -1920,7 +2029,7 @@ fn write_bounded_text_positions(buf: &mut String, text: &str, style: &TextStyle)
 }
 
 fn display_text_for_text_run(run: &TextRunNode) -> Option<String> {
-    let display_text = expand_pua_render_text(run.display_or_text());
+    let display_text = expand_pua_render_text_in_style(run.display_or_text(), &run.style);
     (display_text != run.text.as_str()).then_some(display_text)
 }
 
@@ -2991,7 +3100,7 @@ fn write_text_decoration(
     let _ = write!(buf, "],\"positionsComplete\":{complete}");
     if kind == TextDecorationKind::Underline {
         if let Some(top) =
-            crate::renderer::text_decoration::top_underline_geometry(&run.style, font_size)
+            crate::renderer::text_decoration::underline_geometry(&run.style, font_size)
         {
             let _ = write!(
                 buf,
@@ -3124,6 +3233,9 @@ fn write_line_style(buf: &mut String, style: &LineStyle) {
     }
     if style.compound_component {
         buf.push_str(",\"compoundComponent\":true");
+    }
+    if style.preserve_fractional_position {
+        buf.push_str(",\"preserveFractionalPosition\":true");
     }
     if let Some(shadow) = &style.shadow {
         buf.push_str(",\"shadow\":");
@@ -3773,6 +3885,7 @@ mod tests {
                     border_type: 1,
                     inner_char_size: 90,
                     composition: None,
+                    empty_ink: false,
                 }),
                 border_fill_id: 0,
                 baseline: 13.0,
@@ -3896,8 +4009,9 @@ mod tests {
             font_size: 16.0,
             ..Default::default()
         };
-        let text = "\u{F012B}(Signature)";
-        let display_text = "(인)(Signature)";
+        // Hanyang PUA 옛한글 한 글자가 자모 셋으로 펼쳐지는 1→N 표시 투영이다.
+        let text = "\u{E0BC}(Signature)";
+        let display_text = "\u{115F}\u{1161}\u{11AE}(Signature)";
         let source_positions = compute_char_positions(text, &style);
         let display_positions = compute_char_positions(display_text, &style);
         let text_run = PaintOp::text_run(
@@ -4096,6 +4210,7 @@ mod tests {
                 border_type: 2,
                 inner_char_size: 80,
                 composition: None,
+                empty_ink: false,
             }),
             border_fill_id: 0,
             baseline: 11.0,
@@ -4147,7 +4262,7 @@ mod tests {
 
         let value: Value = serde_json::from_str(&json).expect("valid layer JSON");
         let ops = value["root"]["ops"].as_array().expect("leaf ops");
-        let display_text = expand_pua_render_text(&run.text);
+        let display_text = crate::renderer::composer::expand_pua_render_text(&run.text);
         let positions = compute_char_positions(&display_text, &run.style);
         let expected_end = clamp_tab_leader_end_x(
             &display_text,
@@ -4167,7 +4282,7 @@ mod tests {
     #[test]
     fn decoration_uses_display_positions_and_script_metrics() {
         let run = TextRunNode {
-            text: "\u{F012B}".to_string(),
+            text: "\u{E0BC}".to_string(),
             style: TextStyle {
                 font_family: "Noto Sans".to_string(),
                 font_size: 20.0,
@@ -4308,6 +4423,7 @@ mod tests {
                 border_type: 1,
                 inner_char_size: 100,
                 composition: None,
+                empty_ink: false,
             }),
             border_fill_id: 0,
             baseline: 10.0,

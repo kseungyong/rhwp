@@ -27,7 +27,8 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            # Keep the GNU binary compatible with Ubuntu 24.04 (glibc 2.39).
+            runner: ubuntu-24.04
             archive: tar.gz
             archive_suffix: linux-x86_64
             binary_name: rhwp
@@ -116,6 +117,14 @@ jobs:
         run: |
           target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version
 
+      - name: Install Python for release verification
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Prepare third-party notices
+        run: python scripts/prepare_release_notices.py dist/rhwp/notices
+
       - name: Package archive (Linux/macOS)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -126,6 +135,7 @@ jobs:
           cp LICENSE dist/rhwp/
           cp README.md dist/rhwp/
           cp README_EN.md dist/rhwp/
+          cp packaging/PDF_QUICKSTART.md packaging/PDF_QUICKSTART_EN.md dist/rhwp/
           cd dist && tar -czf "../${ARCHIVE_NAME}" rhwp/
           cd ..
           ls -la "${ARCHIVE_NAME}"
@@ -141,17 +151,13 @@ jobs:
           Copy-Item LICENSE dist/rhwp/
           Copy-Item README.md dist/rhwp/
           Copy-Item README_EN.md dist/rhwp/
+          Copy-Item packaging/PDF_QUICKSTART.md, packaging/PDF_QUICKSTART_EN.md dist/rhwp/
           Compress-Archive -Path dist/rhwp -DestinationPath $archiveName -Force
           Get-ChildItem $archiveName
           "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Verify the packaged binary on every platform, including the Intel binary
       # on macOS ARM. --version alone cannot detect a missing optional backend.
-      - name: Install Python for release verification
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.12'
-
       - name: Verify packaged PNG export
         shell: bash
         run: |
@@ -195,7 +201,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Attach to release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: |

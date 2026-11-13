@@ -27,6 +27,7 @@ impl TypesetEngine {
             suppress_large_forward_jump: false,
             suppress_hwpx_stale_forward: st.profile.hwpx_stored_layout(),
             rejected_stored_forward_origin: None,
+            rebased_after_unstored_forward: false,
             stored_equation_reflow: st.profile.hwp5_container(),
             prev_reissued_equation_rows: st
                 .vpos_prev_layout_para
@@ -61,6 +62,7 @@ impl TypesetEngine {
             endnote_note_first_paras: Default::default(),
             endnote_tail_leading_hu: Default::default(),
             seed_lazy_base_from_next_stored: false,
+            synthetic_forward_rejected_hu: 0,
         }
     }
 
@@ -96,6 +98,7 @@ impl TypesetEngine {
             hc.rejected_stored_forward_origin
                 .map(|source| (para_idx, source)),
         );
+        st.record_rebased_after_unstored_forward(hc.rebased_after_unstored_forward);
     }
 
     /// 렌더러 `build_single_column` 의 inter-item VPOS_CORR(Stage C `HeightCursor::vpos_adjust`)
@@ -113,58 +116,38 @@ impl TypesetEngine {
         styles: &ResolvedStyleSet,
         spacing_before_px: f64,
     ) {
+        match self.vpos_snap_current_height_with_storage(
+            st,
+            para_idx,
+            paragraphs,
+            composed,
+            styles,
+            spacing_before_px,
+            &crate::storage::Unbounded,
+        ) {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(in crate::renderer::typeset) fn vpos_snap_current_height_with_storage<
+        S: crate::storage::Storage,
+    >(
+        &self,
+        st: &mut TypesetState,
+        para_idx: usize,
+        paragraphs: &[Paragraph],
+        composed: &[ComposedParagraph],
+        styles: &ResolvedStyleSet,
+        spacing_before_px: f64,
+        storage: &S,
+    ) -> Result<(), S::Error> {
         if st.col_count != 1 {
-            return; // 다단은 Stage E
+            return Ok(()); // 다단은 Stage E
         }
-        // 컬럼 첫 항목: anchor + page_base 확립 (렌더러 2186/2216 정합).
-        // items.first() 의 vpos 를 page_base 로, 현 current_height 를 anchor 로 둔다.
-        if st.current_items.is_empty() {
-            st.record_vpos_column_anchor(st.current_height);
-            st.record_vpos_page_origin(
-                paragraphs
-                    .get(para_idx)
-                    .and_then(|p| p.line_segs.first())
-                    .map(|seg| {
-                        // 배치가 보존하는 문단 앞 여백을 측정의 쪽 원점으로 빼지 않는다.
-                        let margin_is_page_relative = (st.profile.hwpx_stored_layout()
-                            || st.profile.hwp5_stored_pagination_layout()
-                            || st.profile.hwp3_native_layout())
-                            && !st.profile.session_edited()
-                            && paragraphs.get(para_idx).is_some_and(|first| {
-                                crate::renderer::stored_page_origin::stored_first_margin_is_page_relative(
-                                    first,
-                                    paragraphs.get(para_idx + 1),
-                                    styles,
-                                    self.dpi,
-                                )
-                            });
-                        if margin_is_page_relative {
-                            0
-                        } else {
-                            seg.vertical_pos
-                                - paragraphs.get(para_idx).map_or(0, |first| {
-                                    crate::renderer::layout::synthesized_first_margin_hu(
-                                        first, styles, self.dpi,
-                                    )
-                                })
-                        }
-                    }),
-            );
-            st.record_vpos_lazy_origin(None);
-            st.record_stored_column_origin(
-                st.vpos_page_base.map(|base| (base, st.vpos_col_anchor)),
-            );
-            // [#2243] 저장 여부 태깅 — dirty 역스냅 금지 판단용.
-            st.record_vpos_origin_provenance(
-                paragraphs
-                    .get(para_idx)
-                    .and_then(|p| p.line_segs.first())
-                    .is_some_and(|s| {
-                        s.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
-                    }),
-            );
-            st.record_vpos_ladder_validity(false);
-        }
+        let first_item_stored_top = super::super::paragraph::initialize_first_paragraph_origin(
+            st, para_idx, paragraphs, styles, self.dpi,
+        );
         // [#7824] 합성 줄(`TAG_IMPLEMENTATION_PROPERTY`)만 가진 문단이 흐름에 들어오면 이 쪽의
         // 사다리는 한/글 사다리가 아니다 — 로드 재구성이 그 문단에 rhwp 의 누적 좌표를 주므로,
         // 뒤 저장 문단의 쪽-상대 vpos 와 같은 좌표계가 아니다. 그러면 뒤 저장 문단의 스냅이
@@ -199,6 +182,9 @@ impl TypesetEngine {
         } else {
             hc.vpos_adjust(st.current_height, para_idx, paragraphs, styles)
         };
+        if let Some(top) = first_item_stored_top {
+            y = y.max(top);
+        }
         // 재조판된 저장 문단이 행을 줄였으면 후속 저장 사다리의 절대 vpos는
         // 옛 행 수를 담고 있다. 동일 쪽에서 회수한 높이를 뺀 뒤 흐름 뒤로만 스냅한다.
         if st.profile.hwpx_stored_layout()
@@ -319,32 +305,37 @@ impl TypesetEngine {
         {
             y = st.current_height;
         }
-        // [#2243 진단] snap 입출력 — 동작 불변.
-        if std::env::var("RHWP_DIAG_SNAPALL").is_ok() {
-            eprintln!(
-                "DIAG_SNAPALL sec={} page={} pi={} y_in={:.1} y_out={:.1} base={:?} lazy={:?} anchor={:.1} dirty={} source={:?}",
-                st.section_index,
-                st.pages.len(),
-                para_idx,
-                st.current_height,
-                y,
-                st.vpos_page_base,
-                hc.vpos_lazy_base,
-                st.vpos_col_anchor,
-                st.vpos_ladder_dirty,
-                hc.stored_column_origin,
-            );
-        }
-        if std::env::var("RHWP_DIAG_TAC").is_ok() && (y - st.current_height).abs() > 0.05 {
-            eprintln!(
-                "DIAG_SNAP pi={} y_in={:.1} y_out={:.1} page_base={:?} lazy={:?} anchor={:.1}",
-                para_idx,
-                st.current_height,
-                y,
-                st.vpos_page_base,
-                hc.vpos_lazy_base,
-                st.vpos_col_anchor,
-            );
+        // 배치가 버릴 스냅을 측정이 따르면 그리지 않는 높이로 쪽을 넘긴다. 같은 판정을 쓰고
+        // 뒤 문단의 상대 간격을 위해 사다리 원점도 함께 옮긴다.
+        if st.profile.hwpx_stored_layout() {
+            let previous_line_owner = st.current_items.last().and_then(|item| match item {
+                crate::renderer::typeset::PageItem::FullParagraph { para_index }
+                | crate::renderer::typeset::PageItem::PartialParagraph { para_index, .. } => {
+                    Some(*para_index)
+                }
+                _ => None,
+            });
+            let keeps_gap = paragraphs.get(para_idx).is_some_and(|para| {
+                crate::renderer::height_cursor::stale_snap_stays_above_band(
+                    para,
+                    para_idx,
+                    st.current_height,
+                    y,
+                    st.visible_float_exclusions
+                        .iter()
+                        .map(|zone| (zone.para_index, zone.top)),
+                    previous_line_owner,
+                    self.dpi,
+                )
+            });
+            if keeps_gap {
+                hc.shift_vpos_base_for_rendered_backtrack(y - st.current_height);
+                st.record_rejected_gap_snap(crate::renderer::px_to_hwpunit(
+                    y - st.current_height,
+                    self.dpi,
+                ));
+                y = st.current_height;
+            }
         }
         // 페이지 배분이 확정한 단 상대 흐름 경계는 배치도 그대로 소비한다.
         // 앞 문단을 완전히 수용한 같은 단에서 다음 시작으로 이동했으면 그
@@ -370,13 +361,14 @@ impl TypesetEngine {
             {
                 let previous = *previous;
                 if previous != para_idx && st.vpos_prev_layout_para == Some(previous) {
-                    st.record_stored_paragraph_flow_end(previous, y);
+                    st.record_stored_paragraph_flow_end_with_storage(previous, y, storage)?;
                 }
             }
         }
         // 재조판 뒤 저장 줄의 원점 연결과 지연 기준 산출을 모두 회수한다.
         st.record_vpos_page_origin(hc.vpos_page_base);
         st.record_vpos_lazy_origin(hc.vpos_lazy_base);
+        st.record_synthetic_forward_rejected(hc.synthetic_forward_rejected_hu);
         st.record_stored_column_origin(hc.stored_column_origin);
         st.record_vpos_column_anchor(hc.col_anchor_y);
         st.align_flow_to(y);
@@ -385,5 +377,8 @@ impl TypesetEngine {
             hc.rejected_stored_forward_origin
                 .map(|source| (para_idx, source)),
         );
+        st.record_rebased_after_unstored_forward(hc.rebased_after_unstored_forward);
+
+        Ok(())
     }
 }

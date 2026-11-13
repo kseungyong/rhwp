@@ -50,7 +50,7 @@ fn unaccounted_topbottom_band_hu(para: &Paragraph) -> Option<i64> {
         || common.height == 0
         || common.height > i32::MAX as u32
         || table.caption.is_some()
-        || table.page_break != TablePageBreak::None
+        || table.layout_page_break() != TablePageBreak::None
     {
         return None;
     }
@@ -133,4 +133,85 @@ pub(crate) fn stored_line_ladder_is_uniform_filler(
     }
 
     contradicting * CONTRADICTION_RATIO_DIVISOR >= paragraphs.len()
+}
+
+/// [#8474] 단 맨 위 문단의 저장 첫 줄이 증언하는 쪽 위 간격(px).
+///
+/// 한/글은 문단 위 간격을 쪽 맨 위에서도 적용한다 — 구역 첫 쪽·쪽 나누기·자연 쪽 넘김
+/// 모두 첫 줄 vpos 가 위 간격과 같다(합성 실측, `samples/issue8474/`). 저장 사다리를 믿는
+/// 경로에서 첫 줄이 원본 줄이고 그 vpos 가 0 보다 크고 위 간격 이하이면 그 vpos 를 쪽 위
+/// 간격으로 쓴다. 그 밖(합성 줄·편집·구역 누적 좌표)은 0 이다. 글자처럼 취급 표 host 의
+/// 단일 저장 줄 TAC 계획(`physical_tac`)이 이 값을 원점에 두고 paint 가 그 원점을 그대로 쓴다.
+pub(crate) fn stored_column_top_spacing(
+    para: &Paragraph,
+    spacing_before: f64,
+    stored_profile: bool,
+    dpi: f64,
+) -> f64 {
+    if !stored_profile
+        || spacing_before <= 0.0
+        || para.stored_text_partition_is_dirty()
+        || para.cell_format_vpos_dirty
+    {
+        return 0.0;
+    }
+    let Some(first) = para.line_segs.first() else {
+        return 0.0;
+    };
+    if first.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0 {
+        return 0.0;
+    }
+    let vpos = para
+        .source_line_seg_vertical_pos
+        .as_ref()
+        .and_then(|positions| positions.first())
+        .copied()
+        .unwrap_or(first.vertical_pos);
+    let saved_top = hwpunit_to_px(vpos, dpi);
+    if saved_top > 0.0 && saved_top <= spacing_before + 0.5 {
+        saved_top
+    } else {
+        0.0
+    }
+}
+
+/// 원본 FIRST..LAST가 같은 물리 행의 비중첩 수평 조각을 완결하는지 확인한다.
+/// bit31은 구현 편의 속성이며, 이 소유 관계 자체를 별도 줄로 바꾸지 않는다.
+/// 같은 높이의 개별 완결 행·쪽/단 시작·내용 없는 합성 자리표는 이 경계가 아니다.
+pub(crate) fn has_declared_fragment_boundary(para: &Paragraph, index: usize) -> bool {
+    let rows = &para.line_segs;
+    let Some((previous, current)) = index
+        .checked_sub(1)
+        .and_then(|before| rows.get(before).zip(rows.get(index)))
+    else {
+        return false;
+    };
+    if previous.vertical_pos != current.vertical_pos
+        || previous.column_start == current.column_start
+    {
+        return false;
+    }
+    let top = current.vertical_pos;
+    let mut start = index - 1;
+    while start > 0 && rows[start - 1].vertical_pos == top {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < rows.len() && rows[end].vertical_pos == top {
+        end += 1;
+    }
+    let row = &rows[start..end];
+    row.iter().enumerate().all(|(offset, segment)| {
+        segment.line_height > 0
+            && segment.segment_width > 0
+            && segment.is_first_segment() == (offset == 0)
+            && segment.is_last_segment() == (offset + 1 == row.len())
+            && (offset == 0
+                || (!segment.is_first_line_of_page() && !segment.is_first_line_of_column()))
+    }) && row.windows(2).all(|pair| {
+        pair[0]
+            .column_start
+            .checked_add(pair[0].segment_width)
+            .is_some_and(|right| right <= pair[1].column_start)
+    })
 }

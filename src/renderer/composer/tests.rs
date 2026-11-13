@@ -284,6 +284,7 @@ fn context_display_overlay_preserves_frame_style_partitions_around_the_field() {
             space_metric: crate::renderer::composer::SpaceMetric::Stored,
             regenerated_font_metrics: false,
             literal_figure_space: false,
+            literal_soft_hyphen: false,
             ..stale.clone()
         },
         ComposedTextRun {
@@ -380,7 +381,8 @@ fn modest_field_fill_reflows_a_geometry_matching_stored_partition() {
         &clean_composed,
         &clean_probe,
         inner_width,
-        &styles
+        &styles,
+        false
     ));
     let mut clean_frame = ParagraphBox::content(0..width_hwp).frame(0);
     assert!(matches!(
@@ -398,7 +400,7 @@ fn modest_field_fill_reflows_a_geometry_matching_stored_partition() {
         Some(line_breaking::StoredRowResolution::Stored)
     ));
 
-    let stale = stored_rows_are_stale(&composed, &para, inner_width, &styles);
+    let stale = stored_rows_are_stale(&composed, &para, inner_width, &styles, false);
     assert!(
         stale,
         "the mutation bit, not overflow magnitude, is decisive"
@@ -433,6 +435,64 @@ fn modest_field_fill_reflows_a_geometry_matching_stored_partition() {
         !materialized.stored_text_partition_is_dirty(),
         "a model-writing reflow publishes a current partition"
     );
+    {
+        let text = "alpha\tomega";
+        let extensions = vec![[7500, 0, 0x0203, 0, 0, 0, 9]];
+        let mut para = Paragraph {
+            text: text.into(),
+            char_count: text.chars().count() as u32 + 1,
+            char_offsets: (0..text.chars().count() as u32).collect(),
+            tab_extended: extensions.clone(),
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            }],
+            line_segs: vec![LineSeg {
+                segment_width: 15000,
+                line_height: 1000,
+                text_height: 900,
+                baseline_distance: 800,
+                tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let composed = compose_paragraph(&para);
+        assert_eq!(
+            composed.tab_extended, extensions,
+            "저장 줄 수용 경로는 전진을 보존한다"
+        );
+        para.invalidate_layout_inputs();
+        assert!(para.stored_text_partition_is_dirty());
+        let styles = crate::renderer::style_resolver::ResolvedStyleSet::default();
+        let rebuilt = recompose_stored_lines_in_frame(
+            &composed,
+            &para,
+            ParagraphBox::content(0..15000),
+            200.0,
+            &styles,
+            96.0,
+            false,
+            StoredRowMissPolicy::Reflow,
+            &[],
+        )
+        .expect("편집으로 무효화한 저장 줄은 현재 프레임에서 재구성한다");
+        assert!(
+            rebuilt.tab_extended.is_empty(),
+            "옛 줄의 전진을 새 줄에서 다시 수용하지 않는다"
+        );
+        assert_eq!(
+            para.tab_extended, extensions,
+            "원본·직렬화 데이터는 보존한다"
+        );
+        let visible: String = rebuilt
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(visible, text, "재조판은 내용 순서·누락·중복을 보존한다");
+    }
 }
 
 /// 누름틀을 가진 본문 문단도 프레임이 소유한다 — 소유자 없는 문단을 만들면 안 된다.
@@ -798,11 +858,19 @@ fn test_compose_multi_line_multi_style() {
 
 /// table-vpos-01 page 5의 10/11/12 마커는 CharOverlap 하나에 두 개의
 /// HWP PUA 구성 글자가 들어온다. 텍스트 흐름과 캐럿 이동은 한 글자 폭이어야 한다.
+/// 두 글자는 사각형 블록의 십의자리 1·일의자리 0이다(한컴 12.30 사각형 "12" 저장본과 같은 블록).
 #[test]
 fn test_char_overlap_multi_component_is_single_advance() {
     let chars = vec!['\u{F02BA}', '\u{F02C3}'];
-    assert_eq!(decode_pua_overlap_number(&chars), None);
+    assert_eq!(decode_pua_overlap_number(&chars).as_deref(), Some("10"));
+    assert_eq!(pua_overlap_number_border(&chars), 3);
     assert_eq!(char_overlap_advance_units(&chars), 1);
+    // 한컴 반전 원·반전 사각형 "12"
+    assert_eq!(
+        decode_pua_overlap_number(&['\u{F029D}', '\u{F02A8}']).as_deref(),
+        Some("12")
+    );
+    assert_eq!(pua_overlap_number_border(&['\u{F02D7}', '\u{F02E2}']), 4);
 }
 
 /// [#4085] `charSz` 는 OWPML 상 "테두리 내부 글자의 크기 비율"이므로 테두리를
@@ -826,24 +894,6 @@ fn char_overlap_signed_size_steps_follow_hancom_print() {
     // 기존 PR #1101의 테두리 있는 음수 크기 계약도 유지한다.
     assert_eq!(char_overlap_size_ratio(4, -2), 0.8);
     assert_eq!(char_overlap_size_ratio(3, 0), 1.0);
-}
-
-/// LineSeg 없는 텍스트 문단
-#[test]
-fn test_compose_no_line_segs() {
-    let para = Paragraph {
-        text: "텍스트만 있음".to_string(),
-        char_shapes: vec![CharShapeRef {
-            start_pos: 0,
-            char_shape_id: 7,
-        }],
-        ..Default::default()
-    };
-
-    let composed = compose_paragraph(&para);
-    assert_eq!(composed.lines.len(), 1);
-    assert_eq!(composed.lines[0].runs[0].text, "텍스트만 있음");
-    assert_eq!(composed.lines[0].runs[0].char_style_id, 7);
 }
 
 /// 확장 컨트롤 문자로 인한 위치 격차
@@ -1198,6 +1248,7 @@ fn test_split_runs_by_lang_korean_english() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     }];
     let result = split_runs_by_lang(runs);
     assert_eq!(result.len(), 3);
@@ -1225,6 +1276,7 @@ fn test_split_runs_by_lang_no_split() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     }];
     let result = split_runs_by_lang(runs);
     assert_eq!(result.len(), 1);
@@ -1248,6 +1300,7 @@ fn test_split_runs_by_lang_space_follows_prev() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     }];
     let result = split_runs_by_lang(runs);
     assert_eq!(result.len(), 3);
@@ -1275,6 +1328,7 @@ fn test_split_runs_by_lang_empty() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     }];
     let result = split_runs_by_lang(runs);
     assert_eq!(result.len(), 1);
@@ -1297,6 +1351,7 @@ fn test_split_runs_by_lang_english_only() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     }];
     let result = split_runs_by_lang(runs);
     assert_eq!(result.len(), 1);
@@ -1404,6 +1459,7 @@ fn test_estimate_composed_line_width() {
             space_metric: crate::renderer::composer::SpaceMetric::Stored,
             regenerated_font_metrics: false,
             literal_figure_space: false,
+            literal_soft_hyphen: false,
         }],
         line_height: 400,
         baseline_distance: 320,
@@ -1904,6 +1960,7 @@ fn test_555_effective_text_for_metrics_uses_display_text_when_present() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     };
     let effective = super::effective_text_for_metrics(&run);
     assert_eq!(
@@ -1932,6 +1989,7 @@ fn test_555_effective_text_for_metrics_multi_jamo_cluster() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     };
     let effective = super::effective_text_for_metrics(&run);
     assert_eq!(
@@ -1961,6 +2019,7 @@ fn test_555_effective_text_for_metrics_no_display_text_falls_back_to_text() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     };
     let effective = super::effective_text_for_metrics(&run);
     assert_eq!(
@@ -1991,6 +2050,7 @@ fn test_677_effective_text_for_metrics_preserves_f081c_filler() {
         space_metric: crate::renderer::composer::SpaceMetric::Stored,
         regenerated_font_metrics: false,
         literal_figure_space: false,
+        literal_soft_hyphen: false,
     };
     let effective = super::effective_text_for_metrics(&run);
     assert_eq!(
@@ -2119,6 +2179,7 @@ fn test_kbu1_line_start_forbidden_retraction() {
             space_metric: crate::renderer::composer::SpaceMetric::Stored,
             regenerated_font_metrics: false,
             literal_figure_space: false,
+            literal_soft_hyphen: false,
         }],
         line_height: 400,
         baseline_distance: 320,
@@ -2465,4 +2526,35 @@ fn default_tabs_use_the_physical_row_origin() {
         1,
         "탭 격자는 줄 내부 0이 아니라 물리 행의 시작 좌표에서 이어진다"
     );
+}
+
+/// 저장 줄 없는 문단은 vpos 재계산이 건너뛰지만, 그 높이 자리는 뒤 문단의 저장
+/// 좌표에 남아 있다. 앞 문단을 편집해도 그 간격을 지워 뒤 문단을 끌어올리지 않는다.
+#[test]
+fn recalculating_vpos_keeps_the_room_of_a_paragraph_without_stored_lines() {
+    let line = |vertical_pos| LineSeg {
+        vertical_pos,
+        line_height: 1000,
+        text_height: 1000,
+        baseline_distance: 850,
+        line_spacing: 600,
+        segment_width: 42520,
+        ..Default::default()
+    };
+    let lined = |vertical_pos| Paragraph {
+        line_segs: vec![line(vertical_pos)],
+        ..Default::default()
+    };
+    // 0번(0~1600) 뒤에 줄 없는 1번(저장 높이 2000)이 있고, 2번은 3600에서 시작한다.
+    let mut paragraphs = vec![lined(0), Paragraph::default(), lined(3600), lined(5200)];
+    let styles = ResolvedStyleSet::default();
+    recalculate_section_vpos(&mut paragraphs, 0, None, Some(1600), &styles, 96.0, false);
+    assert_eq!(paragraphs[2].line_segs[0].vertical_pos, 3600);
+    assert_eq!(paragraphs[3].line_segs[0].vertical_pos, 5200);
+
+    // 0번이 한 줄 늘면 뒤 문단은 그 증가만큼만 내려간다.
+    paragraphs[0].line_segs.push(line(1600));
+    recalculate_section_vpos(&mut paragraphs, 0, None, Some(1600), &styles, 96.0, false);
+    assert_eq!(paragraphs[2].line_segs[0].vertical_pos, 5200);
+    assert_eq!(paragraphs[3].line_segs[0].vertical_pos, 6800);
 }

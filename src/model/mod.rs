@@ -10,13 +10,18 @@ pub mod control;
 pub mod document;
 pub mod event;
 pub mod footnote;
+pub(crate) mod form_script;
 pub mod header_footer;
 pub(crate) mod hwp3_page_ownership;
 pub mod hyperlink;
 pub mod hyperlink_format;
 pub(crate) mod identity;
 pub mod image;
+pub(crate) mod line_seg_tags;
+pub mod memo_extended;
+pub mod memo_shape;
 pub(crate) mod native_font_program;
+pub(crate) mod owned_work;
 pub mod page;
 pub mod paragraph;
 pub mod path;
@@ -29,6 +34,7 @@ pub mod style;
 pub mod table;
 pub(crate) mod table_row_grid;
 pub mod text_clip;
+pub mod text_paint;
 
 /// HWP 내부 단위 (1/7200 인치, 부호 없음)
 pub type HwpUnit = u32;
@@ -102,3 +108,5 @@ mod tests {
         assert_eq!((red >> 16) & 0xFF, 0x00); // B
     }
 }
+
+pub(crate) mod memo_time;

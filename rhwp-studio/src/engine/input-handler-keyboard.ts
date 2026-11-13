@@ -271,6 +271,8 @@ function deleteSelectedObject(wasm: WasmBridge, ref: PictureDeleteRef): void {
     }
   } else if (ref.type === 'equation') {
     wasm.deleteEquationControl(ref.sec, ref.ppi, ref.ci);
+  } else if (ref.cellPath && ref.cellPath.length > 0) {
+    wasm.deleteCellShapeControlByPath(ref.sec, ref.ppi, ref.cellPath, ref.ci);
   } else {
     wasm.deleteShapeControl(ref.sec, ref.ppi, ref.ci);
   }
@@ -805,6 +807,13 @@ export function onKeyDown(this: any, e: KeyboardEvent): void {
     return; // 다른 키 무시
   }
 
+  // 연속 형광펜 모드에서 Escape → 종료
+  if (this.highlightPenColor && e.key === 'Escape') {
+    e.preventDefault();
+    this.setHighlightPen(null);
+    return;
+  }
+
   // 그림 배치 모드에서 Escape → 취소
   if (this.imagePlacementMode && e.key === 'Escape') {
     e.preventDefault();
@@ -1145,7 +1154,7 @@ export function onKeyDown(this: any, e: KeyboardEvent): void {
   if (this.cursor.isInPictureObjectSelection()) {
     if (e.key === 'Escape') {
       e.preventDefault();
-      this.cursor.moveOutOfSelectedPicture();
+      this.cursor.returnToSelectedObjectOwner();
       this.pictureObjectRenderer?.clear();
       this.eventBus.emit('picture-object-selection-changed', false);
       this.updateCaret();

@@ -136,6 +136,7 @@ fn test_serialize_face_name_with_type_info_and_default_name() {
 #[test]
 fn test_serialize_char_shape_roundtrip() {
     let cs = CharShape {
+        text_paint: None,
         raw_data: None,
         font_ids: [0, 1, 2, 0, 0, 0, 0],
         ratios: [100, 80, 100, 100, 100, 100, 100],
@@ -429,6 +430,7 @@ fn test_serialize_border_fill_solid() {
             alpha: 0,
         },
         three_d: false,
+        break_cell_separate_line: false,
     };
 
     let data = serialize_border_fill(&bf);
@@ -470,6 +472,7 @@ fn test_serialize_border_fill_preserves_solid_and_image_alpha() {
             alpha: 180,
         },
         three_d: false,
+        break_cell_separate_line: false,
     };
     let data = serialize_border_fill(&bf);
     let mut r = crate::parser::byte_reader::ByteReader::new(&data[FILL_OFFSET..]);
@@ -506,6 +509,7 @@ fn test_serialize_border_fill_cross_centerline_uses_hwp5_center_bits() {
         center_line: CenterLine::Cross,
         fill: Fill::default(),
         three_d: false,
+        break_cell_separate_line: false,
     };
 
     let data = serialize_border_fill(&bf);
@@ -560,6 +564,7 @@ fn test_serialize_border_fill_image_fill_mode_uses_hwp5_values() {
                 alpha: 0,
             },
             three_d: false,
+            break_cell_separate_line: false,
         };
 
         let data = serialize_border_fill(&bf);
@@ -629,6 +634,7 @@ fn test_serialize_doc_info_roundtrip() {
         native_program: None,
     });
     doc_info.char_shapes.push(CharShape {
+        text_paint: None,
         raw_data: None,
         font_ids: [0; 7],
         ratios: [100; 7],
@@ -724,7 +730,7 @@ fn test_serialize_numbering_roundtrip() {
     };
     numbering.level_formats[0] = "^1.".to_string();
     numbering.start_number = 1;
-    numbering.level_start_numbers = [1; 7];
+    numbering.level_start_numbers = [1; crate::model::style::NUMBERING_LEVELS];
 
     let data = serialize_numbering(&numbering);
     let mut r = crate::parser::byte_reader::ByteReader::new(&data);
@@ -753,7 +759,7 @@ fn numbering_serializes_number_format_into_attr_bits() {
         number_format: 8, // 예: HANGUL_MIXED
     };
     numbering.level_formats[0] = "^1.".to_string();
-    numbering.level_start_numbers = [1; 7];
+    numbering.level_start_numbers = [1; crate::model::style::NUMBERING_LEVELS];
 
     let data = serialize_numbering(&numbering);
     let mut r = crate::parser::byte_reader::ByteReader::new(&data);
@@ -800,6 +806,7 @@ fn test_serialize_bullet_layout_and_roundtrip() {
         char_shape_id: 2,
         bullet_char: '-',
         image_bullet: 0,
+        hwpx_image_without_ref: false,
         image_data: [0; 4],
         check_bullet_char: '\0',
         raw_para_head: None,

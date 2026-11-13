@@ -2,17 +2,33 @@
 kind: guide
 status: active
 canonical: mydocs/manual/pr_review_workflow.md
-last_verified: 2026-10-18
+last_verified: 2026-11-10
 ---
 
 # 로컬 사전 검증
 
 이 가이드는 PR의 코드·sample·frontend 변경을 로컬에서 확인하는 절차다. **PR 제출 전에 4.3의
-변경 범위별 필수 검증과 해당 보조 절차를 빠짐없이 완료한다.** 기여자·메인터너·콜라보레이터 모두
-같은 기준을 적용한다. 실행 head·base SHA, 명령·환경·실제 결과와 증적을 PR 본문 또는 기존 검증
+변경 범위별 필수 검증과 해당 역할의 보조 절차를 빠짐없이 완료한다.** 일반 기여자의 제출 검증과
+통합 담당 collaborator·maintainer의 추가 검증을 구분한다. 실행 head·base SHA, 명령·환경·실제 결과와 증적을 PR 본문 또는 기존 검증
 기록에 연결한다. 비해당 항목은 변경 범위와 소비 경로를 근거로 구분하며, 실패·미실행 항목을
 비해당으로 바꾸거나 새 PR의 CI에 넘겨 제출 전 검증을 대신하지 않는다. 정본에서 허용한 동일
 code head의 기존 CI·증적 재사용은 그 조건을 확인해 기록한다.
+
+| 적용 역할 | 검증 책임 |
+| --- | --- |
+| 일반 사용자·외부 contributor | 변경 범위에 따른 일반 검증과 Native/fresh WASM 시각 증적 제출. 조판 영향 PR의 `--handbook-gate` 실행·통과도 포함한다. 비공개 원본 OTF 보유나 정본 보호 TSV 전체의 특별 하락 금지 검증은 제출 조건이 아니다. |
+| 통합 담당 collaborator·maintainer | 위 일반 검증에 더해 조판·렌더링 영향 PR의 정본 보호 TSV 전체에 대한 특별 하락 금지 검증을 완료한다. 이 특별 검증의 원본 글꼴 확보·환경 정합·보정·재검증도 통합 담당자의 책임이다. |
+
+**조판에 영향을 주는 변경이 포함된 PR은 일반 기여자를 포함하여 제출 전 최종 head에서
+행정업무운영 편람 HWPX Native 383쪽 `--handbook-gate`를 실행하고 통과해야 한다.**
+필요한 글꼴은 지원 웹폰트 공급 경로를 사용할 수 있으므로 비공개 원본 OTF 보유를 요구하지 않는다. 저장소 루트에서
+`venv/bin/python scripts/visual_sweep.py --handbook-gate --out output/pr-review/<검증명>`을
+실행한다. 다른 Visual Sweep 실행에 같은 옵션을 추가해도 된다. gate의 90%·페이지별 기준 하락
+검사 실패, 미실행·누락·쪽수 불일치는 제출 보류다. 실행 head·명령·결과와
+전체 TSV를 기록한다. 일반 Visual Sweep은 이 검사를 자동으로 반복하지 않는다.
+편람 gate와 별도로, [정본 보호 TSV 전체의 특별 하락 금지 검증](../verification/visual_verification_governance.md#정본-보호-tsv의-공식-표시값-보존)은
+통합 담당 collaborator·maintainer만 수행한다. 일반 기여자에게 비공개 원본 OTF 설치나 이 특별 검증의 재현을 요구하지 않는다.
+일반 시각 검증의 90%·쪽수·내용 보존과 페이지별 98% px 회귀 조건은 계속 적용한다.
 
 일반 제출은 **검증을 완료한 Open PR**로 한다. Draft는 미완성 설계·WIP의 조기 논의처럼 특별한
 목적을 명시한 경우에만 사용하며, 에이전트는 작업지시자의 명시적 Draft 지시가 있어야 생성한다.
@@ -84,8 +100,16 @@ SHA-256·이전/보존 경로·활성 유지/제거 목록·복원 조건을 기
 모든 PR review Cargo 실행은 기본 증분 빌드를 사용한다. macOS·Linux·Windows 모두 각 host의 **기본 rhwp
 작업공간 아래 `target/pr-review` 한 곳**을 Native·WASM·lint·회귀에 재사용한다. review worktree가 바뀌어도
 동일한 물리 경로를 절대 경로로 전달한다. `target/<issue>`, `target/pr-<번호>`, `target/pr-review/<issue>`나
-worktree 안의 별도 `target/pr-review`를 새로 만들지 않는다. Cargo가 소스 경로·feature·compiler 변경을 판별해
-필요한 unit만 다시 빌드하며, 캐시 재사용이 최종 head 검증을 생략하는 근거는 아니다.
+worktree 안의 별도 `target/pr-review`를 새로 만들지 않는다. Cargo의 캐시를 재사용하더라도 실제
+산출물의 소유와 최종 head 검증을 확인한다.
+
+같은 target에서 base와 후보 worktree를 번갈아 빌드하면 공통 경로의 실행 파일이나
+`deps/librhwp.rlib`가 다른 worktree의 산출물로 덮일 수 있다. Cargo가 빠르게 성공하거나 실행 파일의
+해시가 바뀌었다는 사실만으로 후보 라이브러리가 연결됐다고 판정하지 않는다. worktree를 바꾼 뒤
+소유가 의심되면 공유 target을 삭제하지 말고 해당 worktree의 **라이브러리와 실행 파일을 함께**
+다시 빌드한다. 상세 빌드 로그에서 두 소스 unit의 재컴파일을 확인하고, 후보의 알려진 동작을
+대표 입력으로 실행해 base와 구분한다. 실행 파일은 worktree별로 복사해 SHA-256을 기록한 뒤
+시각 비교에 사용한다. 검증 중 발견된 잘못된 비교는 근거에서 제거하고 실제 후보로 다시 수행한다.
 
 `target/pr-review`는 **이동하거나 이름을 바꾸지 않는다**. 일부 통합 테스트의 `CARGO_BIN_EXE_*` fallback은
 컴파일 당시 절대 target 경로를 가질 수 있어, 빌드 뒤 directory를 옮기면 실행 파일을 찾지 못한다. 최초
@@ -115,6 +139,28 @@ find "${rhwp_review_source_dir:?기본 작업공간 경로를 먼저 고정하�
 pgrep -alf '(^|/)(cargo|rustc|wasm-pack)( |$)' || true
 ~~~
 
+### 편람 130쪽의 WMF 렌더링 차이
+
+여기서 130쪽은 TSV의 `page=130`, 즉 PDF의 130번째 쪽이며 지면에 인쇄된 쪽 번호는
+122다. 2026-11-07 완료한 전쪽 검증(96 DPI, 색상 경계 보정 전 2px 실루엣)의 실제 값은
+다음과 같다.
+
+| 원본 | Native raw | fresh WASM raw | 경계 보정 후 보조값 |
+| --- | ---: | ---: | ---: |
+| 편람 HWP | 99.96% | 99.96% | 양쪽 99.97% |
+| 편람 HWPX | 99.96% | 99.96% | 양쪽 99.97% |
+
+HWP/HWPX의 Native·fresh WASM 네 결과 모두 **나머지 382쪽은 raw 100.00%**다.
+일반 기여자를 포함한 편람 `--handbook-gate`는 이 중 HWPX Native의 383쪽을 선택하여
+나머지 382쪽의 100.00%와 130쪽의 raw 99.96% 대비 하락이 없는지 확인한다. 필요한 글꼴은
+지원 웹폰트 공급 경로를 사용할 수 있다. HWP·fresh WASM 및 다른 문서까지 정본 전체를
+대조하는 특별 하락 금지 검증은 통합 담당 collaborator·maintainer가 별도로 수행한다.
+
+행정업무운영 편람의 이 쪽에는 알려진 WMF 렌더링 차이가 있다. 이 WMF 영역을 독립 한컴
+Print와 100% 일치시키는 보정을 이번 PR 검증의 완료 조건으로 요구하지 않으며, 100%를
+강제하는 회귀 기대값도 추가하지 않는다. 130쪽은 전쪽 TSV에 포함하고 실제 raw와
+review·overlay에서 확인한 WMF 차이를 그대로 기록한다.
+
 ### 리베이스로 반영한 PR의 기능 보존 검증
 
 리베이스 뒤에는 현재 작업의 개선과 **새 기준에서 들어온 PR의 기능 유지·개선**을 함께 확인한다.
@@ -141,6 +187,10 @@ pgrep -alf '(^|/)(cargo|rustc|wasm-pack)( |$)' || true
    유지/개선/후퇴/미검증 → 보정·재검증 결과`를 연결한다. 리베이스 전 실행은 출처 기록이며 새
    후보의 검증으로 표시하지 않는다. 실행으로 확인한 후퇴와 필수 증거 부족을 구분하고, 어느 쪽이든
    해소 전에는 준비 완료·새 PR 생성·승인·통합을 보류한다. 별도 보고서 파일을 중복 작성할 필요는 없다.
+
+collaborator·maintainer는 이 기능 보존 검증에
+[정본 보호 TSV의 공식 두 자리 표시값 보존](../verification/visual_verification_governance.md#정본-보호-tsv의-공식-표시값-보존)도
+적용한다. 일반 사용자·외부 contributor에게 원본 OTF 설치나 이 특별 보호 검증의 재현을 요구하지 않는다.
 
 ### 고정 review target과 실행 환경
 
@@ -433,14 +483,50 @@ git status --short --branch
 
 ## 4.2 merge simulation
 
+새 PR 제출 후보는 최신 base와의 병합뿐 아니라 **리뷰어가 지정되지 않은 본인 계정의 기존
+열린 PR 전체와의 병합도 생성 전에 시뮬레이션한다.** 이미 리뷰어가 지정된 PR은 작업 중이므로
+제외하고 근거를 기록한다. 리뷰어 미지정 Draft는 포함하며 각 대상 PR의 최신 head를 fetch해
+고정하고 후보와 개별 비교한다. 함께 통합할 대상 PR은 예정 순서의 누적 결과도 확인한다.
+대상 조회·갱신·제출 보류 조건은
+[제출 전 병합 시뮬레이션](../codex/docs_and_git_workflow.md#4-제출-후보와-본인-열린-pr의-병합-시뮬레이션)을 따른다.
+
+현재 작업 트리와 원 PR branch를 건드리지 않는 기본 경로는 다음과 같다. `head SHA`가
+가리키는 정확한 commit을 사용하며, 기존 PR을 실제로 merge하거나 push하는 명령이 아니다.
+
+~~~bash
+# 후보와 최신 base, 각 기존 PR의 fetch·SHA 확인 후 실행한다.
+rhwp_merge_log_dir="output/pr-review/<review-id>/logs"
+mkdir -p "$rhwp_merge_log_dir"
+git merge-tree --write-tree \
+  "${rhwp_review_base_sha:?최신 base SHA를 먼저 고정하세요}" \
+  "${rhwp_review_candidate_sha:?제출 후보 SHA를 먼저 고정하세요}" \
+  > "$rhwp_merge_log_dir/candidate-base-merge-tree.log" 2>&1
+
+# 본인의 리뷰어 미지정 열린 PR마다 반복한다. 각 실행의 종료 코드를 확인하고 기록한다.
+git merge-tree --write-tree \
+  "$rhwp_review_candidate_sha" \
+  "${rhwp_existing_pr_head_sha:?기존 PR 최신 head SHA를 먼저 고정하세요}" \
+  > "$rhwp_merge_log_dir/pr-${rhwp_existing_pr_number:?기존 PR 번호를 먼저 지정하세요}-merge-tree.log" 2>&1
+~~~
+
+종료 코드 0은 충돌 없음, 1은 병합 충돌이며 그 밖의 실패도 제출을 막는다. 첫 검사부터
+결과를 판정하고 실패한 상태에서 다음 명령으로 덮어쓰지 않는다. 로그에 기록된 tree SHA만
+보고 성공으로 처리하지 않는다. PR별 SHA·명령·종료 코드·충돌 파일·로그를 기존 검토 기록에
+남기고, 생성 직전 목록이나 SHA가 바뀌면 영향을 받는 검사를 다시 실행한다.
+
+실제 merge 상태와 결과 tree를 더 조사해야 할 때만 작업 전용 임시 worktree에서 다음 경로를
+사용한다. 현재 구현·검증 작업 트리에서 직접 실행하지 않는다.
+
 ~~~bash
 git switch -c prN-merge-test upstream/devel
 git merge local/prN --no-commit --no-ff
 git status
 ~~~
 
-devel 위에 PR head를 합친 결과 tree와 conflict를 확인한다. conflict 해결 방침은 작업지시자 결정이
-필요하다. 여러 PR의 누적 검토는 [다수 PR과 update branch](multi_pr_update_branch.md)를 따른다.
+devel 위에 PR head를 합친 결과 tree와 conflict를 확인한다. 승인된 보정 범위에서는 양쪽 기능을
+보존해 충돌을 해소하고 영향 검증과 시뮬레이션을 다시 수행한다. 원격 변경과 범위 밖의 추가
+조치는 기존 승인 절차를 따른다. 여러 PR의 누적 검토는
+[다수 PR과 update branch](multi_pr_update_branch.md)를 따른다.
 
 ## 4.3 변경 범위별 기본 검증
 
@@ -527,6 +613,26 @@ python3 -m unittest discover -s scripts/tests -p 'test_*workflow.py'
 상호 계약을 함께 검사한다. 따라서 새 archive label이나 reusable input을 추가한 PR은
 GitHub CI에서가 아니라 PR을 열기 전에 누락된 consumer를 발견해야 한다.
 
+### 편집·저장·열기 기능의 실제 경로와 반복 저장 검증
+
+이 절은 **일반 기여자·메인터너·콜라보레이터 모두에게, 리베이스 여부와 관계없이 적용한다.**
+새 기능과 기존 기능 보정 모두 변경한 제품 진입점에서 실제 동작을 검증한다. 내부 helper나 모델 값,
+컴파일·전체 CI 통과만으로 편집·저장·열기 경로의 검증을 대신하지 않는다.
+
+- 저장 결과에 영향을 주는 API·파서·직렬화·편집 변경은 대표 입력에서
+  **편집 → 저장 → 다시 열기 → 재저장 → 다시 열기**를 실행한다. 최초 저장의 재로드뿐 아니라
+  재로드한 모델을 다시 저장한 뒤에도 변경한 속성·내용과 기존 개체·목록·참조 관계가 보존되어야 한다.
+- 지원하는 HWP/HWPX 저장 형식을 각각 확인한다. 형식 간 저장 경로를 변경했다면 해당 교차 저장도
+  포함한다. 같은 저장 영역이나 자원을 공유하는 기능은 함께 사용한 입력과 정상 대조군을 확인한다.
+- 중요한 경계는 실제 공개 API·저장기·파서를 호출하는 자동 회귀 검사로 남긴다. 기대값은 독립 형식
+  계약이나 유효한 저장본에서 정하며, 구현의 현재 출력을 그대로 기대값으로 복사하지 않는다.
+- PR 본문 또는 기존 검증 기록에 입력·실행 경로·source SHA·명령·결과와 내용 보존 판정을 적는다.
+  일반 기여자에게 별도 내부 review 문서 작성을 요구하지 않는다. 저장에 영향이 없는 변경은 실제
+  소비 경로를 근거로 비해당 사유를 기록한다. 조판 영향이 있으면 기존 시각 검증도 함께 완료한다.
+
+[리베이스로 반영한 PR의 기능 보존 검증](#리베이스로-반영한-pr의-기능-보존-검증)은 여기에 더해
+새 devel에서 들어온 기능과 현재 변경의 공존을 확인하는 추가 절차다.
+
 ### 4.3.0.0 상수·정책·호출 경로 변경의 동작 기반 회귀 검증
 
 상수의 출처, 예산·축출 정책, fallback 또는 bridge·setter 같은 실제 호출 경로를 변경할 때는
@@ -592,7 +698,119 @@ merge 판단에서는 다음 경계를 적용한다.
 패턴을 따른다. 근거와 재현 조건은 [#3289 CI 보고서](../../report/archives/task_m100_3289_report.md#멀티러너-거버넌스-운영-규칙)에
 기록되어 있다.
 
-일반 Rust 검증 예시는 다음과 같다. 명령은 같은 checkout에서 동시에 실행하지 않는다.
+### 회귀 테스트의 최소 글꼴 환경
+
+전체 회귀와 변경 범위의 집중 회귀는 별도로 설치한 상용 글꼴이나 개인 글꼴을 볼 수 없는
+**최소 글꼴 환경**에서 실행한다. 운영체제 동작에 필요한 기본 글꼴, 저장소의 라이선스 확인된
+기본 fallback과 검사가 명시적으로 공급하는 라이선스 확인 fixture만 허용한다. OS 기본 글꼴은
+그 종류를 기록하며 특정 시스템 글꼴이 있어야 테스트가 통과하도록 기대값을 만들지 않는다.
+글꼴 프로그램 자체를 검사할 때도 필요한 fixture를
+명시하며 시스템 설치 여부로 건너뛰지 않는다. 같은 조건에서 CI도 재현할 수 있어야 한다.
+실제 노출된 글꼴 파일 목록, 격리 방법, 실행 명령과 결과를 기록한다. 이 환경의 회귀 결과와
+독립 한컴 Print PDF에 맞는 글꼴을 공급한 Visual Sweep 결과는 별도로 보고한다.
+
+`FONTCONFIG_FILE`만 설정해 `fc-list`를 줄이는 것으로 격리를 판정하지 않는다. Native 코드는
+시스템 글꼴 디렉터리를 직접 탐색할 수 있고, `RHWP_FONT_PATH`, 명시적 경로 또는 브라우저의
+로컬 글꼴 접근도 별도 공급 경로다. 격리된 컨테이너나 OS의 파일 시스템 격리에서 이 경로들을
+함께 제한하고, 환경별 실제 탐색 경로와 목록을 확인한다. Docker는 필수가 아니다. Windows·macOS도
+같은 조건의 격리 환경을 사용한다. 격리할 수 없으면 회귀 검증을 완료한 것으로 기록하지 않는다.
+
+Ubuntu에서 `bwrap`을 사용할 수 있고 사용자 글꼴 경로가 아래와 같은 경우의 예시는 다음과 같다.
+실제 경로가 다르거나 추가 글꼴 디렉터리가 있으면 해당 경로도 숨긴다. 이 예시는 공용
+`target/pr-review`를 그대로 사용한다. Fontconfig 목록뿐 아니라 명시 경로와 fixture도 확인한다.
+
+~~~bash
+rhwp_minfont_dir="$PWD/output/pr-review/minimal-font"
+mkdir -p "$rhwp_minfont_dir/cache"
+cat > "$rhwp_minfont_dir/fonts.conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig><dir>$PWD/ttfs/opensource</dir><cachedir>$rhwp_minfont_dir/cache</cachedir></fontconfig>
+EOF
+bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+  --ro-bind /etc /etc --proc /proc --dev /dev --ro-bind /sys /sys --bind /tmp /tmp \
+  --dir "$HOME" --bind "$PWD" "$PWD" --bind "$HOME/.cargo" "$HOME/.cargo" \
+  --ro-bind "$HOME/.rustup" "$HOME/.rustup" \
+  --tmpfs /usr/share/fonts --tmpfs /usr/local/share/fonts --setenv HOME "$HOME" \
+  --setenv FONTCONFIG_FILE "$rhwp_minfont_dir/fonts.conf" --unsetenv RHWP_FONT_PATH \
+  --chdir "$PWD" sh -c 'fc-list -f "%{file}\n"; exec "$@"' sh \
+  cargo nextest run --locked --cargo-profile release-test \
+  --target-dir "${rhwp_review_target_dir:?공용 target 경로를 먼저 고정하세요}" \
+  --tests --test-threads <현재_환경에_맞는_값> --no-fail-fast
+~~~
+
+위 예시는 Ubuntu의 `/usr`·Rust 설치 위치를 전제로 하며 홈의 사용자 글꼴과 `/opt`를 노출하지
+않는다. 다른 도구 설치 위치나 OS 구조가 다르면 필요한 경로만 추가하고 글꼴이 함께 노출되지
+않는지 확인한다. 집중 검사와 Native Skia 검사에도 같은 격리를 적용하고, 실제 글꼴 프로그램을
+시험하는 fixture는 별도 명시한다.
+스크립트나 테스트가 시스템 디렉터리의 파일을 직접 공급한다면 목록 확인만으로 통과시키지 않고
+해당 공급 경로를 수정하거나 격리한다.
+
+#### macOS
+
+개인 Mac의 글꼴을 비활성화하거나 삭제하지 않는다. 현재 Mac에서 검증 프로세스에 한정해
+추가 설치 글꼴과 로컬 글꼴 접근을 차단하는 격리 환경을 사용할 수 있다. 가상 머신이나 검증 전용
+계정은 선택 사항이다. 계정만 분리하면 `/Library/Fonts`의 공유 글꼴은 그대로 보이므로 실제
+접근 범위를 확인한다. `/System/Library/Fonts` 등 OS 기본 글꼴은 보존하고 목록에 기록한다.
+`system_profiler`의 결과를 기준 목록과 대조해 한컴·개인 글꼴이 없음을 확인한다. Fontconfig
+목록만으로 CoreText가 볼 수 있는 글꼴이 격리됐다고 판단하지 않는다.
+
+~~~bash
+mkdir -p output/pr-review/minimal-font
+system_profiler SPFontsDataType -json > output/pr-review/minimal-font/macos-fonts.json
+env -u RHWP_FONT_PATH cargo nextest run --locked --cargo-profile release-test \
+  --target-dir target/pr-review --tests --test-threads <현재_환경에_맞는_값> --no-fail-fast \
+  > output/pr-review/minimal-font/macos-nextest.log 2>&1
+~~~
+
+Native Skia와 집중 검사도 이 격리 환경에서 같은 target을 순차 재사용한다. 브라우저 검사는
+로컬 글꼴 접근을 거부한 상태에서 기본 동작을 확인하며, 실제 OTF 공급 기능은 라이선스 확인
+fixture를 명시하는 별도의 검사로 실행한다.
+
+현재 계정의 프로세스 파일 sandbox를 격리 환경으로 사용할 때도 같은 검증이 필요하다.
+`~/Library/Fonts`·`/Library/Fonts`와 추가 탐색 경로, 허용 fixture 이외의 `ttfs` 및 이전 글꼴
+캐시를 차단하고 새 캐시를 사용한다. **파일 접근 차단만으로는 충분하지 않다.** CoreText가
+개인 글꼴 별칭을 계속 열거하면서 실제 프로그램은 LastResort로 바꾸면, Chrome이 해당 글꼴을
+존재하는 것으로 오인해 한글과 UI 문자를 대체 기호로 출력할 수 있다.
+
+따라서 해당 macOS에서 검증한 `sandbox-exec` 프로필을 사용할 경우 개인 Font Registry의
+`com.apple.fonts`·`com.apple.fonts.atsbridge` 조회도 프로세스에 한정해 차단하고, CoreText와
+`system_profiler`에서 개인 글꼴이 실제로 제외되는지 확인한다. OS 글꼴의 목록 순서는 달라질
+수 있으므로 이름 순서만 비교하지 않고 파일 해시·실제 프로그램과 기본 한글 표시를 대조한다.
+일반 사용자 프로세스의 등록·표시가 바뀌지 않았다는 대조 결과도 남긴다. 개인 글꼴을 삭제하거나
+비활성화하는 방식으로 대체하지 않는다. 격리 프로필·허용 파일·실제 목록·환경별 결과를 기록한다.
+OS 버전이나 프로필 차이로 격리를 확인하지 못한 범위는 검증 결과에 명시하며, 확인한 범위만
+최소 글꼴 환경의 검증 결과로 보고한다. 이를 이유로 VM 생성이나 계정 분리를 필수로 요구하지 않는다.
+
+#### Windows
+
+개인 PC의 글꼴을 삭제하지 않는다. 한컴·사용자 글꼴을 추가하지 않은 깨끗한 Windows 가상
+머신이나 Windows Sandbox를 사용한다. Windows 기본 글꼴은 보존하고 목록·해시를 기록하며,
+사용자별 글꼴 등록과 명시적 글꼴 경로도 확인한다. DirectWrite가 보는 글꼴을 Fontconfig
+목록으로 대신하지 않는다. Windows 작업공간에 checkout과 공용 `target/pr-review`를 둔다.
+
+~~~powershell
+New-Item -ItemType Directory -Force output/pr-review/minimal-font | Out-Null
+Get-ChildItem "$env:WINDIR\Fonts" -File | Get-FileHash -Algorithm SHA256 |
+  Export-Csv output/pr-review/minimal-font/windows-fonts.csv -NoTypeInformation -Encoding UTF8
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts' -ErrorAction SilentlyContinue |
+  ConvertTo-Json | Set-Content output/pr-review/minimal-font/windows-user-fonts.json -Encoding UTF8
+Remove-Item Env:RHWP_FONT_PATH -ErrorAction SilentlyContinue
+cargo nextest run --locked --cargo-profile release-test --target-dir target/pr-review `
+  --tests --test-threads <현재_환경에_맞는_값> --no-fail-fast *> output/pr-review/minimal-font/windows-nextest.log
+if ($LASTEXITCODE -ne 0) { throw '최소 글꼴 전체 회귀 실패' }
+~~~
+
+운영체제 기본 목록과 별도 설치 글꼴을 구분하고, 사용자 글꼴 등록이 없다는 결과도 확인한다.
+Native Skia와 집중 검사는 같은 Windows 격리 환경에서 순차 실행한다. 각 OS의 결과는 서로
+대체하지 않으며, 실제로 실행한 OS와 환경을 명시한다.
+
+OTF를 포함한 글꼴 파일을 저장소·배포 패키지·테스트 fixture에 넣기 전에 출처, 해당 파일과
+파생물의 라이선스 및 재배포 권한을 확인하고 라이선스가 요구하는 전문·저작권 고지를 함께
+제공한다. 해당되는 서드파티 리소스는 `THIRD_PARTY_LICENSES.md`에도 기록한다. 절차가 끝나지
+않은 글꼴은 배포하지 않는다. 로컬 설치·시각 검증에서 사용했다는 사실은 배포 권한이 아니다.
+
+일반 Rust 검증 명령은 위 최소 글꼴 격리 안에서 실행한다. 명령은 같은 checkout에서 동시에 실행하지 않는다.
 
 ~~~bash
 cargo nextest run --locked \

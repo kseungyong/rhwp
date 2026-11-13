@@ -40,13 +40,20 @@ fn mix_text_fingerprint(target: &mut [u8; 32], value: &[u8; 32]) {
 }
 
 impl<'a> PersistenceInputs<'a> {
-    fn visit(&mut self, paragraphs: &'a [Paragraph]) {
+    fn visit_with_storage<S: crate::storage::Storage>(
+        &mut self,
+        paragraphs: &'a [Paragraph],
+        storage: &S,
+    ) -> Result<(), S::Error> {
         for paragraph in paragraphs {
-            self.paragraphs.push((
-                paragraph.stored_text_partition_dirty,
-                paragraph.cell_format_vpos_dirty,
-                paragraph.source_line_seg_vertical_pos.as_deref(),
-            ));
+            storage.push(
+                &mut self.paragraphs,
+                (
+                    paragraph.stored_text_partition_dirty,
+                    paragraph.cell_format_vpos_dirty,
+                    paragraph.source_line_seg_vertical_pos.as_deref(),
+                ),
+            )?;
             self.characters += paragraph.text.chars().count();
             mix_text_fingerprint(
                 &mut self.text_fingerprint,
@@ -56,88 +63,129 @@ impl<'a> PersistenceInputs<'a> {
                 match control {
                     Control::Table(table) => {
                         for cell in &table.cells {
-                            self.visit(&cell.paragraphs);
+                            self.visit_with_storage(&cell.paragraphs, storage)?;
                         }
-                        self.caption(table.caption.as_ref());
+                        self.caption_with_storage(table.caption.as_ref(), storage)?;
                     }
-                    Control::Picture(picture) => self.caption(picture.caption.as_ref()),
-                    Control::Shape(shape) => self.shape(shape),
-                    Control::Header(header) => self.visit(&header.paragraphs),
-                    Control::Footer(footer) => self.visit(&footer.paragraphs),
-                    Control::Footnote(note) => self.visit(&note.paragraphs),
-                    Control::Endnote(note) => self.visit(&note.paragraphs),
-                    Control::HiddenComment(comment) => self.visit(&comment.paragraphs),
-                    Control::Field(field) => self.visit(&field.memo_paragraphs),
+                    Control::Picture(picture) => {
+                        self.caption_with_storage(picture.caption.as_ref(), storage)?
+                    }
+                    Control::Shape(shape) => self.shape_with_storage(shape, storage)?,
+                    Control::Header(header) => {
+                        self.visit_with_storage(&header.paragraphs, storage)?
+                    }
+                    Control::Footer(footer) => {
+                        self.visit_with_storage(&footer.paragraphs, storage)?
+                    }
+                    Control::Footnote(note) => {
+                        self.visit_with_storage(&note.paragraphs, storage)?
+                    }
+                    Control::Endnote(note) => self.visit_with_storage(&note.paragraphs, storage)?,
+                    Control::HiddenComment(comment) => {
+                        self.visit_with_storage(&comment.paragraphs, storage)?
+                    }
+                    Control::Field(field) => {
+                        self.visit_with_storage(&field.memo_paragraphs, storage)?
+                    }
                     Control::SectionDef(definition) => {
                         for master in &definition.master_pages {
-                            self.visit(&master.paragraphs);
+                            self.visit_with_storage(&master.paragraphs, storage)?;
                         }
                     }
                     _ => {}
                 }
             }
         }
+        Ok(())
     }
 
-    fn caption(&mut self, caption: Option<&'a Caption>) {
+    fn caption_with_storage<S: crate::storage::Storage>(
+        &mut self,
+        caption: Option<&'a Caption>,
+        storage: &S,
+    ) -> Result<(), S::Error> {
         if let Some(caption) = caption {
-            self.visit(&caption.paragraphs);
+            self.visit_with_storage(&caption.paragraphs, storage)?;
         }
+        Ok(())
     }
 
-    fn shape(&mut self, shape: &'a ShapeObject) {
+    fn shape_with_storage<S: crate::storage::Storage>(
+        &mut self,
+        shape: &'a ShapeObject,
+        storage: &S,
+    ) -> Result<(), S::Error> {
         if let Some(drawing) = shape.drawing() {
             if let Some(textbox) = &drawing.text_box {
-                self.visit(&textbox.paragraphs);
+                self.visit_with_storage(&textbox.paragraphs, storage)?;
             }
-            self.caption(drawing.caption.as_ref());
+            self.caption_with_storage(drawing.caption.as_ref(), storage)?;
         }
         match shape {
-            ShapeObject::Picture(picture) => self.caption(picture.caption.as_ref()),
+            ShapeObject::Picture(picture) => {
+                self.caption_with_storage(picture.caption.as_ref(), storage)?
+            }
             ShapeObject::Group(group) => {
                 for child in &group.children {
-                    self.shape(child);
+                    self.shape_with_storage(child, storage)?;
                 }
-                self.caption(group.caption.as_ref());
+                self.caption_with_storage(group.caption.as_ref(), storage)?;
             }
-            ShapeObject::Chart(chart) => self.caption(chart.caption.as_ref()),
-            ShapeObject::Ole(ole) => self.caption(ole.caption.as_ref()),
+            ShapeObject::Chart(chart) => {
+                self.caption_with_storage(chart.caption.as_ref(), storage)?
+            }
+            ShapeObject::Ole(ole) => self.caption_with_storage(ole.caption.as_ref(), storage)?,
             _ => {}
         }
+        Ok(())
     }
 
     fn section(section: &'a Section) -> Self {
-        let mut inputs = Self::default();
-        inputs.visit(&section.paragraphs);
-        for master in &section.section_def.master_pages {
-            inputs.visit(&master.paragraphs);
+        match Self::section_with_storage(section, &crate::storage::Unbounded) {
+            Ok(value) => value,
+            Err(never) => match never {},
         }
-        inputs
+    }
+    fn section_with_storage<S: crate::storage::Storage>(
+        section: &'a Section,
+        storage: &S,
+    ) -> Result<Self, S::Error> {
+        let mut inputs = Self::default();
+        inputs.visit_with_storage(&section.paragraphs, storage)?;
+        for master in &section.section_def.master_pages {
+            inputs.visit_with_storage(&master.paragraphs, storage)?;
+        }
+        Ok(inputs)
     }
 }
 
 impl LoadedFrames {
     fn capture(document: &Document) -> Self {
-        Self {
-            doc_info: doc_info_model_digest(&document.doc_info, &document.doc_properties),
-            sections: document
-                .sections
-                .iter()
-                .map(|section| {
-                    let inputs = PersistenceInputs::section(section);
-                    LoadedSection {
-                        model: section_model_digest(section),
-                        persistence: record_digest(&inputs.paragraphs),
-                        characters: inputs.characters,
-                        text_fingerprint: inputs.text_fingerprint,
-                        cell_text_delta: Some(0),
-                        text_delta: [0; 32],
-                        source_stream: None,
-                        restore_pending: false,
-                    }
-                })
-                .collect(),
+        match Self::capture_with_storage(document, &crate::storage::Unbounded) {
+            Ok(value) => value,
+            Err(never) => match never {},
         }
+    }
+    fn capture_with_storage<S: crate::storage::Storage>(
+        document: &Document,
+        storage: &S,
+    ) -> Result<Self, S::Error> {
+        Ok(Self {
+            doc_info: doc_info_model_digest(&document.doc_info, &document.doc_properties),
+            sections: storage.try_collect(document.sections.iter().map(|section| {
+                let inputs = PersistenceInputs::section_with_storage(section, storage)?;
+                Ok(LoadedSection {
+                    model: section_model_digest(section),
+                    persistence: record_digest(&inputs.paragraphs),
+                    characters: inputs.characters,
+                    text_fingerprint: inputs.text_fingerprint,
+                    cell_text_delta: Some(0),
+                    text_delta: [0; 32],
+                    source_stream: None,
+                    restore_pending: false,
+                })
+            }))?,
+        })
     }
 
     fn note_cell_edit(
@@ -178,7 +226,18 @@ impl LoadedFrames {
 impl DocumentCore {
     /// 로드 픽스업·첫 페이지 구성 또는 명시적인 문서 교체를 완료한 지점만 호출한다.
     pub(crate) fn capture_loaded_source_frames(&mut self) {
-        self.render_normalization.loaded_frames = Some(LoadedFrames::capture(&self.document));
+        match self.capture_loaded_source_frames_with_storage(&crate::storage::Unbounded) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+    pub(crate) fn capture_loaded_source_frames_with_storage<S: crate::storage::Storage>(
+        &mut self,
+        storage: &S,
+    ) -> Result<(), S::Error> {
+        self.render_normalization.loaded_frames =
+            Some(LoadedFrames::capture_with_storage(&self.document, storage)?);
+        Ok(())
     }
 
     /// 스냅샷 등 전체 파생 상태 재구성은 저비용 후보 힌트도 현재 원본에 동기화한다.
@@ -241,6 +300,26 @@ impl DocumentCore {
         // raw 캐시 복원은 렌더 경로의 변경이다. 줄 프레임·유닛 점유가 그대로인
         // 편집까지 cellFlowChanged로 승격해 owner 전체를 재구성하지 않는다.
         changed
+    }
+
+    /// 개체 편집도 원본 모델·스타일·저장 프레임이 모두 복원됐을 때만 로드 캐시를 돌린다.
+    /// offset만 복원한 뒤 구역을 영구적인 편집 상태로 남기면, 관계없는 표의 저장 높이까지
+    /// 다시 해석되어 Undo 전후 표시 위치가 달라질 수 있다.
+    pub(crate) fn finish_loaded_source_cache_after_object_edit(&mut self, section: usize) {
+        let restored = self
+            .render_normalization
+            .loaded_frames
+            .as_ref()
+            .is_some_and(|frames| frames.matches(&self.document, section));
+        if let Some(source) = self
+            .render_normalization
+            .loaded_frames
+            .as_mut()
+            .and_then(|frames| frames.sections.get_mut(section))
+        {
+            source.restore_pending = restored;
+        }
+        self.finish_loaded_source_cache_after_cell_edit(section, true);
     }
 
     /// 기존 무효화 지점에서 원본 raw 캐시를 복사하지 않고 이동해 보존한다.

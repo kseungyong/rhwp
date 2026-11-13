@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Debug, Write};
 
+use super::culling::CullingIndex;
 use super::diagnostics::ReplayDiagnostics;
 use super::glyph_replay::gradient_stop_byte_cost;
 use super::replay_policy::ReplayPolicy;
@@ -320,11 +321,15 @@ fn decoded_resource_cost(bytes: &[u8], svg_estimate: usize) -> usize {
 
 #[derive(Clone, Copy)]
 pub(super) struct ReplayCacheContext<'a> {
+    pub culling: &'a CullingIndex,
     pub seed: Option<CacheKey>,
     pub page_bounds: skia_safe::Rect,
+    pub page_extent: (f64, f64),
     pub retained_resource_estimate: usize,
     pub policy: ReplayPolicy,
     pub raster_target: bool,
+    pub geometric_text: bool,
+    pub device_clip: bool,
     pub bitmap_paper_grid: Option<crate::renderer::bitmap_raster::PrintPaperGrid>,
     pub diagnostics: &'a RefCell<ReplayDiagnostics>,
 }
@@ -336,6 +341,7 @@ impl<'a> ReplayCacheContext<'a> {
         strict: bool,
         raster_target: bool,
         diagnostics: &'a RefCell<ReplayDiagnostics>,
+        culling: &'a CullingIndex,
     ) -> Self {
         let resources = resource_identity(&tree.resources);
         let seed = resources.as_ref().and_then(|(digest, _)| {
@@ -349,6 +355,8 @@ impl<'a> ReplayCacheContext<'a> {
                 scale,
                 strict,
                 raster_target,
+                tree.preserves_raster_text_geometry(),
+                tree.uses_raster_clip_coverage(),
                 digest,
             ))
         });
@@ -357,13 +365,17 @@ impl<'a> ReplayCacheContext<'a> {
         // arena's decoded image estimates and a viewport per SVG resource.
         let svg_estimate = (pixels * 4.0 * tree.resources.svg_count() as f64) as usize;
         Self {
+            culling,
             seed,
             page_bounds: skia_safe::Rect::from_wh(tree.page_width as f32, tree.page_height as f32),
+            page_extent: (tree.page_width, tree.page_height),
             retained_resource_estimate: resources
                 .map_or(usize::MAX, |(_, bytes)| bytes)
                 .saturating_add(svg_estimate),
             policy: ReplayPolicy::new(tree.profile),
             raster_target,
+            geometric_text: tree.preserves_raster_text_geometry(),
+            device_clip: tree.uses_raster_clip_coverage(),
             bitmap_paper_grid: None,
             diagnostics,
         }

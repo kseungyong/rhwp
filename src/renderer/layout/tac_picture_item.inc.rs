@@ -13,6 +13,7 @@ impl LayoutEngine {
         control_index: usize,
         ctx: &ColumnItemCtx,
         y_offset: f64,
+        stored_line_y: Option<f64>,
     ) -> f64 {
         let ColumnItemCtx {
             page_content,
@@ -31,9 +32,12 @@ impl LayoutEngine {
         let box_w = pic_w + margin_left + margin_right;
         let box_h = pic_h + margin_top + margin_bottom;
         // 같은 paragraph 의 sibling wrap=TopAndBottom 개체(tac=false)가
-        // 차지하는 vertical 영역만큼 picture y 보정.
+        // 차지하는 vertical 영역만큼 picture y 보정. 이 경로의 그림 y 는 문단 시작 기준이다.
         let sibling_reserved_hu =
-            super::layout::paragraph_layout::calc_sibling_topandbottom_reserved_hu(&para.controls);
+            super::layout::paragraph_layout::calc_sibling_topandbottom_reserved_hu(
+                &para.controls,
+                0,
+            );
         let sibling_reserved_px = hwpunit_to_px(sibling_reserved_hu, self.dpi);
 
         // [Task #1151 v9 결함 D] sibling TAC picture 시퀀스 위치 판별.
@@ -87,8 +91,10 @@ impl LayoutEngine {
                 reserved_based
             }
         };
-        let default_pic_y =
-            self.compute_tac_picture_shape_y(para, comp, styles, para_y_for_pic, pic_h);
+        // [#8441] 저장 줄 사다리로 정한 줄 위치가 있으면 그것이 원점이다.
+        let default_pic_y = stored_line_y.unwrap_or_else(|| {
+            self.compute_tac_picture_shape_y(para, comp, styles, para_y_for_pic, pic_h)
+        });
         let para_style_id = comp
             .map(|c| c.para_style_id as usize)
             .unwrap_or(para.para_shape_id as usize);
@@ -109,8 +115,19 @@ impl LayoutEngine {
         // para_margin_left 만큼 더 오른쪽으로 밀리는 결함이 있었다
         // (exam_kor.hwp p18/pi=46,50,54,56... 실측 확인 — inner_pad_left=11.33px
         // 만큼 이중 가산). paragraph_layout.rs 와 동일하게 가산 없이 통일한다.
-        let mut effective_margin_left =
-            tac_picture_effective_margin_left(para_margin_left, para_indent);
+        // [#8441] 그림이 실린 저장 줄이 첫 줄이 아니면 그 줄은 이어지는 줄의 여백을 쓴다:
+        // 내어쓰기(indent<0)는 둘째 줄부터 |indent| 만큼 들어가고, 들여쓰기는 첫 줄에만 준다.
+        // (한컴 2022 Print 실측: 156715172·156509623·156532689·156767332 의 TAC 표 다음 줄
+        // 그림 왼끝 = 왼쪽 여백 + |indent|.)
+        // 글자가 있는 줄의 그림은 문자 위치가 가로 원점을 정하므로 이 규칙 밖이다.
+        let picture_line = control_line_seg_index(para, control_index)
+            .filter(|_| !para_has_visible_text(para))
+            .unwrap_or(0);
+        let mut effective_margin_left = if picture_line > 0 {
+            para_margin_left + (-para_indent).max(0.0)
+        } else {
+            tac_picture_effective_margin_left(para_margin_left, para_indent)
+        };
         // [Task #534 v2] LINE_SEG.column_start 는 Square wrap 인라인 표/그림이
         // 좌측에 floating 시 표 영역 이후 텍스트 시작 위치를 HWP IR 가 인코딩.
         // layout_shape_item 은 col_area.x 그대로 사용 → picture (TAC) 가 표
@@ -118,7 +135,7 @@ impl LayoutEngine {
         // 표시기 + 그림). cs 가 effective_margin_left 보다 크면 cs 우선.
         let line_seg_cs_px = para
             .line_segs
-            .first()
+            .get(picture_line)
             .map(|s| hwpunit_to_px(s.column_start, self.dpi))
             .unwrap_or(0.0);
         if line_seg_cs_px > effective_margin_left {
@@ -211,6 +228,18 @@ impl LayoutEngine {
             None,
         );
         let already_registered = registered_inline_pos.is_some();
+        // paragraph_layout 은 줄 안에서만 TAC 그림을 그린다. 저장 줄도 글자도 없는 문단은
+        // 프레임 재조합이 줄을 만들 때만 그림이 그려지고, 재조합이 사양하면 높이만
+        // 전진하는 빈 줄 폴백을 탄다. 그 판정은 문단 경로 안에서 끝나므로, 조합 줄이
+        // 없는 문단은 먼저 지나간 문단 경로가 이 그림을 실제로 그렸는지 단에서 확인한다.
+        let para_path_draws_picture = has_full_para_item
+            && (comp.is_some_and(|c| !c.lines.is_empty())
+                || subtree_has_picture(
+                    col_node,
+                    page_content.section_index,
+                    para_index,
+                    control_index,
+                ));
         let effective_pic_y = registered_inline_pos
             .map(|(_, registered_y)| registered_y)
             .unwrap_or(pic_y);
@@ -242,7 +271,7 @@ impl LayoutEngine {
             }
         }
 
-        if !already_registered && !has_full_para_item {
+        if !already_registered && !para_path_draws_picture {
             let bin_data_id = pic.image_attr.bin_data_id;
             let image_data = find_bin_data_bytes(bin_data_content, bin_data_id);
             let crop = pic.render_crop_rect();
@@ -256,6 +285,7 @@ impl LayoutEngine {
                     control_index: Some(control_index),
                     crop,
                     original_size_hu,
+                    soft_edge_radius_hu: pic.effects.soft_edge_radius,
                     effect: pic.image_attr.effect,
                     brightness: pic.image_attr.brightness,
                     contrast: pic.image_attr.contrast,
@@ -267,8 +297,10 @@ impl LayoutEngine {
                     text_wrap: Some(pic.common.text_wrap),
                     external_path: pic.image_attr.external_path.clone(),
                     content_inset: utils::picture_content_inset(pic),
-                    pre_rotation_ratio: crate::renderer::image_geometry::picture_pre_rotation_ratio(pic),
- source_rect: crate::renderer::image_geometry::picture_source_rect(pic),
+                    pre_rotation_ratio: crate::renderer::image_geometry::picture_pre_rotation_ratio(
+                        pic,
+                    ),
+                    source_rect: crate::renderer::image_geometry::picture_source_rect(pic),
                     ..ImageNode::new(bin_data_id, image_data)
                 }),
                 BoundingBox::new(pic_x + margin_left, pic_y + margin_top, pic_w, pic_h),
@@ -277,8 +309,7 @@ impl LayoutEngine {
             // col_node.children에 들어있으면 그 앞에 끼워넣어 z-order 보존
             // (인라인 TAC 그림은 박스 프레임 시각이고 InFrontOfText 표가
             //  본문 콘텐츠로 그 위에 그려져야 함).
-            let border_node =
-                self.make_picture_border_node(tree, pic, img_node.bbox);
+            let border_node = self.make_picture_border_node(tree, pic, img_node.bbox, img_node.id);
             let insert_pos = col_node.children.iter().position(|c| {
                 matches!(&c.node_type, RenderNodeType::Table(t)
                     if t.para_index == Some(para_index))
@@ -399,7 +430,6 @@ impl LayoutEngine {
                 pic_x,
                 pic_w,
                 cap_y,
-                &mut self.auto_counter.borrow_mut(),
                 bin_data_content,
                 Some(cell_ctx),
                 CaptionOwner::new(
@@ -441,4 +471,16 @@ impl LayoutEngine {
             });
         result_y
     }
+}
+
+/// `node` 아래에 `(section, para, control)` 그림 노드가 이미 있는지 본다.
+fn subtree_has_picture(node: &RenderNode, section: usize, para: usize, control: usize) -> bool {
+    matches!(&node.node_type, RenderNodeType::Image(img)
+        if img.section_index == Some(section)
+            && img.para_index == Some(para)
+            && img.control_index == Some(control))
+        || node
+            .children
+            .iter()
+            .any(|child| subtree_has_picture(child, section, para, control))
 }

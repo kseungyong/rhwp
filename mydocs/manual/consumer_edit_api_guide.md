@@ -94,7 +94,10 @@ doc.removeHyperlinkEx(JSON.stringify({ target, fieldId })); // 표시 글자는 
 
 `start`·`end`는 Unicode scalar 기준 반열린 범위이며 JavaScript의 UTF-16 `string.length`와
 다르다. 본문은 빈 `cellPath`, 셀·글상자는 `[controlIndex, cellIndex, cellParaIndex]`의
-배열을 바깥부터 나열한다. `para`는 가장 바깥 본문 문단이고 글상자의 `cellIndex`는 0이다.
+배열을 바깥부터 나열한다. `para`는 가장 바깥 본문 문단이다. 독립 글상자의 `cellIndex`는 0이며,
+묶음 안 글상자는 원본 자식 순서로 깊이 우선 순회한 글상자 번호(0부터)를 쓴다. 글상자가 없는
+장식 도형과 중간 묶음은 번호를 소비하지 않는다. 클릭 결과의 `cellPath`를 조회·변경에 그대로
+사용하며, 묶음을 해제하거나 제목·본문 글상자를 같은 주소로 합치지 않는다.
 본문·중첩 셀·글상자의 단일 문단을 지원하며 캡션·머리말·각주·다단락 필드 등은 지원하지 않는다.
 조회 결과 `links`에는 `fieldId`, `start`, `end`, `text`, `uri`가 담긴다.
 
@@ -102,6 +105,41 @@ doc.removeHyperlinkEx(JSON.stringify({ target, fieldId })); // 표시 글자는 
 JS 예외다. 새 주소는 HTTP/HTTPS만 허용하며 조회는 기존 scheme을 보존한다.
 무선택 삽입은 표시 글자 삽입과 링크 추가를 같은 snapshot으로 묶고 실패 시 복원해야 한다.
 Studio는 이를 편집 라우터로 처리한다. 직접 WASM 호출은 Studio의 undo·dirty 기록을 만들지 않는다.
+
+### 경로 기반(`*ByPath`) 표·셀 조회의 `path_json` (#8880)
+
+`*ByPath` 메서드는 본문 문단 `parentParaIdx`에서 시작해 바깥부터 한 단계씩 내려가는 JSON 배열을
+받는다.
+
+```text
+[{"controlIndex":N,"cellIndex":N,"cellParaIndex":N}, ...]
+```
+
+| 필드 | 뜻 |
+| --- | --- |
+| `controlIndex` | 현재 문단의 컨트롤 번호(표·글상자 등) |
+| `cellIndex` | 그 표의 칸 번호(행 우선, 0부터). 글상자는 글상자 번호(독립 글상자는 0) |
+| `cellParaIndex` | 그 칸(글상자) 안의 문단 번호 |
+
+- 칸이나 칸 문단을 가리키는 메서드(`getCellInfoByPath`, `getTextInCellByPath`,
+  `getCellParagraphCountByPath`, `getCellParagraphLengthByPath` 등)는 모든 단계에 세 필드가 필요하다.
+  마지막 단계가 조회할 칸과 칸 문단이다.
+- 표 자체를 가리키는 `getTableDimensionsByPath`·`getTableCellBboxesByPath`는 마지막 단계에
+  `controlIndex`만 있으면 된다. 마지막 단계의 `cellIndex`·`cellParaIndex`는 생략할 수 있고,
+  주어져도 쓰지 않는다. 바깥 칸을 지나는 앞 단계는 세 필드가 모두 필요하다.
+
+```ts
+// 본문 문단 3의 컨트롤 1(바깥 표) → 그 표 칸 2의 문단 0에 든 컨트롤 0(안쪽 표)
+const path = [
+  { controlIndex: 1, cellIndex: 2, cellParaIndex: 0 },
+  { controlIndex: 0 },
+];
+const dims = JSON.parse(doc.getTableDimensionsByPath(0, 3, JSON.stringify(path)));
+// 안쪽 표 칸 5의 문단 0 글자
+const text = doc.getTextInCellByPath(0, 3, JSON.stringify([
+  path[0], { controlIndex: 0, cellIndex: 5, cellParaIndex: 0 },
+]), 0, 100);
+```
 
 ## 3. 래퍼(Builder) 패턴 권장
 

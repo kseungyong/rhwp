@@ -27,9 +27,10 @@ pub struct Picture {
     pub border_width: i32,
     /// 테두리 속성
     pub border_attr: ShapeBorderLine,
-    /// 이미지 테두리 좌표 X (4개)
+    /// 그림 꼭짓점의 앞 네 INT32: [pt0.x, pt0.y, pt1.x, pt1.y].
+    /// 기존 필드명과 달리 X 좌표만의 배열이 아니다.
     pub border_x: [i32; 4],
-    /// 이미지 테두리 좌표 Y (4개)
+    /// 그림 꼭짓점의 뒤 네 INT32: [pt2.x, pt2.y, pt3.x, pt3.y].
     pub border_y: [i32; 4],
     /// 자르기 정보
     pub crop: CropInfo,
@@ -52,10 +53,11 @@ pub struct Picture {
     pub effects: PictureEffects,
     /// 캡션
     pub caption: Option<super::shape::Caption>,
-    /// HWPX `<hp:imgDim>` 원본 이미지 픽셀 크기 (#1389).
+    /// HWP5 표 116의 기준 이미지 크기(HWPUNIT 두 개), HWPX `<hp:imgDim>` 대응.
     ///
-    /// imgClip extent 와 독립(전수 측정: 불일치 24/170) — 원본 이미지 픽셀 크기를
-    /// verbatim 보존한다. (dimwidth, dimheight). HWPX 파서만 적재.
+    /// crop과 같은 원본 좌표계의 전체 범위이며 디코딩된 bitmap 픽셀 크기와 구별한다.
+    /// imgClip extent와 독립(전수 측정: 불일치 24/170)인 (dimwidth, dimheight)를
+    /// 그대로 보존한다. HWP5·HWPX 파서가 모두 적재한다.
     pub img_dim: (u32, u32),
     /// HWPX `<hp:pic reverse="...">` 값 — 그림 좌우 반전(한컴 Automation
     /// `InsertPicture`의 `reverse` 옵션과 동일 개념). 파서가 읽지 않고 직렬화기가
@@ -67,6 +69,50 @@ pub struct Picture {
 }
 
 impl Picture {
+    /// Construct an embedded picture with the existing insertion geometry contract.
+    /// `common` owns placement; the source crop and imgDim both use pixels × 75.
+    pub(crate) fn from_embedded_image(
+        common: CommonObjAttr,
+        bin_data_id: u16,
+        natural_width_px: u32,
+        natural_height_px: u32,
+    ) -> Self {
+        let width = common.width;
+        let height = common.height;
+        let img_dim = (natural_width_px * 75, natural_height_px * 75);
+        Self {
+            common,
+            shape_attr: ShapeComponentAttr {
+                original_width: width,
+                original_height: height,
+                current_width: width,
+                current_height: height,
+                local_file_version: 1,
+                render_sx: 1.0,
+                render_sy: 1.0,
+                ..Default::default()
+            },
+            border_x: [0, 0, width as i32, 0],
+            border_y: [width as i32, height as i32, 0, height as i32],
+            crop: CropInfo {
+                left: 0,
+                top: 0,
+                right: img_dim.0 as i32,
+                bottom: img_dim.1 as i32,
+            },
+            img_dim,
+            image_attr: ImageAttr {
+                bin_data_id,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+                transparency: 0,
+                external_path: None,
+            },
+            ..Default::default()
+        }
+    }
+
     /// 저장된 자르기 폭이 있으면 높이가 비어 있어도 그 선택을 보존한다.
     /// 빈 선택을 자르기 없음으로 바꾸면 한컴이 그리지 않는 원본 전체가 나타난다.
     pub fn render_crop_rect(&self) -> Option<(i32, i32, i32, i32)> {
@@ -138,6 +184,22 @@ pub struct ImageAttr {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PictureEffects {
     pub shadow: Option<PictureShadow>,
+    /// HWP5 표 111 / HWPX hp:softEdge의 반경(HWPUNIT).
+    /// 이미지 크기·crop과 별개인 그림 효과이며 원본 좌표에 더하지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soft_edge_radius: Option<f64>,
+}
+
+/// 단독 부드러운 가장자리 꼬리는 반경 뒤 원본 크기·alpha가 생략될 수도 있다.
+/// 가변 길이인 다른 효과의 내부 오프셋을 추측하지 않는다.
+pub(crate) fn picture_soft_edge_radius(extra: &[u8]) -> Option<f64> {
+    if !matches!(extra.len(), 13 | 21 | 22)
+        || u32::from_le_bytes(extra.get(5..9)?.try_into().ok()?) != PICTURE_EFFECT_SOFT_EDGE
+    {
+        return None;
+    }
+    let radius = f32::from_le_bytes(extra.get(9..13)?.try_into().ok()?) as f64;
+    (radius.is_finite() && radius >= 0.0).then_some(radius)
 }
 
 /// HWPX 그림 그림자 효과 (`hp:shadow`).
@@ -223,6 +285,60 @@ pub fn transparency_percent_to_alpha_byte(transparency: u8) -> u8 {
 /// HWP/HWPX 저장용 alpha byte(0~255)를 한컴 UI 투명도(0~100%)로 변환한다.
 pub fn alpha_byte_to_transparency_percent(alpha: u8) -> u8 {
     ((alpha as f64 * 100.0) / 255.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// HWP5 SHAPE_COMPONENT_PICTURE 꼬리(`raw_picture_extra`) 안 필드 위치.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PictureExtraLayout {
+    /// 원본 그림 크기(dimwidth u32, dimheight u32)의 시작 위치.
+    pub dim_offset: Option<usize>,
+    /// 그림 투명도(alpha byte) 위치.
+    pub alpha_offset: Option<usize>,
+}
+
+/// 그림 효과 플래그 중 부드러운 가장자리(표 108·111). 뒤에 반경 f32 하나가 온다.
+const PICTURE_EFFECT_SOFT_EDGE: u32 = 0x4;
+
+/// 그림 꼬리의 구조를 판정한다.
+///
+/// 꼬리는 [테두리 투명도 u8][인스턴스 id u32][그림 효과 정보][dimwidth u32]
+/// [dimheight u32][투명도 u8, 생략 가능] 이다(표 107). 그림 효과 정보는 [효과 플래그
+/// u32][효과별 정보] 이고(표 108), 효과가 없으면 플래그 0 뿐이라 꼬리가 17/18 바이트로
+/// 고정된다. 부드러운 가장자리(플래그 4)는 반경 f32 4바이트를 더 둔다(표 111). 고정
+/// 위치 9..17 로 읽으면 반경이 dimwidth 로 읽혀 자르기 영역이 원본의 극히 일부가 된다.
+///
+/// 효과별 정보 길이를 아는 경우(부드러운 가장자리만)에, 그 길이가 꼬리 길이와 정확히
+/// 맞을 때만 건너뛴다. 그림자·네온·반사처럼 색상 정보가 가변인 효과나 길이가 맞지 않는
+/// 꼬리는 종전 해석을 그대로 쓴다.
+pub(crate) fn picture_extra_layout(extra: &[u8]) -> PictureExtraLayout {
+    const EFFECTS_OFFSET: usize = 5;
+    const FIXED_DIM_OFFSET: usize = EFFECTS_OFFSET + 4;
+    let legacy = PictureExtraLayout {
+        dim_offset: (extra.len() >= FIXED_DIM_OFFSET + 8).then_some(FIXED_DIM_OFFSET),
+        alpha_offset: (extra.len() >= FIXED_DIM_OFFSET + 9).then(|| extra.len() - 1),
+    };
+    let Some(flags) = extra
+        .get(EFFECTS_OFFSET..FIXED_DIM_OFFSET)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    else {
+        return legacy;
+    };
+    let effects_len = match flags {
+        PICTURE_EFFECT_SOFT_EDGE => 4,
+        _ => return legacy,
+    };
+    let dim_offset = FIXED_DIM_OFFSET + effects_len;
+    match extra.len().checked_sub(dim_offset) {
+        Some(8) => PictureExtraLayout {
+            dim_offset: Some(dim_offset),
+            alpha_offset: None,
+        },
+        Some(9) => PictureExtraLayout {
+            dim_offset: Some(dim_offset),
+            alpha_offset: Some(dim_offset + 8),
+        },
+        _ => legacy,
+    }
 }
 
 /// 이미지 효과

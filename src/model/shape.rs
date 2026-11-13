@@ -4,6 +4,8 @@ use super::paragraph::Paragraph;
 use super::style::{Fill, ShapeBorderLine};
 use super::*;
 
+pub(crate) mod shadow;
+
 /// `raw_ctrl_data` (CTRL_HEADER) 바이트 오프셋 상수.
 ///
 /// `parse_common_obj_attr` 및 `serialize_common_obj_attr` 과 일치해야 한다.
@@ -75,10 +77,6 @@ pub struct CommonObjAttr {
     /// bit 2 ⟺ affectLSpacing="1" 를 1:1 대조 검증했다. 이 필드가 없어
     /// 그림·도형·표 방출이 "0" 으로 하드코딩되던 유실을 해소한다.
     pub affect_line_spacing: bool,
-    /// HWPX 출처 GenShape를 HWP5로 저장할 때 필요한 storage high bit 후보.
-    ///
-    /// Table adapter의 `0x08000000` 보강과 다른 `0x04000000` bit 26이다.
-    pub hwp5_gen_shape_attr_bit26: bool,
     /// VertRelTo가 para일 때 크기 보호 여부 (HWP5 GenShape CTRL_HEADER attr bit 20).
     pub size_protect: bool,
     /// HWPX 출처 GenShape 번호 범주 high bit 후보 (HWP5 GenShape CTRL_HEADER attr bit 28).
@@ -131,6 +129,35 @@ pub enum ObjectNumberingType {
     Equation,
 }
 
+impl ObjectNumberingType {
+    /// [#8335] HWP5 개체 공통 속성 attr 의 번호 범주 비트 자리(bit 26-27, #8294).
+    pub const HWP5_ATTR_MASK: u32 = 0x03 << 26;
+
+    /// HWP5 attr bit 26-27 의 번호 범주. bit 28 은 범주와 별개다(#8294).
+    pub fn from_hwp5_attr(attr: u32) -> Self {
+        match (attr >> 26) & 0x03 {
+            1 => Self::Picture,
+            2 => Self::Table,
+            3 => Self::Equation,
+            _ => Self::None,
+        }
+    }
+
+    /// 이 범주를 HWP5 attr bit 26-27 자리에 둔 값.
+    ///
+    /// 한컴이 같은 문서를 저장한 HWP·HWPX 32쌍의 개체 616개(표 348·그림 117·도형 91·
+    /// 수식 60) 전부에서 bit 26-27 이 `numberingType` 과 같다. 개체 종류와 무관하다 —
+    /// `NONE` 그림은 0, `PICTURE` 표는 1 이다.
+    pub fn hwp5_attr_bits(self) -> u32 {
+        (match self {
+            Self::None => 0,
+            Self::Picture => 1,
+            Self::Table => 2,
+            Self::Equation => 3,
+        }) << 26
+    }
+}
+
 /// HWPX 개체 `dropcapstyle` (드롭캡 표시 방식). OWPML Core 스키마 `DropCapStyleType`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum DropCapStyle {
@@ -139,6 +166,45 @@ pub enum DropCapStyle {
     DoubleLine,
     TripleLine,
     Margin,
+}
+
+impl DropCapStyle {
+    /// 한/글 12.30(Mac)이 첫 글자 장식 글상자에 싣는 HWP5 CTRL_DATA 앞 20바이트.
+    ///
+    /// 파라미터 셋 539(0x021b) 안 목록 12291(0x3003)의 부호 없는 정수 28673(0x7001)이
+    /// 장식 방식이다(2줄 1·3줄 2·여백 3). HWPX `hp:parameterset name="539"`와 같은 값이다.
+    const HWP5_CTRL_DATA_PREFIX: [u8; 20] = [
+        0x1b, 0x02, 0x01, 0x00, 0x00, 0x00, 0x03, 0x30, 0x00, 0x80, 0x03, 0x30, 0x01, 0x00, 0x00,
+        0x00, 0x01, 0x70, 0x09, 0x00,
+    ];
+
+    /// HWP5 CTRL_DATA가 첫 글자 장식 파라미터 셋이면 그 방식을 돌려준다.
+    pub fn from_hwp5_ctrl_data(data: &[u8]) -> Option<Self> {
+        let (prefix, value) = data.split_at_checked(Self::HWP5_CTRL_DATA_PREFIX.len())?;
+        if prefix != Self::HWP5_CTRL_DATA_PREFIX {
+            return None;
+        }
+        match u32::from_le_bytes(value.try_into().ok()?) {
+            1 => Some(Self::DoubleLine),
+            2 => Some(Self::TripleLine),
+            3 => Some(Self::Margin),
+            _ => None,
+        }
+    }
+
+    /// 장식 방식을 HWP5 CTRL_DATA로 만든다. 장식이 없으면 한/글처럼 싣지 않는다.
+    pub fn hwp5_ctrl_data(self) -> Option<[u8; 24]> {
+        let value: u32 = match self {
+            Self::None => return None,
+            Self::DoubleLine => 1,
+            Self::TripleLine => 2,
+            Self::Margin => 3,
+        };
+        let mut data = [0; 24];
+        data[..20].copy_from_slice(&Self::HWP5_CTRL_DATA_PREFIX);
+        data[20..].copy_from_slice(&value.to_le_bytes());
+        Some(data)
+    }
 }
 
 /// 세로 위치 기준
@@ -284,6 +350,11 @@ pub struct ShapeComponentAttr {
     /// 아핀 행렬 비대각 요소 (회전/전단 성분)
     pub render_b: f64,
     pub render_c: f64,
+    /// [#8225] 묶음 안 자식 도형의 CTRL_DATA 원본 (자식 SHAPE_COMPONENT 바로 아래 레코드, 라운드트립 보존용).
+    /// 한컴은 여기에 개체 설명 글 같은 ParameterSet 을 둔다. 맨 위 개체의 CTRL_DATA 는
+    /// `Paragraph.ctrl_data_records` 가 갖는다.
+    #[serde(skip)]
+    pub ctrl_data: Option<Vec<u8>>,
 }
 
 impl ShapeComponentAttr {
@@ -339,6 +410,7 @@ impl Default for ShapeComponentAttr {
             render_sy: 1.0,
             render_b: 0.0,
             render_c: 0.0,
+            ctrl_data: None,
         }
     }
 }
@@ -530,6 +602,54 @@ impl ShapeObject {
         }
     }
 
+    /// 편집 셀 주소의 글상자 번호. 독립 도형은 0, 묶음은 원본 자식 순서의 깊이 우선 글상자 번호다.
+    /// 장식 도형과 중간 묶음은 번호를 소비하지 않는다. 저장 모델을 풀거나 복제하지 않는다.
+    pub fn textbox_shape_count(&self) -> usize {
+        match self {
+            Self::Group(group) => group.children.iter().map(Self::textbox_shape_count).sum(),
+            _ => usize::from(
+                self.drawing()
+                    .is_some_and(|drawing| drawing.text_box.is_some()),
+            ),
+        }
+    }
+
+    pub fn textbox_shape_at(&self, mut index: usize) -> Option<&Self> {
+        if let Self::Group(group) = self {
+            for child in &group.children {
+                let count = child.textbox_shape_count();
+                if index < count {
+                    return child.textbox_shape_at(index);
+                }
+                index -= count;
+            }
+            None
+        } else {
+            (index == 0 && self.textbox_shape_count() == 1).then_some(self)
+        }
+    }
+
+    pub fn textbox_shape_at_mut(&mut self, mut index: usize) -> Option<&mut Self> {
+        if let Self::Group(group) = self {
+            for child in &mut group.children {
+                let count = child.textbox_shape_count();
+                if index < count {
+                    return child.textbox_shape_at_mut(index);
+                }
+                index -= count;
+            }
+            None
+        } else if index == 0
+            && self
+                .drawing()
+                .is_some_and(|drawing| drawing.text_box.is_some())
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     /// Z-order 값 반환
     pub fn z_order(&self) -> i32 {
         self.common().z_order
@@ -557,8 +677,30 @@ impl ShapeObject {
     /// (`shape_attr.current_height`)는 어긋날 수 있다 — 한글은 둘 중 큰 값을
     /// 조판 높이로 쓴다. 조판·측정·렌더가 각자 이 식을 다시 쓰면 같은 속성에
     /// 정의가 여러 벌 생기므로(#4333) 이 메서드가 유일한 정의다.
+    ///
+    /// [#8167] HWPX `<hp:curSz height="0">` 를 파서가 `orgSz` 로 채운 값
+    /// (`current_height_was_zero`)은 `renderingInfo` 배율을 적용하기 전 원본 크기라
+    /// 실제 표시 높이가 아니다. 이때는 저장 프레임만 쓴다 — 한/글은 `sz` 1284HU ·
+    /// `orgSz` 6768HU 인 글자처럼 글상자를 1284HU 줄에 놓는다(HWP5-nopassword hwpx 18쪽).
     pub fn flow_height_hu(&self) -> i32 {
-        (self.common().height as i32).max(self.shape_attr().current_height as i32)
+        let attr = self.shape_attr();
+        let current = if attr.current_height_was_zero {
+            0
+        } else {
+            attr.current_height as i32
+        };
+        (self.common().height as i32).max(current)
+    }
+
+    /// 도형이 줄 흐름에서 차지하는 가로 범위 (HWPUNIT). [`Self::flow_height_hu`] 와 같은 규칙.
+    pub fn flow_width_hu(&self) -> i32 {
+        let attr = self.shape_attr();
+        let current = if attr.current_width_was_zero {
+            0
+        } else {
+            attr.current_width as i32
+        };
+        (self.common().width as i32).max(current)
     }
 
     /// 개체 요소 속성 가변 참조 반환
@@ -794,9 +936,9 @@ pub struct CurveShape {
     pub common: CommonObjAttr,
     /// 그리기 공통 속성
     pub drawing: DrawingObjAttr,
-    /// 제어점 좌표 목록
+    /// 곡선이 통과하는 원본 점 체인 (베지어 제어점 배열이 아님)
     pub points: Vec<Point>,
-    /// 세그먼트 타입 목록 (0: line, 1: curve)
+    /// 인접한 점 사이의 구간 종류: points.len() - 1개 (0: line, 1: curve)
     pub segment_types: Vec<u8>,
 }
 

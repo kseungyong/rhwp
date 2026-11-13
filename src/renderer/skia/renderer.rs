@@ -20,8 +20,9 @@ use crate::paint::{
     TextDecorationKind, TextVariantKind, TextVariantQuality, TextVisualReplayRole,
 };
 use crate::renderer::layer_renderer::{
-    LayerRasterRenderer, LayerRenderDiagnostics, LayerRenderResult, RasterOutputFormat,
-    RasterRenderOptions, RasterRenderOutput, TextVariantSelectionReport,
+    is_bounded_vertical_hwp5_replay_candidate, LayerRasterRenderer, LayerRenderDiagnostics,
+    LayerRenderResult, RasterOutputFormat, RasterRenderOptions, RasterRenderOutput,
+    TextVariantSelectionReport, VariantSelectionBackend,
 };
 use crate::renderer::raster_pixels::{
     RasterPixelFormat, RasterPixels, RasterRegion, RasterRegionPixels,
@@ -37,8 +38,12 @@ use super::diagnostics::ReplayDiagnostics;
 use super::equation_conv::{render_equation, EquationFonts};
 use super::fill_shader::shape_fill;
 use super::font_catalog::TypefaceCatalog;
+#[path = "declared_font_fallbacks.rs"]
+mod declared_font_fallbacks;
 #[path = "native_pua_fonts.rs"]
 mod native_pua_fonts;
+#[path = "text_shadow_fonts.rs"]
+mod text_shadow_fonts;
 use super::font_lookup::{
     collect_system_families, font_style_for_text, legacy_typeface_for_style, match_supplied_family,
     match_system_family_style, SystemFontFamilies,
@@ -49,7 +54,7 @@ use super::glyph_replay::{
 };
 use super::image_cache::ImageResourceCache;
 use super::image_conv::{draw_image_bytes, draw_svg_fragment};
-use super::line_replay::draw_line;
+use super::line_replay::{draw_line, floor_stroke_to_device};
 use super::text_replay::SkiaTextReplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,6 +64,7 @@ pub enum NativeGlyphRunReplayProofReason {
     AdvanceCountMismatch,
     GlyphTransformUnsupported,
     VerticalOrientationUnsupported,
+    VerticalAuthorityUnsupported,
     StrictVisualIneligible,
     MissingGlyph,
     ClusterMismatch,
@@ -94,6 +100,7 @@ impl NativeGlyphRunReplayProofReason {
             Self::AdvanceCountMismatch => "advanceCountMismatch",
             Self::GlyphTransformUnsupported => "glyphTransformUnsupported",
             Self::VerticalOrientationUnsupported => "verticalOrientationUnsupported",
+            Self::VerticalAuthorityUnsupported => "verticalAuthorityUnsupported",
             Self::StrictVisualIneligible => "strictVisualIneligible",
             Self::MissingGlyph => "missingGlyph",
             Self::ClusterMismatch => "clusterMismatch",
@@ -130,6 +137,26 @@ pub struct NativeGlyphRunReplayProof {
     pub reasons: Vec<NativeGlyphRunReplayProofReason>,
 }
 
+/// The reason a strict alternative was abandoned during Native resource preparation.
+/// Contract and exact-face failures retain the same public proof returned by preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeGlyphPreparationFailure {
+    GlyphRunRejected(NativeGlyphRunReplayProof),
+    PreparationBudgetExceeded,
+    UnsupportedOutlinePayload,
+    VariantPartsIncomplete,
+}
+
+/// A bounded observation of one rejected Native text alternative.
+/// Identifiers are UTF-8 prefixes of at most 256 bytes; they are not cache keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeGlyphReplayRejectReport {
+    pub equivalence_group: String,
+    pub variant_id: String,
+    pub variant_kind: TextVariantKind,
+    pub failure: NativeGlyphPreparationFailure,
+}
+
 fn native_skia_can_replay_glyph_run(run: &LayerGlyphRunPaint, resources: &ResourceArena) -> bool {
     native_skia_glyph_run_replay_proof(run, resources).typeface_constructible
 }
@@ -141,6 +168,9 @@ fn native_skia_glyph_run_contract_is_replayable(
     native_skia_glyph_run_replay_proof(run, resources).contract_replayable
 }
 
+/// Checks the glyph/resource declaration. The enclosing leaf's source text is
+/// not available here; replay additionally checks that bounded vertical runs
+/// replace exactly one source scalar before suppressing their TextRun fallback.
 pub fn native_skia_glyph_run_replay_proof(
     run: &LayerGlyphRunPaint,
     resources: &ResourceArena,
@@ -155,6 +185,59 @@ fn prepare_native_glyph_run(
 ) -> (NativeGlyphRunReplayProof, Option<PreparedGlyph>) {
     let mut contract_reasons = BTreeSet::new();
     let mut construction_reasons = BTreeSet::new();
+
+    let vertical_declared =
+        run.diagnostics.reason.as_deref() == Some("boundedVerticalHwp5TableCellV1");
+    let bounded_vertical =
+        is_bounded_vertical_hwp5_replay_candidate(run, VariantSelectionBackend::NativeSkia);
+    if vertical_declared && !bounded_vertical {
+        // A malformed bounded claim must never re-enter the ordinary horizontal lane.
+        contract_reasons.insert(NativeGlyphRunReplayProofReason::VerticalAuthorityUnsupported);
+    }
+    if bounded_vertical {
+        let source_ranges_match = run.source.utf8_range.start == 0
+            && run.source.utf16_range.start == 0
+            && matches!(
+                (run.source.utf8_range.end, run.source.utf16_range.end),
+                (1, 1) | (2, 1) | (3, 1) | (4, 2)
+            );
+        let cluster_matches = matches!(run.clusters.as_slice(), [cluster]
+            if source_ranges_match
+                && run.glyph_ids.len() == 1
+                && cluster.source_range_utf8 == run.source.utf8_range
+                && cluster.source_range_utf16 == Some(run.source.utf16_range)
+                && cluster.text_range_utf8 == Some(run.source.utf8_range)
+                && cluster.glyph_range == crate::paint::GlyphRange::new(0, 1)
+                && cluster.flags.as_slice() == [crate::paint::GlyphClusterFlag::FallbackBoundary]);
+        if !cluster_matches {
+            contract_reasons.insert(NativeGlyphRunReplayProofReason::ClusterMismatch);
+        }
+        if run.advances.as_ref().map(Vec::len) != Some(1) {
+            contract_reasons.insert(NativeGlyphRunReplayProofReason::AdvanceCountMismatch);
+        }
+        let placement = run.placement.run_to_page;
+        if [
+            placement.a,
+            placement.b,
+            placement.c,
+            placement.d,
+            placement.e,
+            placement.f,
+        ] != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            || run.placement.baseline_y != 0.0
+            || run.paint_style.font_size != run.shape_key.font_instance.size_px
+            || run.variant.equivalence_group != format!("text-{}", run.source.id.0)
+            || run.variant.anchor_op_id.as_deref() != Some(run.variant.equivalence_group.as_str())
+            || run.diagnostics.max_origin_delta_px != 0.0
+            || run.diagnostics.max_advance_delta_px != 0.0
+            || run.diagnostics.max_residual_after_adjustment_px != 0.0
+        {
+            contract_reasons.insert(NativeGlyphRunReplayProofReason::VerticalAuthorityUnsupported);
+        }
+        if !run.paint_style.is_fill_only_glyph_replay() {
+            contract_reasons.insert(NativeGlyphRunReplayProofReason::UnsupportedPaintEffect);
+        }
+    }
 
     if run.glyph_ids.is_empty() {
         contract_reasons.insert(NativeGlyphRunReplayProofReason::EmptyGlyphIds);
@@ -172,8 +255,12 @@ fn prepare_native_glyph_run(
     if run.direction != crate::paint::TextDirection::Ltr
         || run.shape_key.direction != crate::paint::TextDirection::Ltr
         || run.bidi_level != Some(0)
-        || run.writing_mode != crate::paint::WritingMode::HorizontalTb
-        || run.shape_key.writing_mode != crate::paint::WritingMode::HorizontalTb
+        || ((!matches!(run.writing_mode, crate::paint::WritingMode::HorizontalTb)
+            || !matches!(
+                run.shape_key.writing_mode,
+                crate::paint::WritingMode::HorizontalTb
+            ))
+            && !bounded_vertical)
     {
         contract_reasons.insert(NativeGlyphRunReplayProofReason::DirectionUnsupported);
     }
@@ -193,7 +280,7 @@ fn prepare_native_glyph_run(
     if run.glyph_transforms.is_some() {
         contract_reasons.insert(NativeGlyphRunReplayProofReason::GlyphTransformUnsupported);
     }
-    if run.orientation != GlyphRunOrientation::Horizontal {
+    if run.orientation != GlyphRunOrientation::Horizontal && !bounded_vertical {
         contract_reasons.insert(NativeGlyphRunReplayProofReason::VerticalOrientationUnsupported);
     }
     if !run.diagnostics.strict_visual_eligible {
@@ -396,6 +483,8 @@ struct CachedPicture {
     inverse_matrix: Matrix,
     next_text_source_id: u32,
     selection_updates: Vec<TextVariantSelectionReport>,
+    native_glyph_rejections: Vec<NativeGlyphReplayRejectReport>,
+    native_glyph_rejections_dropped: usize,
 }
 
 struct PageReplayOutput {
@@ -405,6 +494,7 @@ struct PageReplayOutput {
 }
 
 pub struct SkiaLayerRenderer {
+    viewport_culling: bool,
     font_mgr: FontMgr,
     text_shaper: OnceCell<Option<Shaper>>,
     /// 사용자 지정 경로의 family별 TTC face·스타일 catalog.
@@ -439,6 +529,7 @@ impl SkiaLayerRenderer {
             };
         }
         SKIA_FONT_BASE.with(|(font_mgr, system_families)| Self {
+            viewport_culling: true,
             font_mgr: font_mgr.clone(),
             text_shaper: OnceCell::new(),
             custom_typefaces: TypefaceCatalog::default(),
@@ -462,6 +553,14 @@ impl SkiaLayerRenderer {
         self.picture_cache = RefCell::new(BoundedCache::new(max_entries, max_bytes));
         self.glyph_cache = RefCell::new(BoundedCache::new(max_entries, max_bytes));
         self.image_cache = ImageResourceCache::new(max_entries, max_bytes);
+        self
+    }
+
+    /// Cull only proven simple-shape bounds outside a raster canvas clip.
+    /// Unknown text, SVG, image/effect bounds and strict vector replay remain
+    /// fully replayed. Disable for direct pixel/counter comparison.
+    pub fn with_viewport_culling(mut self, enabled: bool) -> Self {
+        self.viewport_culling = enabled;
         self
     }
 
@@ -490,9 +589,10 @@ impl SkiaLayerRenderer {
         page_num: u32,
         options_json: &str,
     ) -> Result<String, crate::error::HwpError> {
-        let observe = |requested: &str, character: char, bold: bool, italic: bool| {
-            self.font_decision(requested, character, bold, italic)
-        };
+        let observe =
+            |requested: &str, character: char, bold: bool, italic: bool, source_ttf: bool| {
+                self.font_decision(requested, character, bold, italic, source_ttf)
+            };
         core.get_font_decision_trace_with_native_observer(
             page_num,
             options_json,
@@ -558,8 +658,11 @@ impl SkiaLayerRenderer {
         character: char,
         bold: bool,
         italic: bool,
+        source_ttf: bool,
     ) -> crate::renderer::font_decision::BackendDecision {
-        use super::font_lookup::{select_typeface_for_character, text_typeface_candidates};
+        use super::font_lookup::{
+            select_typeface_for_character, text_typeface_candidates_for_source,
+        };
 
         let style = font_style_for_text(&crate::renderer::TextStyle {
             font_family: requested.into(),
@@ -567,13 +670,14 @@ impl SkiaLayerRenderer {
             italic,
             ..Default::default()
         });
-        let (candidates, typefaces) = text_typeface_candidates(
+        let (candidates, typefaces) = text_typeface_candidates_for_source(
             &self.font_mgr,
             &self.system_families,
             &self.custom_typefaces,
             &self.bundled_typefaces,
             requested,
             style,
+            source_ttf,
         );
         let selected = select_typeface_for_character(&typefaces, character);
         let mut failures = Vec::new();
@@ -965,6 +1069,10 @@ impl SkiaLayerRenderer {
         let diagnostics = RefCell::new(ReplayDiagnostics::new(tree));
         let cache_before = self.cache_stats();
         let image_before = self.image_cache.observations();
+        let culling = super::culling::CullingIndex::new(
+            &tree.root,
+            self.viewport_culling && !strict_resource_failures,
+        );
         // Resource bytes are fingerprinted once per page, not once per group.
         let mut cache_context = ReplayCacheContext::new(
             tree,
@@ -972,6 +1080,7 @@ impl SkiaLayerRenderer {
             strict_resource_failures,
             canvas.image_info().color_type() != skia_safe::ColorType::Unknown,
             &diagnostics,
+            &culling,
         );
         let matrix = canvas.local_to_device_as_3x3();
         if tree.profile == crate::paint::RenderProfile::Print
@@ -1034,27 +1143,29 @@ impl SkiaLayerRenderer {
         resources: &ResourceArena,
         scale: f32,
         context: &ReplayCacheContext<'_>,
-    ) -> Option<Rc<PreparedGlyph>> {
+    ) -> Result<Rc<PreparedGlyph>, NativeGlyphPreparationFailure> {
         let key = context.seed.and_then(|seed| debug_key(&(seed, op)));
         let cached = key.and_then(|key| self.glyph_cache.borrow_mut().get(key));
         if let Some(prepared) = cached {
-            return Some(prepared);
+            return Ok(prepared);
         }
         let prepared = Rc::new(match op {
             PaintOp::GlyphRun { run, .. } => {
-                prepare_native_glyph_run(run, resources, &self.font_mgr).1?
+                let (proof, prepared) = prepare_native_glyph_run(run, resources, &self.font_mgr);
+                prepared.ok_or(NativeGlyphPreparationFailure::GlyphRunRejected(proof))?
             }
             PaintOp::GlyphOutline { outline, bbox, .. } => {
-                prepare_glyph_outline(outline, *bbox, resources, scale)?
+                prepare_glyph_outline(outline, *bbox, resources, scale)
+                    .ok_or(NativeGlyphPreparationFailure::UnsupportedOutlinePayload)?
             }
-            _ => return None,
+            _ => return Err(NativeGlyphPreparationFailure::UnsupportedOutlinePayload),
         });
         if let Some(key) = key {
             self.glyph_cache
                 .borrow_mut()
                 .insert(key, prepared.clone(), prepared.byte_cost);
         }
-        Some(prepared)
+        Ok(prepared)
     }
 
     fn render_node(
@@ -1071,6 +1182,12 @@ impl SkiaLayerRenderer {
         strict_resource_failures: bool,
         cache_context: &ReplayCacheContext<'_>,
     ) -> LayerRenderResult<()> {
+        if cache_context.culling.is_outside(node, canvas) {
+            let mut diagnostics = cache_context.diagnostics.borrow_mut();
+            diagnostics.output.layer_nodes_culled =
+                diagnostics.output.layer_nodes_culled.saturating_add(1);
+            return Ok(());
+        }
         {
             let mut diagnostics = cache_context.diagnostics.borrow_mut();
             diagnostics.output.layer_nodes_replayed =
@@ -1083,6 +1200,7 @@ impl SkiaLayerRenderer {
         let active_layer = node.layer.or(inherited_layer);
         let clip_enabled = output_options.clip_enabled;
         let antialias = cache_context.policy.antialias();
+        let raster_target = cache_context.raster_target;
         let apply_dash = |paint: &mut Paint, dash: StrokeDash| {
             let mut intervals = dash.intervals(f64::from(paint.stroke_width()));
             // 기존 범용 Skia 패턴은 종전 선 굵기 배율을 유지한다.
@@ -1115,6 +1233,7 @@ impl SkiaLayerRenderer {
             });
             paint.set_color(colorref_to_skia(style.stroke_color?, style.opacity as f32));
             apply_dash(&mut paint, style.stroke_dash);
+            floor_stroke_to_device(canvas, &mut paint, raster_target);
             Some(paint)
         };
         let make_line_paint = |style: &LineStyle| {
@@ -1132,6 +1251,7 @@ impl SkiaLayerRenderer {
                 let intervals = intervals.iter().map(|v| *v as f32).collect::<Vec<_>>();
                 paint.set_path_effect(PathEffect::dash(&intervals, 0.0));
             }
+            floor_stroke_to_device(canvas, &mut paint, raster_target);
             paint
         };
         let draw_placeholder = |bbox: crate::renderer::render_tree::BoundingBox, label: &str| {
@@ -1175,7 +1295,8 @@ impl SkiaLayerRenderer {
                           crop_reference_size,
                           effect,
                           brightness,
-                          contrast| {
+                          contrast,
+                          print_area| {
             draw_image_bytes(
                 canvas,
                 &self.image_cache,
@@ -1194,7 +1315,13 @@ impl SkiaLayerRenderer {
                 cache_context
                     .policy
                     .image_sampling()
-                    .with_paper_grid(cache_context.bitmap_paper_grid),
+                    .with_strict_resources(strict_resource_failures)
+                    .with_paper_grid(cache_context.bitmap_paper_grid)
+                    .with_print_page((print_area && cache_context.raster_target).then_some((
+                        cache_context.page_extent.0,
+                        cache_context.page_extent.1,
+                        f64::from(fallback_raster_scale),
+                    ))),
             )
         };
         let equation_fonts = EquationFonts {
@@ -1206,6 +1333,7 @@ impl SkiaLayerRenderer {
         let text_replay = SkiaTextReplay {
             canvas,
             raster_target: cache_context.raster_target,
+            geometric_text: cache_context.raster_target && cache_context.geometric_text,
             hft_outline_enabled,
             font_mgr: &self.font_mgr,
             text_shaper: &self.text_shaper,
@@ -1294,6 +1422,16 @@ impl SkiaLayerRenderer {
                             .borrow_mut()
                             .apply_selection(report);
                     }
+                    {
+                        let mut diagnostics = cache_context.diagnostics.borrow_mut();
+                        for report in cached.native_glyph_rejections {
+                            diagnostics.apply_native_rejection(report);
+                        }
+                        diagnostics.output.native_glyph_rejections_dropped = diagnostics
+                            .output
+                            .native_glyph_rejections_dropped
+                            .saturating_add(cached.native_glyph_rejections_dropped);
+                    }
                     canvas.draw_picture(&cached.picture, Some(&cached.inverse_matrix), None);
                     *next_text_source_id = cached.next_text_source_id;
                     return Ok(());
@@ -1304,7 +1442,14 @@ impl SkiaLayerRenderer {
                     (bounds.is_finite() && !bounds.is_empty()).then_some((key, inverse, bounds))
                 });
                 if let Some((key, inverse_matrix, bounds)) = recording {
-                    let update_start = cache_context.diagnostics.borrow().selection_updates.len();
+                    let (update_start, rejection_start, dropped_start) = {
+                        let diagnostics = cache_context.diagnostics.borrow();
+                        (
+                            diagnostics.selection_updates.len(),
+                            diagnostics.output.native_glyph_rejections.len(),
+                            diagnostics.output.native_glyph_rejections_dropped,
+                        )
+                    };
                     let mut recorder = PictureRecorder::new();
                     let recording_canvas = recorder.begin_recording(bounds, true);
                     // Preserve device-scale-dependent SVG rasterization while
@@ -1314,30 +1459,53 @@ impl SkiaLayerRenderer {
                     let picture = recorder.finish_recording_as_picture(None).ok_or_else(|| {
                         HwpError::RenderError("Skia static picture recording failed".into())
                     })?;
-                    let selection_updates = {
+                    let (
+                        selection_updates,
+                        native_glyph_rejections,
+                        native_glyph_rejections_dropped,
+                    ) = {
                         let mut diagnostics = cache_context.diagnostics.borrow_mut();
                         diagnostics.output.static_picture_cache_recordings = diagnostics
                             .output
                             .static_picture_cache_recordings
                             .saturating_add(1);
-                        diagnostics.selection_updates[update_start..].to_vec()
+                        (
+                            diagnostics.selection_updates[update_start..].to_vec(),
+                            diagnostics.output.native_glyph_rejections[rejection_start..].to_vec(),
+                            diagnostics
+                                .output
+                                .native_glyph_rejections_dropped
+                                .saturating_sub(dropped_start),
+                        )
                     };
                     canvas.draw_picture(&picture, Some(&inverse_matrix), None);
-                    let bytes = picture
-                        .approximate_bytes_used()
-                        .saturating_add(cache_context.retained_resource_estimate)
-                        .saturating_add(inline_resource_estimate(node, fallback_raster_scale))
-                        .saturating_add(debug_size(&selection_updates).unwrap_or(usize::MAX));
-                    self.picture_cache.borrow_mut().insert(
-                        key,
-                        CachedPicture {
-                            picture,
-                            inverse_matrix,
-                            next_text_source_id: *next_text_source_id,
-                            selection_updates,
-                        },
-                        bytes,
-                    );
+                    // A saturated page-level report can hide this subtree's
+                    // first rejections if an earlier sibling already used some
+                    // of the allowance. Such a snapshot depends on the preceding
+                    // siblings, which are deliberately absent from this key.
+                    // Replay it again rather than retain incomplete diagnostics.
+                    if rejection_start == 0 || native_glyph_rejections_dropped == 0 {
+                        let bytes = picture
+                            .approximate_bytes_used()
+                            .saturating_add(cache_context.retained_resource_estimate)
+                            .saturating_add(inline_resource_estimate(node, fallback_raster_scale))
+                            .saturating_add(debug_size(&selection_updates).unwrap_or(usize::MAX))
+                            .saturating_add(
+                                debug_size(&native_glyph_rejections).unwrap_or(usize::MAX),
+                            );
+                        self.picture_cache.borrow_mut().insert(
+                            key,
+                            CachedPicture {
+                                picture,
+                                inverse_matrix,
+                                next_text_source_id: *next_text_source_id,
+                                selection_updates,
+                                native_glyph_rejections,
+                                native_glyph_rejections_dropped,
+                            },
+                            bytes,
+                        );
+                    }
                 } else {
                     render_children(canvas, next_text_source_id)?;
                 }
@@ -1407,6 +1575,28 @@ impl SkiaLayerRenderer {
                     );
                 }
                 canvas.save();
+                let clip = if cache_context.raster_target && cache_context.device_clip {
+                    let matrix = canvas.local_to_device_as_3x3();
+                    (!matrix.has_perspective())
+                        .then(|| {
+                            crate::paint::device_clip::rectangle(
+                                *clip,
+                                [
+                                    matrix.scale_x(),
+                                    matrix.skew_y(),
+                                    matrix.skew_x(),
+                                    matrix.scale_y(),
+                                    matrix.translate_x(),
+                                    matrix.translate_y(),
+                                ]
+                                .map(f64::from),
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or(*clip)
+                } else {
+                    *clip
+                };
                 canvas.clip_rect(
                     Rect::from_xywh(
                         clip.x as f32,
@@ -1434,21 +1624,30 @@ impl SkiaLayerRenderer {
                 result?;
             }
             LayerNodeKind::Leaf { ops } => {
-                let fallback_source_ids = ops
+                let fallback_sources = ops
                     .iter()
                     .filter_map(|op| match op {
-                        PaintOp::TextRun { source, .. } => {
-                            source.as_ref().map(|source| source.id.0)
-                        }
+                        PaintOp::TextRun { source, run, .. } => source
+                            .as_ref()
+                            .map(|source| (source.id.0, run.text.chars().take(2).count() == 1)),
                         _ => None,
                     })
-                    .collect::<HashSet<_>>();
+                    .collect::<HashMap<_, _>>();
                 let mut variant_order = 0usize;
                 let mut prepared_glyphs = HashMap::<usize, Rc<PreparedGlyph>>::new();
                 let mut preparation_budget = GlyphPreparationBudget::new();
                 let mut glyph_variants = HashMap::<
                     String,
-                    HashMap<String, (usize, u32, HashSet<u32>, bool, TextVariantKind)>,
+                    HashMap<
+                        String,
+                        (
+                            usize,
+                            u32,
+                            HashSet<u32>,
+                            Option<NativeGlyphPreparationFailure>,
+                            TextVariantKind,
+                        ),
+                    >,
                 >::new();
                 let mut glyph_variant_sources = HashMap::<String, u32>::new();
                 for (op_index, op) in ops.iter().enumerate() {
@@ -1459,16 +1658,33 @@ impl SkiaLayerRenderer {
                         PaintOp::GlyphRun { run, .. } => Some((
                             &run.variant,
                             run.source.id.0,
-                            glyph_run_minimum_byte_cost(run, resources).and_then(|minimum_bytes| {
-                                preparation_budget.prepare(minimum_bytes, || {
+                            preparation_budget.prepare(
+                                glyph_run_minimum_byte_cost(run, resources).unwrap_or(0),
+                                || {
+                                    // Four UTF-8 bytes / two UTF-16 units can
+                                    // represent one supplementary scalar or
+                                    // multiple BMP scalars. The source span
+                                    // alone cannot prove the producer subset.
+                                    if run.diagnostics.reason.as_deref()
+                                        == Some("boundedVerticalHwp5TableCellV1")
+                                        && fallback_sources.get(&run.source.id.0) != Some(&true)
+                                    {
+                                        return Err(NativeGlyphPreparationFailure::GlyphRunRejected(
+                                            NativeGlyphRunReplayProof {
+                                                contract_replayable: false,
+                                                typeface_constructible: false,
+                                                reasons: vec![NativeGlyphRunReplayProofReason::VerticalAuthorityUnsupported],
+                                            },
+                                        ));
+                                    }
                                     self.prepare_cached_glyph(
                                         op,
                                         resources,
                                         fallback_raster_scale,
                                         cache_context,
                                     )
-                                })
-                            }),
+                                },
+                            ),
                         )),
                         PaintOp::GlyphOutline { outline, .. } => Some((
                             &outline.variant,
@@ -1498,19 +1714,27 @@ impl SkiaLayerRenderer {
                                 order,
                                 variant.part_count,
                                 HashSet::new(),
-                                true,
+                                None,
                                 variant.variant_kind,
                             )
                         });
                         if state.1 != variant.part_count || variant.part_count == 0 {
-                            state.3 = false;
+                            state.3.get_or_insert(
+                                NativeGlyphPreparationFailure::VariantPartsIncomplete,
+                            );
                         }
                         if !state.2.insert(variant.part_index) {
-                            state.3 = false;
+                            state.3.get_or_insert(
+                                NativeGlyphPreparationFailure::VariantPartsIncomplete,
+                            );
                         }
-                        state.3 &= prepared.is_some();
-                        if let Some(prepared) = prepared {
-                            prepared_glyphs.insert(op_index, prepared);
+                        match prepared {
+                            Ok(prepared) => {
+                                prepared_glyphs.insert(op_index, prepared);
+                            }
+                            Err(failure) => {
+                                state.3.get_or_insert(failure);
+                            }
                         }
                     }
                 }
@@ -1526,16 +1750,21 @@ impl SkiaLayerRenderer {
                     candidates.sort_by_key(|(_, state)| state.0);
                     let mut selected = None;
                     let mut rejected = Vec::new();
-                    for (variant_id, (_, expected_part_count, parts, supported, kind)) in candidates
-                    {
+                    for (variant_id, (_, expected_part_count, parts, failure, kind)) in candidates {
                         let parts_complete = parts.len() as u32 == expected_part_count
                             && (0..expected_part_count).all(|index| parts.contains(&index));
-                        if supported && parts_complete {
+                        if failure.is_none() && parts_complete {
                             if selected.is_none() {
                                 selected = Some((variant_id, kind));
                             }
                         } else {
-                            rejected.push((variant_id, kind));
+                            rejected.push((
+                                variant_id,
+                                kind,
+                                failure.unwrap_or(
+                                    NativeGlyphPreparationFailure::VariantPartsIncomplete,
+                                ),
+                            ));
                         }
                     }
                     if let Some((id, _)) = &selected {
@@ -1543,7 +1772,7 @@ impl SkiaLayerRenderer {
                     }
                     let fallback = glyph_variant_sources
                         .get(&group)
-                        .is_some_and(|source| fallback_source_ids.contains(source));
+                        .is_some_and(|source| fallback_sources.contains_key(source));
                     cache_context.diagnostics.borrow_mut().actual_selection(
                         &group,
                         selected.as_ref().map(|(id, kind)| (id.as_str(), *kind)),
@@ -1685,6 +1914,7 @@ impl SkiaLayerRenderer {
                                     } else {
                                         image.display_brightness_contrast().1
                                     },
+                                    false,
                                 );
                                 if needs_watermark_opacity {
                                     canvas.restore();
@@ -1704,6 +1934,7 @@ impl SkiaLayerRenderer {
                                 } else {
                                     1.0
                                 });
+                                floor_stroke_to_device(canvas, &mut paint, raster_target);
                                 paint.set_color(colorref_to_skia(color, 1.0));
                                 canvas.draw_rect(rect, &paint);
                             }
@@ -1805,19 +2036,12 @@ impl SkiaLayerRenderer {
                                     canvas,
                                     !matches!(op, PaintOp::GlyphOutline { .. }) || antialias,
                                     cache_context.policy.image_sampling().options(),
+                                    cache_context.raster_target,
                                 );
                             }
                         }
                         PaintOp::FootnoteMarker { bbox, marker } => {
-                            let style = crate::renderer::TextStyle {
-                                font_family: marker.font_family.clone(),
-                                font_size:
-                                    crate::renderer::render_tree::FootnoteMarkerNode::font_size(
-                                        marker.base_font_size,
-                                    ),
-                                color: marker.color,
-                                ..Default::default()
-                            };
+                            let style = marker.paint_style();
                             text_replay.draw_text(
                                 &marker.text,
                                 *bbox,
@@ -1829,7 +2053,9 @@ impl SkiaLayerRenderer {
                                 false,
                                 false,
                                 false,
-                                None,
+                                marker.source_run.as_deref().and_then(|run| {
+                                    run.validated_layout_positions_for(&marker.text)
+                                }),
                                 0,
                                 false,
                                 false,
@@ -1850,12 +2076,26 @@ impl SkiaLayerRenderer {
                             if line.transform.has_transform() {
                                 open_shape_transform(line.transform, bbox);
                             }
+                            let minimum_width = cache_context
+                                .policy
+                                .print_stroke_adjustment()
+                                .then(|| canvas.local_to_device_as_3x3())
+                                .filter(|matrix| !matrix.has_perspective())
+                                .and_then(|matrix| {
+                                    crate::renderer::raster_stroke::minimum_width([
+                                        f64::from(matrix.scale_x()),
+                                        f64::from(matrix.skew_y()),
+                                        f64::from(matrix.skew_x()),
+                                        f64::from(matrix.scale_y()),
+                                    ])
+                                });
                             draw_line(
                                 canvas,
                                 line,
                                 &make_line_paint(&line.style),
                                 antialias,
                                 profile,
+                                raster_target,
                             );
                             draw_arrow_heads(
                                 canvas,
@@ -1880,10 +2120,19 @@ impl SkiaLayerRenderer {
                                 bbox.width as f32,
                                 bbox.height as f32,
                             );
-                            if let Some(fill) =
+                            if let Some(mut fill) =
                                 shape_fill(bbox, &rect.style, rect.gradient.as_deref(), antialias)
                             {
-                                if rect.corner_radius > 0.0 {
+                                if let Some(fill_rect) = super::rectangle_fill::bounds(
+                                    canvas,
+                                    *bbox,
+                                    rect,
+                                    cache_context.raster_target
+                                        && cache_context.policy.print_stroke_adjustment(),
+                                ) {
+                                    fill.set_anti_alias(false);
+                                    canvas.draw_rect(fill_rect, &fill);
+                                } else if rect.corner_radius > 0.0 {
                                     canvas.draw_round_rect(
                                         sk_rect,
                                         rect.corner_radius as f32,
@@ -1895,6 +2144,28 @@ impl SkiaLayerRenderer {
                                 }
                             }
                             if let Some(mut stroke) = make_stroke_paint(&rect.style) {
+                                if cache_context.raster_target
+                                    && cache_context.policy.print_stroke_adjustment()
+                                {
+                                    let matrix = canvas.local_to_device_as_3x3();
+                                    let minimum = (!matrix.has_perspective())
+                                        .then(|| {
+                                            crate::renderer::raster_stroke::minimum_width([
+                                                f64::from(matrix.scale_x()),
+                                                f64::from(matrix.skew_y()),
+                                                f64::from(matrix.skew_x()),
+                                                f64::from(matrix.scale_y()),
+                                            ])
+                                        })
+                                        .flatten();
+                                    if let Some(width) = rect.print_picture_pen.and_then(|pen| {
+                                        crate::renderer::print_picture_pen::raster_width(
+                                            pen, minimum,
+                                        )
+                                    }) {
+                                        stroke.set_stroke_width(width as f32);
+                                    }
+                                }
                                 if rect.round_stroke_join {
                                     stroke.set_stroke_join(skia_safe::paint::Join::Round);
                                 }
@@ -2025,6 +2296,11 @@ impl SkiaLayerRenderer {
                                 })
                                 .flatten();
                             let resolved = resolved.as_deref().or(fallback.as_ref());
+                            let prepared =
+                                crate::renderer::image_resolver::image_for_resolved_window(
+                                    image, resolved,
+                                );
+                            let image = prepared.as_ref();
                             let effective_bbox = image.transformed_paint_bbox(bbox);
                             // 저장 viewport는 그림 변환 바깥의 페이지 좌표 clip이다.
                             let _source_clip_restore = image.source_clip_path(bbox).map(|points| {
@@ -2041,6 +2317,13 @@ impl SkiaLayerRenderer {
                             if image.transform.has_transform() {
                                 open_shape_transform(image.transform, &effective_bbox);
                             }
+                            let effective_bbox = super::image_coverage::bounds(
+                                canvas,
+                                effective_bbox,
+                                image,
+                                cache_context.raster_target
+                                    && cache_context.policy.print_stroke_adjustment(),
+                            );
                             let data = resolved
                                 .map(|payload| &payload.data[..])
                                 .or(image.data.as_deref());
@@ -2077,6 +2360,9 @@ impl SkiaLayerRenderer {
                                         image.brightness
                                     },
                                     if suppress_effects { 0 } else { image.contrast },
+                                    crate::renderer::image_resolver::print_area_sampling(
+                                        image, resolved,
+                                    ),
                                 );
                                 if opacity < 1.0 {
                                     canvas.restore();
@@ -2216,6 +2502,18 @@ impl SkiaLayerRenderer {
     ) {
         use crate::renderer::form_appearance::{form_drawing, FormPrimitive};
         let drawing = form_drawing(form, bbox);
+        // 컨트롤은 자기 영역 밖을 그리지 않는다. 폭보다 긴 캡션은 영역 경계에서 잘린다.
+        canvas.save();
+        canvas.clip_rect(
+            Rect::from_xywh(
+                bbox.x as f32,
+                bbox.y as f32,
+                bbox.width as f32,
+                bbox.height as f32,
+            ),
+            None,
+            Some(true),
+        );
         for primitive in drawing.primitives {
             let mut paint = Paint::default();
             paint.set_anti_alias(true);
@@ -2301,6 +2599,7 @@ impl SkiaLayerRenderer {
                 &paint,
             );
         }
+        canvas.restore();
     }
 }
 
@@ -2592,6 +2891,36 @@ mod tests {
 
     #[test]
     fn native_skia_keeps_glyph_run_fallback_when_exact_blob_cannot_instantiate() {
+        // Failed preparations consume work just like successful ones, even when
+        // no font/path object is retained. Test through the production budget API.
+        let mut entry_budget = GlyphPreparationBudget::new();
+        let failure = NativeGlyphPreparationFailure::UnsupportedOutlinePayload;
+        for _ in 0..4096 {
+            let result = entry_budget.prepare::<PreparedGlyph>(0, || Err(failure.clone()));
+            assert!(matches!(result, Err(value) if value == failure));
+        }
+        assert!(matches!(
+            entry_budget.prepare::<PreparedGlyph>(0, || panic!(
+                "exhausted entry budget must skip construction"
+            )),
+            Err(NativeGlyphPreparationFailure::PreparationBudgetExceeded)
+        ));
+        let mut byte_budget = GlyphPreparationBudget::new();
+        let max_bytes = super::super::glyph_replay::MAX_PREPARED_GLYPH_BYTES;
+        assert!(matches!(
+            byte_budget.prepare::<PreparedGlyph>(max_bytes + 1, || panic!(
+                "oversized minimum must skip construction"
+            )),
+            Err(NativeGlyphPreparationFailure::PreparationBudgetExceeded)
+        ));
+        let failed = byte_budget.prepare::<PreparedGlyph>(max_bytes, || Err(failure.clone()));
+        assert!(matches!(failed, Err(value) if value == failure));
+        assert!(matches!(
+            byte_budget.prepare::<PreparedGlyph>(0, || panic!(
+                "failed work must not restore its byte allowance"
+            )),
+            Err(NativeGlyphPreparationFailure::PreparationBudgetExceeded)
+        ));
         let resources = portable_font_resources();
         let run = portable_glyph_run(GlyphRunOrientation::Horizontal);
         let proof = native_skia_glyph_run_replay_proof(&run, &resources);
@@ -2610,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn native_skia_rejects_vertical_glyph_run_contract_for_now() {
+    fn native_skia_rejects_vertical_glyph_runs_without_bounded_authority() {
         let resources = portable_font_resources();
         let run = portable_glyph_run(GlyphRunOrientation::VerticalUpright);
 
@@ -3882,6 +4211,7 @@ mod tests {
             display_text: None,
         };
         let marker = FootnoteMarkerNode {
+            source_run: None,
             number: 1,
             text: "1)".to_string(),
             base_font_size: 18.0,
@@ -3935,6 +4265,7 @@ mod tests {
                 border_type: 1,
                 inner_char_size: 90,
                 composition: None,
+                empty_ink: false,
             }),
             border_fill_id: 0,
             baseline: 22.0,
@@ -4059,6 +4390,11 @@ mod tests {
             ..Default::default()
         });
         let output = SkiaLayerRenderer::new()
+            .try_with_font_data(&[include_bytes!(
+                "../../../ttfs/opensource/RHWPPublicBatang-Regular.ttf"
+            )
+            .to_vec()])
+            .expect("load licensed test font")
             .render_raster_with_options(&tree, RasterRenderOptions::default())
             .expect("render control marks");
         let image = decode_rgba(&output.bytes);
@@ -4280,6 +4616,13 @@ mod tests {
             ),
         );
         let output = SkiaLayerRenderer::new()
+            .try_with_font_data(&[include_bytes!(
+                "../../../assets/fonts/LatinModernMath-VariableOutline-subset.otf"
+            )
+            .to_vec()])
+            .expect("load licensed test font")
+            .with_font_family_alias("Latin Modern Math", "RHWP LMM Variable Outline")
+            .expect("bind equation family to the supplied fixture")
             .render_raster_with_options(&tree, RasterRenderOptions::default())
             .expect("render atop equation");
         let image = decode_rgba(&output.bytes);

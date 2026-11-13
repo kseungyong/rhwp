@@ -8,7 +8,7 @@ use super::paint_op::{
 };
 use super::{LayerNode, LayerNodeKind, PageLayerTree, MAX_POSITIONED_CONTROL_MARKS_PER_RUN};
 use crate::model::style::UnderlineType;
-use crate::renderer::composer::expand_pua_render_text;
+use crate::renderer::composer::expand_pua_render_text_in_style;
 use crate::renderer::render_tree::{BoundingBox, ShapeTransform, TextRunNode};
 use crate::renderer::{
     clamp_tab_leader_end_x, svg_arc_to_beziers, LineRenderType, LineStyle, PathCommand, ShadowStyle,
@@ -802,6 +802,10 @@ fn text_bounds(logical: BoundingBox, run: &TextRunNode) -> BoundingBox {
     if run.style.outline_type != 0 || run.style.emboss || run.style.engrave {
         padding = padding.max(font_size * 0.15);
     }
+    if let Some(p) = run.style.text_paint {
+        let width = if p.width == 0.0 { 1.0 } else { p.width };
+        padding = padding.max(width * f64::from(p.paint.miter_limit_milli) / 2000.0);
+    }
     if run.style.emphasis_dot != 0 {
         padding = padding.max(font_size * 0.35);
     }
@@ -946,7 +950,7 @@ fn decoration_bounds(
         );
     }
     let top_geometry = (kind == TextDecorationKind::Underline)
-        .then(|| crate::renderer::text_decoration::top_underline_geometry(&run.style, font_size))
+        .then(|| crate::renderer::text_decoration::underline_geometry(&run.style, font_size))
         .flatten();
     let end_pad = top_geometry
         .as_ref()
@@ -1003,7 +1007,7 @@ pub(super) fn bounded_text_prefix(text: &str) -> (String, bool) {
 
 pub(super) fn bounded_display_text_for_run(run: &TextRunNode) -> (String, bool) {
     let (source_prefix, source_complete) = bounded_text_prefix(run.display_or_text());
-    let display_text = expand_pua_render_text(&source_prefix);
+    let display_text = expand_pua_render_text_in_style(&source_prefix, &run.style);
     let (display_prefix, display_complete) = bounded_text_prefix(&display_text);
     (display_prefix, source_complete && display_complete)
 }

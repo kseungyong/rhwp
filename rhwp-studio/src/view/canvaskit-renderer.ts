@@ -3,14 +3,19 @@ import { compatibilityGlyphView } from './canvaskit/compatibility-glyph-view.ts'
 import { CanvasKitBundledFontFamily, syntheticItalicSkew } from './canvaskit/font-style-selection.ts';
 import { ordinaryTextFontFamilies, parseCssFontFamilyList } from '../core/font-substitution.ts';
 import { textRequiresComplexShaping } from './canvaskit/nominal-text-replay.ts';
-import { singleDigitGeometry } from './canvaskit/boxed-digit-geometry.ts';
+import { enclosedPua, enclosedPuaInnerFaces, enclosedPuaInnerText } from '../core/enclosed-pua.ts';
+import { enclosedPuaGeometry } from './canvaskit/enclosed-pua-geometry.ts';
 import { imageRectIsReduced, imageRectUsesCubic } from './canvaskit/image-reduction.ts';
 import { rasterLineGeometry } from './canvaskit/raster-stroke.ts';
+import { textShadowOffsets } from './canvaskit/text-shadow.ts';
+import { scriptDrawMetrics } from './canvaskit/script-metrics.ts';
 import { shouldDrawPageMarginGuides } from './page-margin-guides.ts';
 import squareGradientSkSL from '../../../src/renderer/square_gradient.sksl?raw';
 import * as bitmapRasterWasm from '@wasm/rhwp.js';
 import { drawAnisotropicPrintImage, drawPrintFrameImage } from './canvaskit/anisotropic-image.ts';
 import { drawPrintMetafile, isPrintMetafile } from './canvaskit/metafile-print.ts';
+import { drawPrintAreaImage } from './canvaskit/print-image-sampling.ts';
+import { printRectangleClip, printRectangleFill, printBitmapImage, printPicturePenWidth } from './canvaskit/print-device-rectangle.ts';
 import CanvasKitInit from 'canvaskit-wasm';
 import { blake3 } from '@noble/hashes/blake3.js';
 import type {
@@ -83,6 +88,7 @@ import { imageCropSelectionIsEmpty } from './image-crop-scale.ts';
 import { magnificationFiltering } from './image-sampling.ts';
 import { drawEquationTextWithFonts } from './canvaskit/equation-text-replay.ts';
 import { drawDeclaredEquationFontGlyph } from './canvaskit/equation-font-glyph.ts';
+import { drawPositionedEquationGlyphs } from './canvaskit/positioned-equation-glyphs.ts';
 import { drawEquationGlyphOutline } from './canvaskit/equation-glyph-outline.ts';
 import {
   boundedCanvasKitSourceImageKey,
@@ -132,7 +138,7 @@ import {
   type StaticSvgPathLayer,
   type StaticSvgTextLayer,
 } from './static-svg-path-layers';
-import { getLocalFontRecords, loadLocalFontBytesFor, localFontFaceKey, resolveLocalFont, resolveRendererLocalFont,
+import { getLocalFontRecords, loadLocalFontBytesFor, localFontFaceKey, resolveLocalFont, resolveRendererLocalFont, resolveRendererLocalFontCandidates,
   hasHostFontProvider, loadRendererLocalFont, getHostFontState, type LocalFontRecord } from '@/core/local-fonts';
 import { hostFontStyle } from '@/core/host-font-requests';
 import { canvasKitFontFaceData } from './canvaskit/sfnt-face';
@@ -230,7 +236,7 @@ function normalizedFontFamily(value: string | null | undefined): string {
 
 function textRunHasPaintEffects(style: NonNullable<LayerTextRunOp['style']>): boolean {
   const shadeColor = (style.shadeColor ?? '#ffffff').toLowerCase();
-  return (style.outlineType ?? 0) !== 0
+  return style.textPaint !== undefined || (style.outlineType ?? 0) !== 0
     || (style.shadowType ?? 0) !== 0
     || style.emboss === true
     || style.engrave === true
@@ -403,6 +409,9 @@ export class CanvasKitLayerRenderer {
   private readonly croppedEffectImages = new WeakMap<SkImage, { width: number; height: number }>();
   private nextImageKey = 1;
   private currentProfile: LayerRenderProfile = 'screen';
+  private currentRasterClipCoverage = false;
+  private svgRasterScale = 1;
+  private currentRasterScale = 1;
   private preferRasterDepth = 0;
   private readonly surfaceCache = new CanvasKitSurfaceCache();
   private readonly staticPictures = new BoundedNativeCache<StaticPictureEntry>(32, 64 * 1024 * 1024, entry => entry.picture.delete());
@@ -473,6 +482,10 @@ export class CanvasKitLayerRenderer {
   private currentShowParagraphMarks = false;
   private currentShowControlCodes = false;
   private currentClipEnabled = true;
+  // Page-space length of one device pixel at the current scale; the floor for shape/line strokes (#8125).
+  private currentDeviceStrokeFloor = 0;
+  // Screen SkPicture records local coordinates; retain its external device transform for strokes.
+  private recordingStrokeDeviceMatrix: number[] | null = null;
   private currentReplayFeatureCounts: CanvasKitReplayFeatureCounts = {
     dashedStrokes: 0,
     glyphRuns: 0,
@@ -976,6 +989,7 @@ export class CanvasKitLayerRenderer {
       throw new Error('CanvasKit renderer가 이미 dispose되었습니다');
     }
     this.syncDocumentGeneration(documentGeneration);
+    this.svgRasterScale = scale;
     this.unsupportedOps.clear();
     this.currentImageFailures.clear();
     this.currentFontSubstitutions.clear();
@@ -1008,6 +1022,8 @@ export class CanvasKitLayerRenderer {
       const canvas = surface.getCanvas();
       this.currentResources = tree.resources;
       this.currentProfile = tree.profile ?? 'screen';
+      this.currentRasterClipCoverage = tree.rasterClipCoverage ?? (this.currentProfile === 'print');
+      this.currentRasterScale = scale;
       this.currentImageBytesResolver = resolveImageBytes;
       this.currentFontResources = tree.fontResources;
       this.glyphRunFonts.registerResources(
@@ -1025,8 +1041,10 @@ export class CanvasKitLayerRenderer {
       this.selectedTextVariantOps = new WeakSet<LayerPaintOp>();
       this.selectTextVariants(tree.root, canvas);
       this.currentTreeFingerprint = replayFingerprint(tree);
+      this.currentDeviceStrokeFloor = Number.isFinite(scale) && scale > 0 ? 1 / scale : 0;
+      // The stroke floor follows the scale, so static pictures are recorded per scale.
       this.currentPictureContext = this.currentTreeFingerprint
-        ? `${this.currentTreeFingerprint}:${this.documentGeneration}:${this.localFontRevision}:${this.imageResourceRevision}:${JSON.stringify(this.glyphRunFonts.diagnostics())}`
+        ? `${this.currentTreeFingerprint}:${scale}:${this.documentGeneration}:${this.localFontRevision}:${this.imageResourceRevision}:${JSON.stringify(this.glyphRunFonts.diagnostics())}`
         : null;
       if (this.currentTreeFingerprint) {
         const fingerprints = this.treeFingerprints.get(inputTree as PageLayerTree) ?? new Set<string>();
@@ -1089,10 +1107,13 @@ export class CanvasKitLayerRenderer {
     } finally {
       this.currentTreeFingerprint = null;
       this.currentPictureContext = null;
+      this.currentDeviceStrokeFloor = 0;
       this.currentPageExtent = null;
       this.currentBitmapPaperGrid = null;
       this.currentOp = null;
       this.currentProfile = 'screen';
+      this.currentRasterClipCoverage = false;
+      this.currentRasterScale = 1;
       this.preferRasterDepth = 0;
       this.currentResources = undefined;
       this.currentImageBytesResolver = undefined;
@@ -1619,7 +1640,8 @@ export class CanvasKitLayerRenderer {
       return imageOp !== null && this.imageForOp(imageOp) !== null;
     }
     if (op.payloadKind === 'svgGlyph') {
-      return this.staticSvgGlyphPathLayers(op) !== null;
+      return typeof bitmapRasterWasm.prepareStaticSvgRaster === 'function'
+        ? this.staticSvgGlyphRaster(op) !== null : this.staticSvgGlyphPathLayers(op) !== null;
     }
     return op.payloadKind === 'colorLayers'
       || op.payloadKind === 'monochromeFill'
@@ -1686,7 +1708,7 @@ export class CanvasKitLayerRenderer {
     };
   }
 
-  private staticSvgGlyphPathLayers(op: LayerGlyphOutlineOp): StaticSvgPathLayer[] | null {
+  private staticSvgGlyphSource(op: LayerGlyphOutlineOp): { fragment: string; resourceKey: string; currentColor: string } | null {
     const payload = op.svgGlyph;
     const resources = this.currentResources;
     const index = this.layerResourceIndex(
@@ -1714,6 +1736,38 @@ export class CanvasKitLayerRenderer {
     }
     const currentColor = op.paintStyle?.color ?? '#000000';
     if (currentColor.length > 256) return null;
+    return { fragment, resourceKey, currentColor };
+  }
+
+  private staticSvgGlyphRaster(op: LayerGlyphOutlineOp): SkImage | null {
+    const source = this.staticSvgGlyphSource(op);
+    const view = op.svgGlyph?.viewBox;
+    const viewport = op.svgGlyph?.fontEmBox ?? op.bbox;
+    if (!source || !view || !this.boundsAreDrawable(viewport) || !this.boundsAreDrawable(view)) return null;
+    const options = { viewBox: [view.x, view.y, view.width, view.height],
+      viewport: [viewport.x, viewport.y, viewport.width, viewport.height],
+      scale: this.svgRasterScale, currentColor: source.currentColor };
+    const key = `svgGlyphRaster:${source.resourceKey}:${JSON.stringify(options)}`;
+    const cached = this.imageCache.get(key);
+    if (cached) {
+      this.imageCacheHits++; this.imageCache.delete(key); this.imageCache.set(key, cached); return cached.image;
+    }
+    if (this.svgGlyphParseFailures.has(key)) return null;
+    this.imageCacheMisses++;
+    try {
+      const raster = bitmapRasterWasm.prepareStaticSvgRaster(JSON.stringify(options), source.fragment);
+      if (!raster || !(raster.bytes instanceof Uint8Array) || !Number.isSafeInteger(raster.byteCost)
+        || raster.byteCost < 4 || raster.byteCost > 16_777_216 * 4) throw new Error('SVG_RASTER_BUDGET');
+      const image = this.canvasKit.MakeImageFromEncoded(raster.bytes);
+      if (!image) throw new Error('SVG_RASTER_DECODE');
+      return this.retainImage(key, image, raster.byteCost / 4);
+    } catch { this.rememberSvgGlyphParseFailure(key); return null; }
+  }
+
+  private staticSvgGlyphPathLayers(op: LayerGlyphOutlineOp): StaticSvgPathLayer[] | null {
+    const source = this.staticSvgGlyphSource(op);
+    if (!source) return null;
+    const { fragment, resourceKey, currentColor } = source;
     const svgCacheKey = `${resourceKey}:${currentColor}`;
     const cached = this.svgGlyphPathCache.get(svgCacheKey);
     if (cached) {
@@ -1781,12 +1835,13 @@ export class CanvasKitLayerRenderer {
       const recordingBounds = this.staticPictureBounds(node);
       // Print 그림 표본은 실제 장치 CTM에 종속된다. Native와 같이 그 CTM에서
       // 기록하고 재생 때만 역행렬을 상쇄해, cache가 격자를 다시 확대하지 않게 한다.
-      const deviceMatrix = profile === 'print' ? canvas.getTotalMatrix?.() : null;
+      const strokeDeviceMatrix = canvas.getTotalMatrix?.() ?? null;
+      const deviceMatrix = profile === 'print' ? strokeDeviceMatrix : null;
       const inverseMatrix = deviceMatrix ? this.canvasKit.Matrix?.invert(deviceMatrix) : null;
       if (!this.recordingStaticPicture && this.currentPictureContext && this.currentTreeFingerprint
         && (node.cacheHint === 'staticSubtree' || node.cacheHint === 'preferVectorRecording')
         && recordingBounds && (profile !== 'print' || inverseMatrix)) {
-        const nodeKey = replayFingerprint([node, activeLayer, deviceMatrix]);
+        const nodeKey = replayFingerprint([node, activeLayer, strokeDeviceMatrix]);
         if (nodeKey) {
           const key = `${this.currentPictureContext}:${profile}:${replayPlane}:${nodeKey}`;
           const cached = this.staticPictures.get(key);
@@ -1801,6 +1856,8 @@ export class CanvasKitLayerRenderer {
           const before = { ...this.currentReplayFeatureCounts };
           const diagnosticStart = { equations: this.equationRoutes.values.length, textRecoveries: this.textRecoveries.values.length,
             textFailures: this.textFailures.values.length, imageRecoveries: this.imageRecoveries.values.length, patternOps: this.patternReplayOps };
+          const previousStrokeDeviceMatrix = this.recordingStrokeDeviceMatrix;
+          this.recordingStrokeDeviceMatrix = deviceMatrix ? null : strokeDeviceMatrix;
           this.recordingStaticPicture = true;
           try {
             let deviceBounds = recordingBounds;
@@ -1847,6 +1904,7 @@ export class CanvasKitLayerRenderer {
             }
           } finally {
             this.recordingStaticPicture = false;
+            this.recordingStrokeDeviceMatrix = previousStrokeDeviceMatrix;
             if (!finished) { try { picture = recorder.finishRecordingAsPicture(); } catch { /* failed recording */ } }
             picture?.delete();
             recorder.delete();
@@ -1941,7 +1999,8 @@ export class CanvasKitLayerRenderer {
       return;
     }
     canvas.clipRect(
-      canvasKitCanonicalClipRect(node.clip, (x, y, width, height) =>
+      canvasKitCanonicalClipRect(profile === 'print' && this.currentRasterClipCoverage
+        ? printRectangleClip(canvas, node.clip) : node.clip, (x, y, width, height) =>
         this.canvasKit.XYWHRect(x, y, width, height),
       ),
       this.canvasKit.ClipOp?.Intersect ?? 0,
@@ -2016,7 +2075,8 @@ export class CanvasKitLayerRenderer {
           bbox: op.bbox,
           text: op.text,
           baseline: op.baseline ?? op.fontSize ?? 7,
-          style: { fontFamily: op.fontFamily, fontSize: op.fontSize, color: op.color },
+          style: op.style ?? { fontFamily: op.fontFamily, fontSize: op.fontSize, color: op.color },
+          positions: op.positions,
         });
         return;
       case 'formObject':
@@ -2117,13 +2177,18 @@ export class CanvasKitLayerRenderer {
 
   private renderRectangle(canvas: SkCanvas, op: LayerRectangleOp): void {
     this.withImageTransform(canvas, op.bbox, op.transform, () => {
-      this.drawStyledShape(canvas, op.bbox, op.style, (paint) => {
+      const bounds = this.currentProfile === 'print' && op.printFillCoverage === 'device'
+        ? printRectangleFill(canvas, op.bbox) : op.bbox;
+      const penWidth = this.currentProfile === 'print' && op.printPicturePen
+        ? printPicturePenWidth(canvas, op.printPicturePen) : undefined;
+      const style = penWidth === undefined ? op.style : { ...op.style, strokeWidth: penWidth };
+      this.drawStyledShape(canvas, bounds, style, (paint) => {
         if (op.strokeJoin === 'round') paint.setStrokeJoin(this.canvasKit.StrokeJoin.Round);
         const cornerRadius = op.cornerRadius ?? 0;
         if (cornerRadius > 0) {
-          canvas.drawRRect(this.canvasKit.RRectXY(this.rect(op.bbox), cornerRadius, cornerRadius), paint);
+          canvas.drawRRect(this.canvasKit.RRectXY(this.rect(bounds), cornerRadius, cornerRadius), paint);
         } else {
-          canvas.drawRect(this.rect(op.bbox), paint);
+          canvas.drawRect(this.rect(bounds), paint);
         }
       }, op.gradient);
     });
@@ -2345,12 +2410,11 @@ export class CanvasKitLayerRenderer {
         draw(paint);
       } else {
         if ((style.shadowType ?? 0) > 0) {
-          draw(effectPaint(style.shadowColor || '#000000'), style.shadowOffsetX ?? 0, style.shadowOffsetY ?? 0);
+          const shadowPaint = effectPaint(style.shadowColor || '#000000');
+          for (const [x, y] of textShadowOffsets(style)) draw(shadowPaint, x, y);
         }
         if ((style.outlineType ?? 0) > 0) {
-          const stroke = this.makeStrokePaint(style.color ?? '#000000', Math.max(size / 25, 0.5));
-          effects.push(stroke); stroke.setStrokeJoin(this.canvasKit.StrokeJoin.Round);
-          draw(effectPaint('#ffffff')); draw(stroke);
+          this.withCharOutlineStroke(canvas, style, draw);
         } else draw(paint);
       }
       this.currentReplayFeatureCounts.glyphRuns += 1;
@@ -2447,6 +2511,19 @@ export class CanvasKitLayerRenderer {
   }
 
   private renderSvgGlyphOutline(canvas: SkCanvas, op: LayerGlyphOutlineOp): void {
+    if (typeof bitmapRasterWasm.prepareStaticSvgRaster === 'function') {
+      const image = this.staticSvgGlyphRaster(op);
+      const viewport = op.svgGlyph?.fontEmBox ?? op.bbox;
+      if (!image) { this.unsupportedOps.add('glyphOutline:svgReplayInvariant'); return; }
+      canvas.save();
+      try {
+        const matrix = this.affineToCanvasKitMatrix(op.svgGlyph?.transformToRun);
+        if (matrix) canvas.concat(matrix);
+        this.drawImageRect(canvas, image, this.canvasKit.XYWHRect(0, 0, image.width(), image.height()),
+          this.canvasKit.XYWHRect(viewport.x, viewport.y, viewport.width, viewport.height));
+      } finally { canvas.restore(); }
+      return;
+    }
     const payload = op.svgGlyph;
     const viewBox = payload?.viewBox;
     const placement = payload?.fontEmBox ?? op.bbox;
@@ -2780,6 +2857,15 @@ export class CanvasKitLayerRenderer {
     );
     const opacity = Number.isFinite(op.opacity) ? Math.max(0, Math.min(1, op.opacity ?? 1)) : 1;
     const drawImage = (dstX: number, dstY: number, dstW: number, dstH: number) => {
+      if (this.currentProfile === 'print' && op.printImageCoverage === 'device') {
+        const mapped = printBitmapImage(canvas, { x: dstX, y: dstY, width: dstW, height: dstH });
+        dstX = mapped.x; dstY = mapped.y; dstW = mapped.width; dstH = mapped.height;
+      }
+      if ((op.imageReconstruction === 'printArea' || op.imageReconstruction === 'printMaskedArea') && !crop && opacity === 1
+        && this.currentProfile === 'print' && this.preferRasterDepth === 0 && this.currentPageExtent
+        && drawPrintAreaImage(this.canvasKit, canvas, image,
+          { x: dstX, y: dstY, width: dstW, height: dstH }, this.currentPageExtent, this.currentRasterScale,
+          op.imageReconstruction === 'printMaskedArea' ? this.printMaskedImageBytes(op) : undefined)) return;
       const src = crop
         ? this.canvasKit.XYWHRect(crop.x, crop.y, crop.width, crop.height)
         : this.canvasKit.XYWHRect(0, 0, imageWidth, imageHeight);
@@ -3064,6 +3150,7 @@ export class CanvasKitLayerRenderer {
         type: 'charOverlap',
         bbox: op.bbox,
         text: op.text,
+        displayText: op.displayText,
         baseline: op.baseline ?? op.style?.fontSize ?? 12,
         rotation: op.rotation ?? 0,
         isVertical: op.isVertical === true,
@@ -3090,13 +3177,6 @@ export class CanvasKitLayerRenderer {
       replayCodePoints.push(character);
     }
     const style = op.style ?? {};
-    // 줄 방향 문맥을 가진 legacy run은 기존 complex-script fallback을 사용한다.
-    // 명시적 glyphRun의 위치는 producer가 이미 해소하므로 이 분기를 거치지 않는다.
-    if (style.bidiLayout) {
-      this.unsupportedOps.add('textRun:scriptTextRequiresShaping');
-      return;
-    }
-    if (this.recordTextRunCoverageGaps(op, replayCodePoints)) return;
     const ratio = style.ratio ?? 1;
     const outlineType = style.outlineType ?? 0;
     const shadowType = style.shadowType ?? 0;
@@ -3106,13 +3186,17 @@ export class CanvasKitLayerRenderer {
     const baseFontSize = style.fontSize ?? Math.max(1, op.bbox.height || 12);
     const baseline = op.baseline ?? baseFontSize;
     const rotation = op.rotation ?? 0;
+    // 원문·caret 상자는 남지만 크기와 모든 전진이 0이면 그릴 잉크가 없다.
+    // 크기가 있는 장평 0, 음수·비유한 값과 비어 있지 않은 전진은 이 경로로 구제하지 않는다.
+    const zeroSizeNoInk = baseFontSize === 0 && ratio >= 0 && op.bbox.width === 0
+      && replayPositions?.length === replayCodePoints.length + 1
+      && replayPositions.every(position => position === 0);
     if (![op.bbox.x, op.bbox.y, op.bbox.width, op.bbox.height, ratio, outlineType,
       shadowType, shadowOffsetX, shadowOffsetY, baseFontSize, baseline, rotation]
       .every(Number.isFinite)
       || op.bbox.width < 0
       || op.bbox.height < 0
-      || ratio <= 0
-      || baseFontSize <= 0
+      || (!zeroSizeNoInk && (ratio <= 0 || baseFontSize <= 0))
       || !Number.isInteger(outlineType)
       || outlineType < 0
       || !Number.isInteger(shadowType)
@@ -3120,6 +3204,27 @@ export class CanvasKitLayerRenderer {
       this.unsupportedOps.add('textRun:invalidGeometry');
       return;
     }
+    if (style.textPaint) {
+      const { width, paint: p } = style.textPaint;
+      if (!p || typeof p.fill !== 'boolean' || !Number.isFinite(width) || width < 0
+        || width > 1_000_000 || ![p.stroke_color, p.fill_alpha, p.stroke_alpha,
+          p.line_join, p.miter_limit_milli].every(Number.isInteger)
+        || p.stroke_color < 0 || p.stroke_color > 0xffffff
+        || p.fill_alpha < 0 || p.fill_alpha > 255 || p.stroke_alpha < 0 || p.stroke_alpha > 255
+        || p.line_join < 0 || p.line_join > 2 || p.miter_limit_milli < 1000
+        || p.miter_limit_milli > 1_000_000) {
+        this.unsupportedOps.add('textRun:invalidGeometry');
+        return;
+      }
+    }
+    if (zeroSizeNoInk) return;
+    // 줄 방향 문맥을 가진 legacy run은 기존 complex-script fallback을 사용한다.
+    // 명시적 glyphRun의 위치는 producer가 이미 해소하므로 이 분기를 거치지 않는다.
+    if (style.bidiLayout) {
+      this.unsupportedOps.add('textRun:scriptTextRequiresShaping');
+      return;
+    }
+    if (this.recordTextRunCoverageGaps(op, replayCodePoints)) return;
     const verticalPresentationText = op.isVertical
       && op.orientation !== 'vertical-sideways'
       ? VERTICAL_PRESENTATION_BASE_TEXT.get(replayText)
@@ -3137,15 +3242,7 @@ export class CanvasKitLayerRenderer {
         || (code >= 0xd7b0 && code <= 0xd7ff);
     });
     const effectPaints: SkPaint[] = [];
-    let fontSize = baseFontSize;
-    let baselineShift = 0;
-    if (style.superscript) {
-      fontSize = baseFontSize * 0.7;
-      baselineShift -= baseFontSize * 0.3;
-    } else if (style.subscript) {
-      fontSize = baseFontSize * 0.7;
-      baselineShift += baseFontSize * 0.15;
-    }
+    const { fontSize, baselineShift } = scriptDrawMetrics(style, baseFontSize);
     const placementMatrix = this.affineToCanvasKitMatrix(op.placement?.runToPage);
     const originX = placementMatrix ? 0 : op.bbox.x;
     const originY = placementMatrix
@@ -3294,7 +3391,7 @@ export class CanvasKitLayerRenderer {
             }
             const candidateIndex = candidateGlyphIds.findIndex(ids => (ids[index] ?? 0) !== 0);
             if (candidateIndex >= 0) return candidateIndex;
-            return code >= 0xF02B0 && code <= 0xF02C4 ? -1 : 0;
+            return enclosedPua(code) ? -1 : 0;
           });
           for (const fontIndex of new Set(selectedFontIndices)) {
             if (fontIndex > 0) {
@@ -3440,38 +3537,61 @@ export class CanvasKitLayerRenderer {
               continue;
             }
             if (fontIndex === -1) {
-              const codePoint = codePoints[runStart].codePointAt(0) ?? 0;
-              const displayNumber = String(codePoint - 0xF02B0);
-              let geometry = singleDigitGeometry(codePoint - 0xF02B0, fontSize);
+              const glyph = enclosedPua(codePoints[runStart].codePointAt(0) ?? 0)!;
+              const displayNumber = enclosedPuaInnerText(glyph);
+              let geometry = enclosedPuaGeometry(glyph, fontSize);
               if (geometry) {
-                const measuredFace = this.findPreparedTypeface(geometry.face)?.typeface;
-                // 숫자는 본문 regular face를 먼저 사용한다. 기호 글꼴의 사선 0을
-                // 선택하거나 그 윤곽에 다른 face의 source bounds를 적용하지 않는다.
-                const numberFace = measuredFace
-                  ?? this.findPreparedTypeface(requestedFontFamily,
-                    { bold: false, italic: false })?.typeface
-                  ?? this.defaultTypeface ?? typeface ?? this.symbolFallbackTypeface;
-                const numberFont = new this.canvasKit.Font(numberFace, fontSize);
+                const regular = { bold: false, italic: false };
+                const measuredFace = this.findPreparedTypeface(geometry.face, regular)?.typeface;
+                const innerFaces = [
+                  ...enclosedPuaInnerFaces(glyph).map(family =>
+                    this.findPreparedTypeface(family, regular)?.typeface),
+                  this.findPreparedTypeface(requestedFontFamily, regular)?.typeface,
+                  this.defaultTypeface, typeface, this.symbolFallbackTypeface,
+                ];
+                let innerFont: Font | null = null;
+                let usesMeasuredFace = false;
+                const innerLength = Array.from(displayNumber).length;
+                for (const face of new Set(innerFaces)) {
+                  if (!face) continue;
+                  const candidate = new this.canvasKit.Font(face, fontSize);
+                  try {
+                    const ids = candidate.getGlyphIDs(displayNumber, innerLength);
+                    if (ids.length === innerLength && ids.every(id => id !== 0)) {
+                      innerFont = candidate;
+                      usesMeasuredFace = face === measuredFace;
+                      break;
+                    }
+                  } finally {
+                    if (candidate !== innerFont) candidate.delete();
+                  }
+                }
+                if (!innerFont) {
+                  hasMissingGlyph = true;
+                  continue;
+                }
                 const framePaint = this.makeStrokePaint(style.color ?? '#000000', geometry.strokeWidth);
                 try {
-                  if (!measuredFace) {
-                    const glyphs = numberFont.getGlyphIDs(displayNumber, displayNumber.length);
-                    const bounds = numberFont.getGlyphBounds(glyphs);
-                    geometry = singleDigitGeometry(codePoint - 0xF02B0, fontSize, Array.from(bounds))!;
+                  if (!usesMeasuredFace) {
+                    const glyphs = innerFont.getGlyphIDs(displayNumber, displayNumber.length);
+                    const bounds = innerFont.getGlyphBounds(glyphs);
+                    geometry = enclosedPuaGeometry(glyph, fontSize, Array.from(bounds))!;
                   }
-                  canvas.drawRect(this.canvasKit.XYWHRect(
+                  const frame = this.canvasKit.XYWHRect(
                     originX + replayPositions![runStart] + offsetX + geometry.frameX,
                     originY + baselineShift + offsetY + geometry.frameY,
-                    geometry.frameWidth, geometry.frameHeight), framePaint);
+                    geometry.frameWidth, geometry.frameHeight);
+                  if (geometry.ellipse) canvas.drawOval(frame, framePaint);
+                  else canvas.drawRect(frame, framePaint);
                   canvas.save();
-                  canvas.translate(originX + replayPositions![runStart] + offsetX + geometry.numberX,
-                    originY + baselineShift + offsetY + geometry.numberY);
+                  canvas.translate(originX + replayPositions![runStart] + offsetX + geometry.innerX,
+                    originY + baselineShift + offsetY + geometry.innerY);
                   canvas.scale(geometry.scaleX, geometry.scaleY);
-                  canvas.drawText(displayNumber, 0, 0, fillPaint, numberFont);
+                  canvas.drawText(displayNumber, 0, 0, fillPaint, innerFont);
                   canvas.restore();
                 } finally {
                   framePaint.delete();
-                  numberFont.delete();
+                  innerFont.delete();
                 }
                 continue;
               }
@@ -3577,17 +3697,26 @@ export class CanvasKitLayerRenderer {
           if (shadowType > 0) {
             const shadowPaint = this.makeFillPaint(style.shadowColor ?? style.color ?? '#000000');
             effectPaints.push(shadowPaint);
-            drawPass(shadowPaint, shadowOffsetX, shadowOffsetY);
+            for (const [x, y] of textShadowOffsets(style)) drawPass(shadowPaint, x, y);
           }
-          if (outlineType > 0) {
-            const outlineFillPaint = this.makeFillPaint('#ffffff');
-            effectPaints.push(outlineFillPaint);
-            const outlineStrokePaint = this.makeStrokePaint(
-              style.color ?? '#000000',
-              Math.max(fontSize / 25, 0.5),
-            );
-            effectPaints.push(outlineStrokePaint);
-            drawPass(outlineFillPaint, 0, 0, outlineStrokePaint);
+          if (style.textPaint) {
+            const { width, paint: source } = style.textPaint;
+            const color = `#${[source.stroke_color & 255, (source.stroke_color >>> 8) & 255,
+              (source.stroke_color >>> 16) & 255].map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const stroke = this.makeStrokePaint(color, width);
+            stroke.setStrokeWidth(width);
+            effectPaints.push(stroke);
+            stroke.setAlphaf(source.stroke_alpha / 255);
+            stroke.setStrokeMiter(source.miter_limit_milli / 1000);
+            stroke.setStrokeJoin(source.line_join === 1 ? this.canvasKit.StrokeJoin.Round
+              : source.line_join === 2 ? this.canvasKit.StrokeJoin.Bevel : this.canvasKit.StrokeJoin.Miter);
+            if (source.fill) {
+              paint.setAlphaf(source.fill_alpha / 255);
+              drawPass(paint);
+            }
+            drawPass(stroke);
+          } else if (outlineType > 0) {
+            this.withCharOutlineStroke(canvas, style, drawPass);
           } else {
             drawPass(paint);
           }
@@ -3664,6 +3793,7 @@ export class CanvasKitLayerRenderer {
       this.unsupportedOps.add('charOverlap:invalidGeometry');
       return;
     }
+    if (op.displayText === '' && op.charOverlap.borderType === 0) return;
     const fontSize = Math.max(1, rawFontSize);
     const requestedFontFamily = primaryFontFamily(style.fontFamily);
     const preparedTypeface = this.findPreparedTypeface(style.fontFamily, style);
@@ -4101,7 +4231,7 @@ export class CanvasKitLayerRenderer {
     const draw = (originX: number, originY: number) => {
       const baselineY = originY + decoration.baseline;
       if (decoration.kind === 'underline') {
-        if (decoration.underline === 'top' && decoration.topUnderline) {
+        if ((decoration.underline === 'top' || decoration.underline === 'bottom') && decoration.topUnderline) {
           if (textWidth <= 0) return;
           const geometry = decoration.topUnderline;
           const phase = geometry.phase ?? 0;
@@ -4367,6 +4497,21 @@ export class CanvasKitLayerRenderer {
     }
     return { ...family.select(style?.bold === true, style?.italic === true),
       paragraphTypefaces: faces.map(face => face.typeface) };
+  }
+
+  /** 준비와 paint가 같은 family/style 분할 프로그램을 소비한다. */
+  private positionedEquationTypefaces(fontFamily: string): Typeface[] {
+    const selected = new Set<Typeface>();
+    for (const family of parseCssFontFamilyList(fontFamily)) {
+      for (const record of resolveRendererLocalFontCandidates(family, { weight: 400, slant: 'normal' })) {
+        const prepared = this.localTypefaces.get(localFontFaceKey(record));
+        if (prepared?.typeface) selected.add(prepared.typeface);
+      }
+      const prepared = this.findPreparedTypeface(family);
+      if (prepared?.typeface) selected.add(prepared.typeface);
+      for (const typeface of prepared?.paragraphTypefaces ?? []) if (typeface) selected.add(typeface);
+    }
+    return [...selected];
   }
 
   private findPreparedTypeface(fontFamily: string | undefined, style?: LayerTextStyle): CanvasKitLocalTypeface | null {
@@ -4793,33 +4938,13 @@ export class CanvasKitLayerRenderer {
     );
 
     switch (layout.kind.type) {
-      case 'hancomGlyphs': {
-        const run = layout.kind;
-        const typeface = this.findPreparedTypeface(run.fontFamily ?? 'HyhwpEQ')?.typeface;
-        const glyphs = Array.from(run.glyphs);
-        const shears = run.shears ?? glyphs.map(() => 0);
-        if (!typeface || glyphs.length !== run.positions.length
-          || glyphs.length !== shears.length || !shears.every(Number.isFinite)
-          || glyphs.length > CanvasKitLayerRenderer.MAX_EQUATION_TEXT_LENGTH
-          || !run.positions.every(Number.isFinite) || !Number.isFinite(run.baselineShift)) return false;
-        const font = new this.canvasKit.Font(typeface, fontSize);
-        font.setHinting(this.canvasKit.FontHinting.None);
-        font.setSubpixel(true);
-        const paint = this.makeFillPaint(color);
-        try {
-          const ids = font.getGlyphIDs(run.glyphs, glyphs.length);
-          if (!ids || ids.some(id => id === 0)) return false;
-          glyphs.forEach((glyph, index) => {
-            canvas.save();
-            try {
-              canvas.translate(x + run.positions[index], y + layout.baseline + run.baselineShift);
-              canvas.concat([1, -shears[index], 0, 0, 1, 0, 0, 0, 1]);
-              canvas.drawText(glyph, 0, 0, paint, font);
-            } finally { canvas.restore(); }
-          });
-          return true;
-        } finally { font.delete(); paint.delete(); }
-      }
+      case 'hancomGlyphs':
+        return drawPositionedEquationGlyphs({
+          canvasKit: this.canvasKit,
+          typefaces: this.positionedEquationTypefaces(layout.kind.fontFamily ?? 'HyhwpEQ'),
+          maxTextLength: CanvasKitLayerRenderer.MAX_EQUATION_TEXT_LENGTH,
+          makeFillPaint: fillColor => this.makeFillPaint(fillColor),
+        }, canvas, layout.kind, x, y + layout.baseline, fontSize, color);
       case 'row':
         return layout.kind.children.every((box) => child(box));
       case 'text':
@@ -5320,31 +5445,38 @@ export class CanvasKitLayerRenderer {
     const rejection = formDrawingReplayRejection(op);
     if (rejection) { this.unsupportedOps.add(`formObject:${rejection}`); return; }
     const drawing = op.drawing!;
-    for (const primitive of drawing.primitives) {
-      const paint = primitive.kind === 'polyline' && !primitive.closed
-        ? this.makeStrokePaint(primitive.color, primitive.width)
-        : this.makeFillPaint(primitive.color);
-      try {
-        if (primitive.kind === 'rect') {
-          canvas.drawRect(this.rect(primitive.bbox), paint);
-        } else if (primitive.kind === 'circle') {
-          canvas.drawCircle(primitive.x, primitive.y, primitive.radius, paint);
-        } else if (primitive.points.length > 0) {
-          const path = this.createCommandPath([
-            { type: 'moveTo', x: primitive.points[0][0], y: primitive.points[0][1] },
-            ...primitive.points.slice(1).map(([x, y]) => ({ type: 'lineTo' as const, x, y })),
-            ...(primitive.closed ? [{ type: 'closePath' as const }] : []),
-          ]);
-          try { canvas.drawPath(path, paint); } finally { path.delete(); }
-        }
-      } finally { paint.delete(); }
+    // 컨트롤은 자기 영역 밖을 그리지 않는다. 폭보다 긴 캡션은 영역 경계에서 잘린다.
+    canvas.save();
+    canvas.clipRect(this.rect(op.bbox), this.canvasKit.ClipOp?.Intersect ?? 0, true);
+    try {
+      for (const primitive of drawing.primitives) {
+        const paint = primitive.kind === 'polyline' && !primitive.closed
+          ? this.makeStrokePaint(primitive.color, primitive.width)
+          : this.makeFillPaint(primitive.color);
+        try {
+          if (primitive.kind === 'rect') {
+            canvas.drawRect(this.rect(primitive.bbox), paint);
+          } else if (primitive.kind === 'circle') {
+            canvas.drawCircle(primitive.x, primitive.y, primitive.radius, paint);
+          } else if (primitive.points.length > 0) {
+            const path = this.createCommandPath([
+              { type: 'moveTo', x: primitive.points[0][0], y: primitive.points[0][1] },
+              ...primitive.points.slice(1).map(([x, y]) => ({ type: 'lineTo' as const, x, y })),
+              ...(primitive.closed ? [{ type: 'closePath' as const }] : []),
+            ]);
+            try { canvas.drawPath(path, paint); } finally { path.delete(); }
+          }
+        } finally { paint.delete(); }
+      }
+      const label = drawing.label;
+      if (label?.text && !this.drawStaticControlText(canvas, label.text, {
+        x: label.x, y: label.baseline, fontSize: label.fontSize, color: label.color,
+        bold: label.bold, italic: label.italic,
+        fontFamilies: [label.fontFamily, 'Noto Sans KR', 'Noto Sans CJK KR'],
+      })) this.unsupportedOps.add('formObject:textReplayFailed');
+    } finally {
+      canvas.restore();
     }
-    const label = drawing.label;
-    if (label?.text && !this.drawStaticControlText(canvas, label.text, {
-      x: label.x, y: label.baseline, fontSize: label.fontSize, color: label.color,
-      bold: label.bold, italic: label.italic,
-      fontFamilies: [label.fontFamily, 'Noto Sans KR', 'Noto Sans CJK KR'],
-    })) this.unsupportedOps.add('formObject:textReplayFailed');
   }
 
   private renderPlaceholder(canvas: SkCanvas, op: LayerPlaceholderOp): void {
@@ -5433,9 +5565,9 @@ export class CanvasKitLayerRenderer {
       draw(shadowPaint);
       shadowPaint.delete?.();
       if (style?.strokeColor && (style.strokeWidth ?? 0) > 0) {
-        const shadowStroke = this.makeStrokePaint(shadow.color, style.strokeWidth ?? 1, shadow.opacity);
+        const shadowStroke = this.makeStrokePaint(shadow.color, this.deviceStrokeWidth(canvas, style.strokeWidth ?? 1), shadow.opacity);
         try {
-          this.drawStrokeWithDash(style.strokeDash, shadowStroke, () => draw(shadowStroke));
+          this.drawStrokeWithDash(style.strokeDash, shadowStroke, () => draw(shadowStroke), undefined, style.strokeWidth ?? 1);
         } finally {
           shadowStroke.delete?.();
         }
@@ -5460,9 +5592,9 @@ export class CanvasKitLayerRenderer {
       paint.delete?.();
     }
     if (style?.strokeColor && (style.strokeWidth ?? 0) > 0) {
-      const paint = this.makeStrokePaint(style.strokeColor, style.strokeWidth ?? 1, style.opacity);
+      const paint = this.makeStrokePaint(style.strokeColor, this.deviceStrokeWidth(canvas, style.strokeWidth ?? 1), style.opacity);
       try {
-        this.drawStrokeWithDash(style.strokeDash, paint, () => draw(paint));
+        this.drawStrokeWithDash(style.strokeDash, paint, () => draw(paint), undefined, style.strokeWidth ?? 1);
       } finally {
         paint.delete?.();
       }
@@ -5660,13 +5792,13 @@ export class CanvasKitLayerRenderer {
     for (const [widthRatio, offsetRatio] of this.compoundLineSegments(style.lineType)) {
       const paintWidth = widthRatio === 1 && offsetRatio === 0 && resolvedSingleWidth !== undefined
         ? resolvedSingleWidth : Math.max(0.3, width * widthRatio);
-      const paint = this.makeStrokePaint(color, paintWidth, opacity);
+      const paint = this.makeStrokePaint(color, this.deviceStrokeWidth(canvas, paintWidth), opacity);
       const ox = nx * width * offsetRatio;
       const oy = ny * width * offsetRatio;
       try {
         this.drawStrokeWithDash(style.dash, paint, () => {
           canvas.drawLine(x1 + ox, y1 + oy, x2 + ox, y2 + oy, paint);
-        }, style.dashPattern);
+        }, style.dashPattern, paintWidth);
       } finally {
         paint.delete?.();
       }
@@ -5705,6 +5837,7 @@ export class CanvasKitLayerRenderer {
     paint: SkPaint,
     draw: () => void,
     explicitPattern?: number[],
+    declaredWidth = paint.getStrokeWidth(),
   ): void {
     if (explicitPattern !== undefined && (
       explicitPattern.length === 0 || explicitPattern.length > 16
@@ -5722,7 +5855,7 @@ export class CanvasKitLayerRenderer {
     // 도형 스타일은 96dpi 좌표이며 pen 외곽은 한컴 Print의 600dpi 물리 단위다.
     const hwpPattern = typeof dash === 'string' && dash.startsWith('hwp');
     const outline = 96 / 600;
-    const scale = hwpPattern ? Math.max(paint.getStrokeWidth() - outline, outline) : 1;
+    const scale = hwpPattern ? Math.max(Math.max(0.1, declaredWidth) - outline, outline) : 1;
     const intervals = explicitPattern ?? (Array.isArray(dash) ? dash : dash === undefined || dash === 'solid'
       ? null
       : patterns[dash]?.map((value, index) => {
@@ -5753,6 +5886,18 @@ export class CanvasKitLayerRenderer {
       paint.setStrokeCap(previousCap);
       effect.delete?.();
     }
+  }
+
+  private printMaskedImageBytes(op: LayerImageOp): Uint8Array {
+    // imageForOp가 검증한 동일 resource를 공통 sampler에 encoded 그대로 전달한다.
+    const index = this.layerResourceIndex(op.imageRef, this.currentResources?.imageKeys,
+      this.currentResources?.images?.length ?? 0);
+    const resource = index === null ? undefined : this.currentResources?.images?.[index];
+    const source = resource ?? op.base64
+      ?? (op.sourceImageKey ? this.currentImageBytesResolver?.(op.sourceImageKey) : undefined);
+    const bytes = this.imageResourceBytes(source ?? undefined);
+    if (!bytes) throw new Error('Print 색·마스크의 원본 바이트가 없습니다.');
+    return bytes;
   }
 
   private imageForOp(op: LayerImageOp): SkImage | null {
@@ -6000,12 +6145,56 @@ export class CanvasKitLayerRenderer {
     });
   }
 
+  private withCharOutlineStroke(
+    canvas: SkCanvas,
+    style: NonNullable<LayerTextRunOp['style']>,
+    draw: (paint: SkPaint) => void,
+  ): void {
+    const stroke = style.outlineStroke;
+    if (!stroke || !Number.isFinite(stroke.width) || stroke.width <= 0) {
+      // 이전 producer는 기존 fallback 경로로 보내며 미지원 재생을 성공으로 세지 않는다.
+      this.unsupportedOps.add('textOutline:missingResolvedStroke');
+      return;
+    }
+    const paint = this.makeStrokePaint(style.color ?? '#000000', this.deviceStrokeWidth(canvas, stroke.width));
+    paint.setStrokeCap(this.canvasKit.StrokeCap.Round);
+    paint.setStrokeJoin(this.canvasKit.StrokeJoin.Round);
+    try {
+      this.drawStrokeWithDash(undefined, paint, () => draw(paint),
+        stroke.intervals.length > 0 ? stroke.intervals : undefined);
+    } finally {
+      paint.delete();
+    }
+  }
+
   private makeFillPaint(color: string, opacity = 1): SkPaint {
     const paint = new this.canvasKit.Paint();
     paint.setAntiAlias?.(true);
     paint.setStyle(this.canvasKit.PaintStyle.Fill);
     paint.setColor(this.color(color, opacity));
     return paint;
+  }
+
+  /**
+   * Shape and line strokes thinner than one device pixel are drawn one pixel wide (#8125).
+   * A Hancom print raster fills a whole device pixel even for 0.1 mm table rules; anti-aliasing
+   * the declared width leaves them faint. Same rule as Canvas2D `floor_line_width_to_device`
+   * and Native Skia.
+   */
+  private deviceStrokeWidth(canvas: SkCanvas, width: number): number {
+    const matrix = canvas.getTotalMatrix?.();
+    if (!matrix) return Math.max(width, this.currentDeviceStrokeFloor ?? 0);
+    let [a, c, , b, d] = matrix;
+    const external = this.recordingStrokeDeviceMatrix;
+    if (external) {
+      const [ea, ec, , eb, ed] = external;
+      [a, b, c, d] = [ea * a + ec * b, eb * a + ed * b, ea * c + ec * d, eb * c + ed * d];
+    }
+    const determinant = Math.abs(a * d - b * c);
+    if (!Number.isFinite(determinant) || determinant === 0) return width;
+    // Inverse affine maps one device pixel back to local space, as Native/Canvas2D do.
+    const unit = Math.min(Math.hypot(d, b), Math.hypot(c, a)) / determinant;
+    return Number.isFinite(unit) && unit > 0 ? Math.max(width, unit) : width;
   }
 
   private makeStrokePaint(color: string, width: number, opacity = 1): SkPaint {

@@ -10,12 +10,28 @@
 /// 문서의 CJK face나 표시 Unicode·의 전각 폭으로 이 기호를 재지 않는다.
 /// 확인하지 않은 기호는 기존 표시 폴백을 유지하며 글꼴 파일에 의존하지 않는다.
 pub(crate) fn implicit_symbol_advance_em(character: char) -> Option<f64> {
+    if let Some(advance) = super::implicit_symbol::advance_em(character) {
+        return Some(advance);
+    }
     match character {
         '\u{F09E}' | '\u{F0A0}' => Some(312.0 / 1000.0),
+        // 웹한글기안기 인쇄는 Wingdings 원문자·흰 원·체크 상자를 문서 글꼴과
+        // 상관없이 Haan Wings로 그린다. 내장 글꼴 폭: 0x80~0x95·0xA1 /W891,
+        // 0xFE /W892 (1000 단위). 표시용 ①·○·☑ 의 전각 폭을 빌리지 않는다.
+        '\u{F080}'..='\u{F095}' | '\u{F0A1}' => Some(891.0 / 1000.0),
+        '\u{F0FE}' => Some(892.0 / 1000.0),
+        // 독립 한컴 2020 Print issue8680: Wingdings-Regular CID9 /W385.
+        // 표시용 U+1F8AD를 공급하는 Noto 글꼴의 356/1000 폭으로 바꾸지 않는다.
+        '\u{F0FA}' => Some(385.0 / 1000.0),
         // 독립 한컴2020 Print의 원본 책괄호는 Haansoft Batang
         // A854/A855 프로그램을 사용한다. /W512, UPEM1024이며 표시용
         // 전각 흰 겹낫표의 폭으로 원본 반각 전진을 덮어쓰지 않는다.
         '\u{F0854}' | '\u{F0855}' => Some(0.5),
+        // #5793의 독립 Print와 sample10 474쪽은 원 HNC 이중선을
+        // 본문 face와 별개인 Haansoft Batang의 반각 프로그램으로 출력한다.
+        // 원시 HWP5 별칭과 평면15 키는 같은 프로그램이며 굵은 본문에도
+        // 기호 고유 전진을 쓴다. 리터럴 Unicode ═에는 이 계약을 옮기지 않는다.
+        '\u{A827}' | '\u{F0827}' => Some(0.5),
         // 편람의 한컴 2020·2024 Print는 원 PUA 삼각 기호를
         // Haansoft Batang CID13, /W500으로 출력한다. 실제 원 프로그램을
         // 준비한 경우의 전진은 앞선 native_pua_metrics가 소유하고,
@@ -40,6 +56,18 @@ struct OriginalGlyphMetric {
 // 슬래시 네 군데의 /Widths와 CharProc d1이 모두 605/1000이다.
 // 표시 폴백 Palatino의 656/2048은 원본 HFT 글리프의 폭이 아니다.
 static ORIGINAL_GLYPH_METRICS: &[OriginalGlyphMetric] = &[
+    // 독립 한컴2024 Print issue4138-ascii-split의21쪽 T4(U+2264):
+    // FontMatrix.001, Widths와 CharProc d1이 모두1000이다. 같은 원본 HFT를
+    // 영문 family 별칭으로 공급해도 표시 face의 반각 추정으로 바꾸지 않는다.
+    // 원본 선언을 확인한 경로만 소비하며 동명 대체 TTF에는 적용하지 않는다.
+    OriginalGlyphMetric {
+        face: "한양신명조",
+        bold: false,
+        italic: false,
+        character: '≤',
+        advance_units: 1000,
+        em_units: 1000,
+    },
     // 80168 구판 HWPX의 한컴2020 Print 30쪽 T10(Type3, xref348):
     // ToUnicode1630의 code79→00B7, Widths1629=384, FontMatrix.001.
     // 대체 TTF가 실제 선택되지 않은 type1도 이 원본 기호 폭을 유지한다.
@@ -160,7 +188,11 @@ static HCI_TULIP_REGULAR_ADVANCES: &[(char, u16)] = &[
 // Widths225, FontMatrix.001, CharProc d1=225. 국립국어원2022 p3 T9에서도
 // 좌우2018/2019는225/1000. 동명 TTF나 표시 대체의 전각 폭으로 확장하지 않는다.
 pub(crate) fn has_declared_original_glyph_metrics(face: &str) -> bool {
-    has_original_glyph_metrics(face) || matches!(face, "한양중고딕" | "고딕" | "명조" | "산세리프")
+    has_original_glyph_metrics(face)
+        || matches!(
+            face,
+            "한양신명조" | "한양중고딕" | "고딕" | "명조" | "산세리프"
+        )
 }
 
 pub(crate) fn declared_original_glyph_advance_em(
@@ -169,6 +201,19 @@ pub(crate) fn declared_original_glyph_advance_em(
     italic: bool,
     character: char,
 ) -> Option<f64> {
+    // 원본 HFT U+2027은 기존 독립 Print의 Type3 /Widths=500/1000em이다.
+    // 표시용 OTF의 cmap 결측에서 일반 구두점 폭으로 내려가면 뒤 글자가 당겨진다.
+    // glyph 표의 같은 반각 계약을 측정·paint가 함께 소비한다. 명시 TTF/OTF는 비대상이다.
+    if face == "한양신명조" && !bold && !italic && character == '\u{2027}' {
+        return Some(f64::from(HANYANGSINMYEONGJO_HYPHENATION_POINT[0]) / 1024.0);
+    }
+    // 독립 Type3로 확인한 원본 HFT 한양신명조의 두 원형 기호는 1em이다.
+    // 표시용 HY Sinmyeongjo OTF의 반각 hmtx와 원본 전진을 구분한다.
+    // 평가결과서 Print도 U+2219 뒤 한글 원점까지 1em이며 원문에 공백은 없다.
+    if face == "한양신명조" && !bold && !italic && matches!(character, '\u{2218}' | '\u{2219}')
+    {
+        return Some(1.0);
+    }
     // 독립 전체 ASCII 표본의 한컴2020 Print Type3는 95자 모두500/1000em이다.
     // 원본 HFT 선언을 확인한 호출자만 이 부분 표를 받는다. 실제 TrueType,
     // 미검증 italic·비ASCII에는 전달하지 않는다. 알 수 없는 고딕의 점·쉼표를
@@ -182,9 +227,17 @@ pub(crate) fn declared_original_glyph_advance_em(
         return Some(0.5);
     }
     // 원본 HNC 반각 괘선과 Unicode 전각 괘선은 같은 표시 모양이어도
-    // 다른 프로그램이다. 원본 sample11의 한컴2020 Print는 이 HNC 선을
-    // Haansoft Batang의512/1024em으로 출력한다. BMP HWP5 표기도 같은 키다.
-    if face == "명조" && !bold && !italic && matches!(character, '\u{F080F}' | '\u{A80F}') {
+    // 다른 프로그램이다. 원본 sample11의 한컴 2020 Print는 가는 선을 반각으로
+    // 출력한다. sample10의 690·732·746·761쪽과 #5793 Print도 원본 이중선을
+    // 반각으로 확인한다. BMP HWP5 표기도 같은 원본 기호다.
+    if face == "명조"
+        && !bold
+        && !italic
+        && matches!(
+            character,
+            '\u{F080F}' | '\u{A80F}' | '\u{F0827}' | '\u{A827}'
+        )
+    {
         return Some(0.5);
     }
     // 별도 빈 HWPX의 명조 HFT ASCII/선문자 표본을 한컴2020 Print:
@@ -192,6 +245,11 @@ pub(crate) fn declared_original_glyph_advance_em(
     // 미확인 선문자·다른 프로그램·style에는 반영하지 않는다. 대상 본문의
     // 연결선 길이나 원점을 늘리는 대신 같은 원본 문자 전진을 측정·paint가 쓴다.
     if face == "명조" && !bold && !italic && matches!(character, '─' | '│' | '═') {
+        return Some(1.0);
+    }
+    // 원본 명조의 글머리표는 한컴 Print에서 한 글자 폭을 점유한다.
+    // 원본 프로그램이 해당 글리프를 제공하면 호출자가 그 실제 폭을 우선한다.
+    if face == "명조" && !bold && !italic && character == '•' {
         return Some(1.0);
     }
     original_glyph_advance_em(face, bold, italic, character).or_else(|| {

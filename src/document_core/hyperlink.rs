@@ -6,7 +6,9 @@ use super::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::{Control, Field, FieldType, Parameter};
 use crate::model::event::DocumentEvent;
-use crate::model::hyperlink::{bookmark_command, command_bookmark, command_uri, web_command};
+use crate::model::hyperlink::{
+    bookmark_command, command_bookmark, command_uri, destination_command,
+};
 use crate::model::paragraph::{FieldRange, Paragraph};
 use crate::parser::tags;
 
@@ -81,7 +83,7 @@ impl DocumentCore {
         end: usize,
         uri: &str,
     ) -> Result<u32, HwpError> {
-        self.insert_hyperlink_command(target, start, end, web_command(uri)?)
+        self.insert_hyperlink_command(target, start, end, destination_command(uri)?)
     }
 
     /// 선택한 표시 문자열에 문서 내부 책갈피 링크를 붙인다. 책갈피가 문서에 있어야 한다.
@@ -193,7 +195,7 @@ impl DocumentCore {
         field_id: u32,
         uri: &str,
     ) -> Result<bool, HwpError> {
-        let command = web_command(uri)?;
+        let command = destination_command(uri)?;
         self.update_hyperlink_command(target, field_id, command, Some(uri))
     }
 
@@ -223,9 +225,12 @@ impl DocumentCore {
             unreachable!()
         };
         // 링크 종류(웹/책갈피)를 암묵적으로 바꾸지 않는다. Category/TargetType 파라미터가 어긋난다.
-        // mail/file 링크는 어느 쪽으로도 수정하지 않는다.
+        // 외부 목적지는 종류를 보존하고 책갈피 링크와 구별한다.
         let same_kind = match path {
-            Some(_) => web_command(&command_uri(&field.command)).is_ok(),
+            Some(_) => {
+                destination_command(&command_uri(&field.command)).is_ok()
+                    && command_bookmark(&field.command).is_none()
+            }
             None => command_bookmark(&field.command).is_some(),
         };
         if !same_kind {
@@ -417,6 +422,7 @@ impl DocumentCore {
                 range.control_idx -= 1;
             }
         }
+        candidate.forget_para_text_if_emptied();
         for (start, end, mods) in formats {
             let ids = self
                 .document
@@ -474,8 +480,8 @@ impl DocumentCore {
                         .ok_or_else(|| invalid("셀 인덱스 초과"))?
                         .paragraphs
                 }
-                Some(Control::Shape(shape)) if cell_idx == 0 => {
-                    &super::get_textbox_from_shape(shape)
+                Some(Control::Shape(shape)) => {
+                    &super::helpers::get_textbox_at(shape, cell_idx)
                         .ok_or_else(|| invalid("글상자가 없는 도형"))?
                         .paragraphs
                 }

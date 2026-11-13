@@ -63,6 +63,7 @@ impl LayoutEngine {
             let composed = self.compose_cell_unit_paragraph(
                 paragraph,
                 cell.text_direction,
+                cell.line_wrap == crate::model::table::CELL_LINE_WRAP_SQUEEZE,
                 inner_width,
                 styles,
             );
@@ -100,12 +101,12 @@ impl LayoutEngine {
             || !start.is_empty()
             || end != [1]
             || table.common.treat_as_char
-            || table.page_break != TablePageBreak::RowBreak
+            || table.layout_page_break() != TablePageBreak::RowBreak
             || table.row_count <= 1
         {
             return false;
         }
-        let owners = Self::row_cut_cell_order(table, row);
+        let owners = self.indexed_row_cut_cell_order(table, row);
         let [index] = owners.as_slice() else {
             return false;
         };
@@ -226,7 +227,7 @@ impl LayoutEngine {
                 .borrow()
                 .cell_frame_reflowed(table, cell)
             || table.common.treat_as_char
-            || table.page_break != TablePageBreak::RowBreak
+            || table.layout_page_break() != TablePageBreak::RowBreak
             || cell.row_span != 1
             || cell.col != 0
             || cell.col_span != table.col_count

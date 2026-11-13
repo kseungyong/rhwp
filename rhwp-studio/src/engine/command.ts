@@ -8,6 +8,7 @@ import type { DocumentPosition, CharProperties, ParaProperties, CellPathLike, Ce
 import type { HeaderFooterTextPosition, CellBlockSelectionState } from './cursor';
 import type { CharShapeRun } from '@/core/types';
 import { hyperlinkTarget } from '../core/hyperlink';
+import { touchesMemoAnchor } from '../core/memo';
 import { normalizeTextNewlines } from '../core/text-newlines';
 import { MAX_PAGE_LOCAL_TEXT_EDIT_CHARS } from './input-edit-invalidation';
 import type { LineEndpoints as LineEndpointsLike } from './object-drag-record';
@@ -865,15 +866,18 @@ export class DeleteTextCommand implements EditCommand {
       this.deletedText = doGetTextRange(wasm, this.position, this.count);
     }
     // 링크 글자 삭제는 범위·서식 경계를 잃으므로 일반 재삽입으로 반전할 수 없다.
+    // 메모 기준 범위에 닿는 삭제도 같다. 코어가 메모를 지우거나 재삽입한 글자가 범위에 붙는다.
     // 기존 문단 조각은 상위 문단의 셀/중첩 셀/글상자까지 함께 보존한다.
     // 캡션은 hyperlinkTarget의 지원 대상이 아니며 기존 문자 역연산을 유지한다.
     const isCaption = this.position.cellIndex === 65534
       || this.position.cellPath?.some(entry => entry.cellIndex === 65534);
     if (!isCaption && this.count > 0) {
       const target = hyperlinkTarget(this.position);
+      const start = this.position.charOffset;
+      const end = start + this.count;
       const context = wasm.getHyperlinkContext(target);
-      if (context.links.some(link => this.position.charOffset < link.end
-        && link.start < this.position.charOffset + this.count)) {
+      if (context.links.some(link => start < link.end && link.start < end)
+        || touchesMemoAnchor(wasm.getMemoAnchors(), target, start, end)) {
         this.fragmentId = wasm.captureDeleteRange(target.section, target.para, target.para);
       }
     }
@@ -1431,6 +1435,7 @@ export class ApplyCharFormatCommand implements EditCommand {
 
 export type ParaFormatTarget =
   | { kind: 'body'; sec: number; para: number }
+  | { kind: 'cellPath'; sec: number; parentPara: number; path: CellPathEntry[] }
   | { kind: 'cell'; sec: number; parentPara: number; controlIdx: number; cellIdx: number; cellParaIdx: number };
 
 interface ParaShapeHistoryEntry {
@@ -1442,7 +1447,9 @@ interface ParaShapeHistoryEntry {
 function getParaShapeId(wasm: WasmBridge, target: ParaFormatTarget): number {
   const props = target.kind === 'body'
     ? wasm.getParaPropertiesAt(target.sec, target.para)
-    : wasm.getCellParaPropertiesAt(
+    : target.kind === 'cellPath'
+      ? wasm.getCellParaPropertiesAtByPath(target.sec, target.parentPara, JSON.stringify(target.path))
+      : wasm.getCellParaPropertiesAt(
         target.sec,
         target.parentPara,
         target.controlIdx,
@@ -1461,6 +1468,10 @@ function applyParaFormatToTarget(wasm: WasmBridge, target: ParaFormatTarget, pro
     wasm.applyParaFormat(target.sec, target.para, propsJson);
     return;
   }
+  if (target.kind === 'cellPath') {
+    wasm.applyParaFormatInCellByPath(target.sec, target.parentPara, JSON.stringify(target.path), propsJson);
+    return;
+  }
   wasm.applyParaFormatInCell(
     target.sec,
     target.parentPara,
@@ -1474,6 +1485,10 @@ function applyParaFormatToTarget(wasm: WasmBridge, target: ParaFormatTarget, pro
 function restoreParaShapeId(wasm: WasmBridge, target: ParaFormatTarget, paraShapeId: number): void {
   if (target.kind === 'body') {
     wasm.setParaShapeId(target.sec, target.para, paraShapeId);
+    return;
+  }
+  if (target.kind === 'cellPath') {
+    wasm.setCellParaShapeIdByPath(target.sec, target.parentPara, JSON.stringify(target.path), paraShapeId);
     return;
   }
   wasm.setCellParaShapeId(
@@ -1500,9 +1515,11 @@ export class ApplyParaFormatCommand implements EditCommand {
 
   execute(wasm: WasmBridge): DocumentPosition {
     if (this.entries.length > 0 && this.entries.every(entry => entry.afterParaShapeId !== undefined)) {
-      for (const entry of this.entries) {
-        restoreParaShapeId(wasm, entry.target, entry.afterParaShapeId!);
-      }
+      wasm.runInBatch(() => {
+        for (const entry of this.entries) {
+          restoreParaShapeId(wasm, entry.target, entry.afterParaShapeId!);
+        }
+      });
       return { ...this.cursorBefore };
     }
 
@@ -1527,9 +1544,11 @@ export class ApplyParaFormatCommand implements EditCommand {
   }
 
   undo(wasm: WasmBridge): DocumentPosition {
-    for (const entry of this.entries) {
-      restoreParaShapeId(wasm, entry.target, entry.beforeParaShapeId);
-    }
+    wasm.runInBatch(() => {
+      for (const entry of this.entries) {
+        restoreParaShapeId(wasm, entry.target, entry.beforeParaShapeId);
+      }
+    });
     return { ...this.cursorBefore };
   }
 

@@ -4,7 +4,7 @@ use crate::model::style::UnderlineType;
 use crate::paint::LayerOutputOptions;
 use crate::renderer::composer::{
     char_overlap_display_text, char_overlap_size_ratio, decode_pua_overlap_number,
-    expand_pua_render_text_in_style, CharOverlapInfo,
+    expand_pua_render_text_in_style, pua_overlap_number_border, CharOverlapInfo,
 };
 use crate::renderer::layout::split_into_clusters;
 use crate::renderer::render_tree::BoundingBox;
@@ -13,7 +13,8 @@ use crate::renderer::{boxed_pua_char_overlap_semantics, clamp_tab_leader_end_x, 
 use super::font_catalog::TypefaceCatalog;
 use super::font_lookup::{
     font_style_for_text, match_supplied_family, match_system_family_style,
-    select_typeface_for_character, text_typeface_candidates, SystemFontFamilies,
+    select_typeface_for_character, text_typeface_candidates, text_typeface_candidates_for_source,
+    typeface_declares_family, SystemFontFamilies,
 };
 use super::renderer::colorref_to_skia;
 use super::synthetic_typeface::{draw_synthetic_bold_paths, unemboldened_typeface};
@@ -27,6 +28,7 @@ mod overlap;
 pub(super) struct SkiaTextReplay<'a> {
     pub(super) canvas: &'a Canvas,
     pub(super) raster_target: bool,
+    pub(super) geometric_text: bool,
     pub(super) hft_outline_enabled: bool,
     pub(super) font_mgr: &'a FontMgr,
     pub(super) text_shaper: &'a std::cell::OnceCell<Option<skia_safe::Shaper>>,
@@ -80,15 +82,16 @@ impl SkiaTextReplay<'_> {
                 //
                 // 모든 후보를 chain 으로 보존 — char 단위 fallback 에 사용.
                 // 후보와 glyph 선택은 opt-in font decision trace도 그대로 사용한다.
-                let (_, typeface_chain) = text_typeface_candidates(
+                let (_, typeface_chain) = text_typeface_candidates_for_source(
                     self.font_mgr,
                     self.system_families,
                     self.custom_typefaces,
                     self.bundled_typefaces,
                     &crate::renderer::native_font_family_for_style(style),
                     font_style,
+                    style.source_font_is_ttf,
                 );
-                let hft_outline = (self.hft_outline_enabled
+                let hft_outline_family = (self.hft_outline_enabled
                     && crate::renderer::hft_outline::supports_style(style))
                 .then(|| {
                     let family = crate::renderer::hft_outline::first_family(&style.font_family);
@@ -104,22 +107,52 @@ impl SkiaTextReplay<'_> {
                         .or_else(|| {
                             match_supplied_family(self.bundled_typefaces, family, font_style)
                         })?;
-                    super::hft_outline::HftOutlineReplay::new(&face)
+                    Some((family.to_owned(), face.family_name()))
                 })
                 .flatten();
+                // 같은 family의 한글·영문 CFF는 서로 다른 Typeface일 수 있다.
+                // 실제 glyph를 그리는 face의 윤곽을 지연 준비하고 다른 family의
+                // fallback에는 원본 HFT 윤곽 규칙을 적용하지 않는다.
+                let hft_outlines = std::cell::RefCell::new(std::collections::HashMap::new());
+                let draw_hft_outline =
+                    |canvas: &Canvas, text: &str, font: &Font, origin, paint: &Paint| {
+                        let Some((requested_family, primary_family)) = hft_outline_family.as_ref()
+                        else {
+                            return false;
+                        };
+                        let face = font.typeface();
+                        let mut outlines = hft_outlines.borrow_mut();
+                        let outline = outlines.entry(face.unique_id()).or_insert_with(|| {
+                            (face.family_name().eq_ignore_ascii_case(primary_family)
+                                || typeface_declares_family(&face, requested_family))
+                            .then(|| super::hft_outline::HftOutlineReplay::new(&face))
+                            .flatten()
+                        });
+                        outline
+                            .as_ref()
+                            .is_some_and(|outline| outline.draw(canvas, text, font, origin, paint))
+                    };
                 let font_for_text = |sample: &str, size: f32| {
                     if let Some(family) =
                         crate::renderer::measured_glyph_supplier::family(style, sample)
                     {
-                        let (_, chain) = text_typeface_candidates(
+                        let (_, chain) = text_typeface_candidates_for_source(
                             self.font_mgr,
                             self.system_families,
                             self.custom_typefaces,
                             self.bundled_typefaces,
                             family,
                             font_style,
+                            style.source_font_is_ttf,
                         );
-                        return fonts::for_text(&chain, sample, size, style, self.font_mgr);
+                        return fonts::for_text(
+                            &chain,
+                            sample,
+                            size,
+                            style,
+                            self.font_mgr,
+                            self.geometric_text,
+                        );
                     }
                     if crate::renderer::pua_glyph::candidate(sample).is_some() {
                         if let Some(primary) = typeface_chain.first() {
@@ -131,11 +164,19 @@ impl SkiaTextReplay<'_> {
                                     size,
                                     style,
                                     self.font_mgr,
+                                    self.geometric_text,
                                 );
                             }
                         }
                     }
-                    fonts::for_text(&typeface_chain, sample, size, style, self.font_mgr)
+                    fonts::for_text(
+                        &typeface_chain,
+                        sample,
+                        size,
+                        style,
+                        self.font_mgr,
+                        self.geometric_text,
+                    )
                 };
                 let baseline_y = if baseline > 0.0 {
                     bbox.y + baseline
@@ -178,7 +219,7 @@ impl SkiaTextReplay<'_> {
                         .map(|(_, border_type)| border_type)
                         .unwrap_or_else(|| {
                             if overlap.border_type == 0 && is_combined.is_some() {
-                                1
+                                pua_overlap_number_border(&chars)
                             } else {
                                 overlap.border_type
                             }
@@ -305,8 +346,12 @@ impl SkiaTextReplay<'_> {
                 let metric_source = text;
                 let text = expand_pua_render_text_in_style(text, style);
                 let text = text.as_str();
-                let metric_text =
-                    crate::renderer::composer::display_projection_metric_text(metric_source, text);
+                let symbol_sources = crate::renderer::implicit_symbol::sources(metric_source, text);
+                let metric_text = crate::renderer::composer::display_projection_metric_text(
+                    metric_source,
+                    text,
+                    style.literal_soft_hyphen,
+                );
                 let char_positions = crate::renderer::replay_positions_or_compute(
                     metric_text,
                     style,
@@ -343,7 +388,7 @@ impl SkiaTextReplay<'_> {
                     let (fs, r) = style.ratio_draw_params(font_size as f64);
                     (fs as f32, r as f32)
                 };
-                let has_ratio = (ratio - 1.0).abs() > 0.01;
+                let has_ratio = style.has_horizontal_ratio();
                 let shaped_spans = if suppress_glyphs {
                     Vec::new()
                 } else {
@@ -392,13 +437,47 @@ impl SkiaTextReplay<'_> {
                     }
                 };
                 let is_middle_dot = crate::renderer::render_tree::is_vector_middle_dot;
-                let draw_text_pass = |color: Color, stroke_width: f32, dx: f32, dy: f32| {
+                // 외곽선 글자는 SVG·Canvas와 같은 굵기·반복 구간으로 윤곽만 긋는다.
+                // PDF의 명시 paint는 독립적인 채움·획 계약을 우선한다.
+                let outline = style
+                    .text_paint
+                    .is_none()
+                    .then(|| {
+                        crate::renderer::stroke_pattern::char_outline_stroke(style.outline_type)
+                    })
+                    .flatten();
+                let draw_text_pass = |color: Color, stroke_width: Option<f32>, dx: f32, dy: f32| {
                     let mut text_paint = Paint::default();
                     text_paint.set_anti_alias(true);
                     text_paint.set_color(color);
-                    if stroke_width > 0.0 {
+                    if let Some(stroke_width) = stroke_width {
                         text_paint.set_style(paint::Style::Stroke);
                         text_paint.set_stroke_width(stroke_width);
+                        if let Some(explicit) = style.text_paint {
+                            text_paint
+                                .set_stroke_miter(explicit.paint.miter_limit_milli as f32 / 1000.0);
+                            text_paint.set_stroke_join(match explicit.paint.line_join {
+                                1 => paint::Join::Round,
+                                2 => paint::Join::Bevel,
+                                _ => paint::Join::Miter,
+                            });
+                        } else {
+                            text_paint.set_stroke_cap(paint::Cap::Round);
+                            text_paint.set_stroke_join(paint::Join::Round);
+                            if let Some((_, intervals)) =
+                                outline.as_ref().filter(|(_, v)| !v.is_empty())
+                            {
+                                let intervals: Vec<f32> =
+                                    intervals.iter().map(|v| *v as f32).collect();
+                                text_paint
+                                    .set_path_effect(skia_safe::PathEffect::dash(&intervals, 0.0));
+                            }
+                            super::line_replay::floor_stroke_to_device(
+                                canvas,
+                                &mut text_paint,
+                                self.raster_target,
+                            );
+                        }
                     } else {
                         text_paint.set_style(paint::Style::Fill);
                     }
@@ -433,7 +512,9 @@ impl SkiaTextReplay<'_> {
                         // U+FFFC의 실제 개체는 별도 paint op가 소유한다. 문자 인덱스를
                         // 제거하면 뒤 cluster의 저장 위치가 달라지므로 그대로 건너뛴다.
                         if cluster.starts_with('\u{FFFC}')
-                            || cluster.chars().all(char::is_whitespace)
+                            || crate::renderer::text_glyph_visibility::is_nonprinting_cluster(
+                                cluster,
+                            )
                         {
                             continue;
                         }
@@ -466,6 +547,24 @@ impl SkiaTextReplay<'_> {
                         if cluster.starts_with(|ch: char| {
                             ch < '\u{0020}' && !matches!(ch, '\t' | '\n' | '\r')
                         }) {
+                            continue;
+                        }
+                        if let Some((cx, cy, rx, ry)) = crate::renderer::implicit_symbol::ink(
+                            symbol_sources.as_deref(),
+                            *char_idx,
+                            style,
+                        ) {
+                            let cx = f64::from(char_x) + cx;
+                            let cy = y + f64::from(dy) + cy;
+                            canvas.draw_oval(
+                                skia_safe::Rect::from_xywh(
+                                    (cx - rx) as f32,
+                                    (cy - ry) as f32,
+                                    (2.0 * rx) as f32,
+                                    (2.0 * ry) as f32,
+                                ),
+                                &text_paint,
+                            );
                             continue;
                         }
                         if let Some((cx, cy, rx, ry)) =
@@ -525,26 +624,28 @@ impl SkiaTextReplay<'_> {
                             );
                             continue;
                         }
-                        // [#6127] 한컴 사각 안 숫자(U+F02B1~F02C4) 평문 폴백 —
-                        // web_canvas·SVG 와 같은 bounded vector 합성(상자 0.72em,
-                        // 숫자 0.5em). raw PUA 는 함초롬 확장 글꼴이 없으면 빈칸.
+                        // [#6127] 한컴 합성 PUA 기호(사각 안 숫자 등) 평문 폴백 —
+                        // web_canvas·SVG 와 같은 동봉 em 기하의 bounded vector 합성.
+                        // raw PUA 는 함초롬 확장 글꼴이 없으면 빈칸.
                         if cluster.chars().count() == 1 {
-                            if let Some(number) = cluster
+                            if let Some(glyph) = cluster
                                 .chars()
                                 .next()
-                                .and_then(crate::renderer::boxed_pua_number)
+                                .and_then(crate::renderer::enclosed_pua)
                             {
+                                let inner_text = glyph.inner_text();
                                 let baseline_y = y as f32 + dy;
-                                if let Some(g) = crate::renderer::boxed_digit_geometry::single_digit(
-                                    number,
+                                if let Some(g) = crate::renderer::enclosed_pua_geometry::geometry(
+                                    glyph,
                                     f64::from(font_size),
                                 ) {
                                     let family = format!(
                                         "{},{}",
-                                        crate::renderer::boxed_digit_geometry::number_face(),
+                                        crate::renderer::enclosed_pua_geometry::inner_faces(glyph)
+                                            .join(","),
                                         style.font_family
                                     );
-                                    let (_, number_faces) = text_typeface_candidates(
+                                    let (_, inner_faces) = text_typeface_candidates(
                                         self.font_mgr,
                                         self.system_families,
                                         self.custom_typefaces,
@@ -552,40 +653,49 @@ impl SkiaTextReplay<'_> {
                                         &family,
                                         FontStyle::normal(),
                                     );
-                                    if let Some(face) = select_typeface_for_character(
-                                        &number_faces,
-                                        char::from_digit(number, 10).unwrap(),
-                                    ) {
-                                        let mut number_font =
+                                    let inner_char = inner_text.chars().next();
+                                    if let Some(face) = inner_char.and_then(|character| {
+                                        select_typeface_for_character(&inner_faces, character)
+                                    }) {
+                                        let mut inner_font =
                                             Font::new(face.typeface.clone(), font_size);
-                                        number_font.set_edging(font::Edging::AntiAlias);
+                                        inner_font.set_edging(font::Edging::AntiAlias);
+                                        fonts::preserve_geometry(
+                                            &mut inner_font,
+                                            self.geometric_text,
+                                        );
                                         let mut frame_paint = Paint::default();
                                         frame_paint.set_anti_alias(true);
                                         frame_paint.set_style(paint::Style::Stroke);
                                         frame_paint.set_stroke_width(g.stroke_width as f32);
                                         frame_paint.set_color(color);
-                                        canvas.draw_rect(
-                                            Rect::from_xywh(
-                                                char_x + g.frame_x as f32,
-                                                baseline_y + g.frame_y as f32,
-                                                g.frame_width as f32,
-                                                g.frame_height as f32,
-                                            ),
-                                            &frame_paint,
+                                        let frame = Rect::from_xywh(
+                                            char_x + g.frame_x as f32,
+                                            baseline_y + g.frame_y as f32,
+                                            g.frame_width as f32,
+                                            g.frame_height as f32,
                                         );
+                                        match g.frame_shape {
+                                            crate::renderer::enclosed_pua_geometry::FrameShape::Rect => {
+                                                canvas.draw_rect(frame, &frame_paint);
+                                            }
+                                            crate::renderer::enclosed_pua_geometry::FrameShape::Ellipse => {
+                                                canvas.draw_oval(frame, &frame_paint);
+                                            }
+                                        }
                                         canvas.save();
                                         canvas.translate((
-                                            char_x + g.number_x as f32,
-                                            baseline_y + g.number_y as f32,
+                                            char_x + g.inner_x as f32,
+                                            baseline_y + g.inner_y as f32,
                                         ));
                                         canvas.scale((
-                                            g.number_scale_x as f32,
-                                            g.number_scale_y as f32,
+                                            g.inner_scale_x as f32,
+                                            g.inner_scale_y as f32,
                                         ));
                                         canvas.draw_str(
-                                            number.to_string(),
+                                            &inner_text,
                                             (0.0, 0.0),
-                                            &number_font,
+                                            &inner_font,
                                             &text_paint,
                                         );
                                         canvas.restore();
@@ -603,13 +713,12 @@ impl SkiaTextReplay<'_> {
                                     skia_safe::Rect::from_xywh(char_x, box_y, box_size, box_size),
                                     &box_paint,
                                 );
-                                let number_str = number.to_string();
                                 let number_size = (font_size * 0.5).max(1.0);
-                                if let Some(number_font) = font_for_text(&number_str, number_size) {
+                                if let Some(number_font) = font_for_text(&inner_text, number_size) {
                                     let width =
-                                        number_font.measure_str(&number_str, Some(&text_paint)).0;
+                                        number_font.measure_str(&inner_text, Some(&text_paint)).0;
                                     canvas.draw_str(
-                                        &number_str,
+                                        &inner_text,
                                         (
                                             char_x + (box_size - width) / 2.0,
                                             box_y + box_size * 0.72,
@@ -624,7 +733,7 @@ impl SkiaTextReplay<'_> {
                         if let Some(mut font) = font_for_text(cluster, font_size) {
                             // 독립 Print의 regular 프로그램 합성 굵기는 같은 윤곽선의
                             // fill+stroke(0.02em)다. 실제 bold face와 outline pass는 보존한다.
-                            let regular = (style.bold && stroke_width == 0.0)
+                            let regular = (style.bold && stroke_width.is_none())
                                 .then(|| unemboldened_typeface(self.font_mgr, &font.typeface()))
                                 .flatten();
                             let synthetic_bold = regular.is_some();
@@ -633,7 +742,9 @@ impl SkiaTextReplay<'_> {
                                 font.set_embolden(false);
                                 let mut paint = text_paint.clone();
                                 paint.set_style(paint::Style::StrokeAndFill);
-                                paint.set_stroke_width(font_size * 0.02);
+                                paint.set_stroke_width(
+                                    font_size * crate::renderer::HANCOM_FAUX_BOLD_STROKE_EM as f32,
+                                );
                                 paint.set_stroke_miter(10.0);
                                 paint
                             });
@@ -695,7 +806,14 @@ impl SkiaTextReplay<'_> {
                                 canvas.save();
                                 canvas.translate((char_x, char_y));
                                 canvas.scale((scale, 1.0));
-                                canvas.draw_str(glyph_text, (0.0, 0.0), &font, glyph_paint);
+                                fonts::draw_positioned_cluster(
+                                    canvas,
+                                    glyph_text,
+                                    (0.0, 0.0),
+                                    &font,
+                                    glyph_paint,
+                                    self.geometric_text,
+                                );
                                 canvas.restore();
                                 continue;
                             }
@@ -733,11 +851,13 @@ impl SkiaTextReplay<'_> {
                                     glyph_paint,
                                     self.raster_target,
                                 ) {
-                                    canvas.draw_str(
+                                    fonts::draw_positioned_cluster(
+                                        canvas,
                                         glyph_text,
-                                        (char_x + fit_dx, char_y),
+                                        (char_x, char_y),
                                         &font,
                                         glyph_paint,
+                                        self.geometric_text,
                                     );
                                 }
                                 continue;
@@ -749,52 +869,86 @@ impl SkiaTextReplay<'_> {
                                 canvas.save();
                                 canvas.translate((char_x + fit_dx, char_y));
                                 canvas.scale((ratio * fit_scale, 1.0));
-                                if !hft_outline.as_ref().is_some_and(|outline| {
-                                    outline.draw(canvas, glyph_text, &font, (0.0, 0.0), glyph_paint)
-                                }) {
-                                    canvas.draw_str(glyph_text, (0.0, 0.0), &font, glyph_paint);
-                                }
-                                canvas.restore();
-                            } else if !hft_outline.as_ref().is_some_and(|outline| {
-                                outline.draw(
+                                if !draw_hft_outline(
                                     canvas,
                                     glyph_text,
                                     &font,
-                                    (char_x, char_y),
+                                    (0.0, 0.0),
                                     glyph_paint,
-                                )
-                            }) {
-                                canvas.draw_str(glyph_text, (char_x, char_y), &font, glyph_paint);
+                                ) {
+                                    fonts::draw_positioned_cluster(
+                                        canvas,
+                                        glyph_text,
+                                        (0.0, 0.0),
+                                        &font,
+                                        glyph_paint,
+                                        self.geometric_text,
+                                    );
+                                }
+                                canvas.restore();
+                            } else if !draw_hft_outline(
+                                canvas,
+                                glyph_text,
+                                &font,
+                                (char_x, char_y),
+                                glyph_paint,
+                            ) {
+                                fonts::draw_positioned_cluster(
+                                    canvas,
+                                    glyph_text,
+                                    (char_x, char_y),
+                                    &font,
+                                    glyph_paint,
+                                    self.geometric_text,
+                                );
                             }
                         }
                     }
                 };
 
                 if !suppress_glyphs {
-                    if style.shadow_type > 0 {
+                    for [shadow_x, shadow_y] in crate::paint::text_shadow::offsets(style) {
                         draw_text_pass(
                             colorref_to_skia(style.shadow_color, 1.0),
-                            0.0,
-                            style.shadow_offset_x as f32,
-                            style.shadow_offset_y as f32,
+                            None,
+                            shadow_x as f32,
+                            shadow_y as f32,
                         );
                     }
-                    if style.outline_type > 0 {
+                    if let Some((width, _)) = &outline {
                         draw_text_pass(
                             colorref_to_skia(style.color, 1.0),
-                            (font_size * 0.08).max(0.8),
+                            Some(*width as f32),
                             0.0,
                             0.0,
                         );
                     }
                     if style.emboss {
-                        draw_text_pass(Color::WHITE, 0.0, -1.0, -1.0);
-                        draw_text_pass(Color::from_argb(255, 96, 96, 96), 0.0, 1.0, 1.0);
+                        draw_text_pass(Color::WHITE, None, -1.0, -1.0);
+                        draw_text_pass(Color::from_argb(255, 96, 96, 96), None, 1.0, 1.0);
                     } else if style.engrave {
-                        draw_text_pass(Color::from_argb(255, 96, 96, 96), 0.0, -1.0, -1.0);
-                        draw_text_pass(Color::WHITE, 0.0, 1.0, 1.0);
+                        draw_text_pass(Color::from_argb(255, 96, 96, 96), None, -1.0, -1.0);
+                        draw_text_pass(Color::WHITE, None, 1.0, 1.0);
                     }
-                    draw_text_pass(colorref_to_skia(style.color, 1.0), 0.0, 0.0, 0.0);
+                    if let Some(explicit) = style.text_paint {
+                        let p = explicit.paint;
+                        if p.fill {
+                            draw_text_pass(
+                                colorref_to_skia(style.color, f32::from(p.fill_alpha) / 255.0),
+                                None,
+                                0.0,
+                                0.0,
+                            );
+                        }
+                        draw_text_pass(
+                            colorref_to_skia(p.stroke_color, f32::from(p.stroke_alpha) / 255.0),
+                            Some(explicit.width as f32),
+                            0.0,
+                            0.0,
+                        );
+                    } else if outline.is_none() {
+                        draw_text_pass(colorref_to_skia(style.color, 1.0), None, 0.0, 0.0);
+                    }
                 }
 
                 for &(left, right) in &segments {
@@ -806,7 +960,7 @@ impl SkiaTextReplay<'_> {
                         // [#5730] 아래 밑줄은 기준선 + 0.17em (한글 2022 프로브 실측) —
                         // 이중/삼중선(shape 7~10)은 em 비례 실측표를 따른다.
                         // SVG 백엔드(renderer/svg.rs)와 같은 표(text_decoration)를 소비한다.
-                        let top = crate::renderer::text_decoration::top_underline_geometry(
+                        let top = crate::renderer::text_decoration::underline_geometry(
                             style,
                             font_size as f64,
                         );
@@ -879,6 +1033,7 @@ impl SkiaTextReplay<'_> {
                         font_size,
                         &mark_style,
                         self.font_mgr,
+                        self.geometric_text,
                     ) {
                         font.set_scale_x(geometry.ratio as f32);
                         font.set_skew_x((geometry.skew_x * geometry.ratio) as f32);

@@ -1,8 +1,8 @@
 use resvg::{tiny_skia, usvg};
 use skia_safe::{
-    canvas::SrcRectConstraint, color_filters, image::RequiredProperties, Color, ColorSpace,
-    CubicResampler, Data, FilterMode, IRect, Image, Matrix, MipmapMode, Paint, Rect,
-    SamplingOptions, TileMode,
+    canvas::SrcRectConstraint, codec, color_filters, image::RequiredProperties, AlphaType, Codec,
+    Color, ColorSpace, ColorType, CubicResampler, Data, FilterMode, IRect, Image, ImageInfo,
+    Matrix, MipmapMode, Paint, Rect, SamplingOptions, TileMode,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -27,6 +27,8 @@ pub struct ImageSampling {
     mipmap_mode: MipmapMode,
     profile: crate::paint::RenderProfile,
     paper_grid: Option<crate::renderer::bitmap_raster::PrintPaperGrid>,
+    print_page: Option<[u64; 3]>,
+    strict_resource_failures: bool,
 }
 
 impl ImageSampling {
@@ -36,6 +38,8 @@ impl ImageSampling {
             mipmap_mode: MipmapMode::None,
             profile: crate::paint::RenderProfile::Screen,
             paper_grid: None,
+            print_page: None,
+            strict_resource_failures: false,
         }
     }
 
@@ -45,6 +49,8 @@ impl ImageSampling {
             mipmap_mode: MipmapMode::Linear,
             profile: crate::paint::RenderProfile::Screen,
             paper_grid: None,
+            print_page: None,
+            strict_resource_failures: false,
         }
     }
 
@@ -54,6 +60,8 @@ impl ImageSampling {
             mipmap_mode: MipmapMode::None,
             profile: crate::paint::RenderProfile::Screen,
             paper_grid: None,
+            print_page: None,
+            strict_resource_failures: false,
         }
     }
 
@@ -69,6 +77,11 @@ impl ImageSampling {
         self
     }
 
+    pub(super) fn with_strict_resources(mut self, strict: bool) -> Self {
+        self.strict_resource_failures = strict;
+        self
+    }
+
     pub(super) fn with_paper_grid(
         mut self,
         grid: Option<crate::renderer::bitmap_raster::PrintPaperGrid>,
@@ -80,6 +93,67 @@ impl ImageSampling {
     pub(super) fn options(self) -> SamplingOptions {
         SamplingOptions::new(self.filter_mode, self.mipmap_mode)
     }
+
+    pub(super) fn with_print_page(mut self, page: Option<(f64, f64, f64)>) -> Self {
+        self.print_page = page.map(|(w, h, scale)| [w.to_bits(), h.to_bits(), scale.to_bits()]);
+        self
+    }
+}
+
+/// SkImage::from_encoded only creates a lazy image: even invalid/incomplete
+/// compressed pixels can pass that header check and later disappear at draw.
+/// Decode this image resource, not the destination surface, and accept only a
+/// complete codec success. Skia remains the format/color-profile authority.
+fn full_image_decode_succeeds(encoded: &Data) -> bool {
+    use crate::renderer::image_header::{
+        CANVASKIT_MAX_IMAGE_DIMENSION, CANVASKIT_MAX_IMAGE_PIXELS,
+    };
+
+    let Some(mut codec) = Codec::from_data(encoded.clone()) else {
+        return false;
+    };
+    let source = codec.info();
+    let (Ok(width), Ok(height)) = (
+        u32::try_from(source.width()),
+        u32::try_from(source.height()),
+    ) else {
+        return false;
+    };
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0
+        || height == 0
+        || width > CANVASKIT_MAX_IMAGE_DIMENSION
+        || height > CANVASKIT_MAX_IMAGE_DIMENSION
+        || pixels > CANVASKIT_MAX_IMAGE_PIXELS
+    {
+        return false;
+    }
+    let info = ImageInfo::new(
+        (source.width(), source.height()),
+        ColorType::RGBA8888,
+        AlphaType::Premul,
+        source.color_space(),
+    );
+    let row_bytes = info.min_row_bytes();
+    let Some(byte_len) = row_bytes.checked_mul(height as usize) else {
+        return false;
+    };
+    let max_decode_memory = (CANVASKIT_MAX_IMAGE_PIXELS * 4) as usize;
+    if byte_len > max_decode_memory {
+        return false;
+    }
+    let mut decoded = Vec::new();
+    if decoded.try_reserve_exact(byte_len).is_err() {
+        return false;
+    }
+    decoded.resize(byte_len, 0);
+    let options = codec::Options {
+        zero_initialized: codec::ZeroInitialized::Yes,
+        max_decode_memory: Some(max_decode_memory),
+        ..Default::default()
+    };
+    codec.get_pixels_with_options(&info, &mut decoded, row_bytes, Some(&options))
+        == codec::Result::Success
 }
 
 pub(super) fn draw_svg_fragment(
@@ -250,12 +324,31 @@ pub(super) fn draw_image_bytes(
     if !is_valid_destination_rect(x, y, width, height) {
         return false;
     }
+    // Check the original span before JPEG normalization, tone/effect expansion
+    // and print fast paths. The normalized span is checked again below.
+    if sampling.strict_resource_failures && bytes.len() > crate::model::bin_data::MAX_BIN_DATA_BYTES
+    {
+        return false;
+    }
     if effect == ImageEffect::RealPic
         && brightness == 0
         && contrast == 0
         && super::metafile_print::draw(canvas, bytes)
     {
         return true;
+    }
+    if crate::renderer::image_resolver::png_sampling::print_separate_alpha(bytes) {
+        if let Some([w, h, scale]) = sampling.print_page {
+            if super::print_image_sampling::draw_masked(
+                canvas,
+                bytes,
+                Rect::from_xywh(x, y, width, height),
+                (f64::from_bits(w), f64::from_bits(h)),
+                f64::from_bits(scale),
+            ) {
+                return true;
+            }
+        }
     }
     // [#3460] HWPX BinData 는 SVG 를 그대로 담는다(`<hc:img>` → `Format="svg"`). skia 디코더는
     // SVG 를 읽지 못해 종전에는 회색 자리표시자만 남았다. 같은 모듈의 resvg 로 목적지 크기에
@@ -295,16 +388,23 @@ pub(super) fn draw_image_bytes(
                     f64::from(window.width),
                     f64::from(window.height),
                 );
-                src_x <= 0.5
-                    && src_y <= 0.5
-                    && (src_w - f64::from(window.width)).abs() <= 1.0
-                    && (src_h - f64::from(window.height)).abs() <= 1.0
+                crate::renderer::svg::image_source_is_full(
+                    (src_x, src_y, src_w, src_h),
+                    f64::from(window.width),
+                    f64::from(window.height),
+                )
             })
         });
     let key = byte_key(
         b"decoded-image",
         bytes,
-        &(svg_size, svg_device_window, binary_effect, tone),
+        &(
+            svg_size,
+            svg_device_window,
+            binary_effect,
+            tone,
+            sampling.strict_resource_failures,
+        ),
     );
     let cached = cache.get(key, binary_effect.is_some());
     let (image, binary_preprocessed, encoded) = if let Some(CachedImageResource::Decoded {
@@ -358,9 +458,19 @@ pub(super) fn draw_image_bytes(
         // raster-specific dither cannot leak to a differently sized placement.
         let binary_png = binary_effect.and_then(|effect| binary_effect_png(encoded_bytes, effect));
         let encoded_bytes = binary_png.as_deref().unwrap_or(encoded_bytes);
+        if sampling.strict_resource_failures
+            && encoded_bytes.len() > crate::model::bin_data::MAX_BIN_DATA_BYTES
+        {
+            return false;
+        }
         // 디코더와 캐시가 같은 immutable Data를 공유한다. 캐시 hit도 실제
         // 정규화·전처리된 바이트를 전달해 원본/색조 전 바이트로 되돌리지 않는다.
         let encoded = Data::new_copy(encoded_bytes);
+        // Strict cache entries are inserted only after a successful full
+        // decode. Their policy key cannot reuse an unvalidated CPU lazy image.
+        if sampling.strict_resource_failures && !full_image_decode_succeeds(&encoded) {
+            return false;
+        }
         let Some(image) = Image::from_encoded(encoded.clone()) else {
             if binary_effect.is_some() {
                 cache.record_preprocessing(None);
@@ -462,11 +572,12 @@ pub(super) fn draw_image_bytes(
             decoded_width as f64,
             decoded_height as f64,
         );
+        let is_cropped = !crate::renderer::svg::image_source_is_full(
+            (src_x, src_y, src_w, src_h),
+            f64::from(decoded_width),
+            f64::from(decoded_height),
+        );
         let (src_x, src_y, src_w, src_h) = (src_x as f32, src_y as f32, src_w as f32, src_h as f32);
-        let is_cropped = src_x > 0.5
-            || src_y > 0.5
-            || (src_w - decoded_width).abs() > 1.0
-            || (src_h - decoded_height).abs() > 1.0;
         if is_cropped && src_w > 0.0 && src_h > 0.0 {
             Some(Rect::from_xywh(src_x, src_y, src_w, src_h))
         } else {
@@ -478,6 +589,20 @@ pub(super) fn draw_image_bytes(
         if sampling.mipmap_mode == MipmapMode::Linear && src.is_none() && !binary_preprocessed {
             if let Some(frame) = super::super::print_raster::PrintRasterFrame::read(bytes) {
                 if super::anisotropic_image::draw_print_frame(canvas, &image, frame, &paint) {
+                    return;
+                }
+            }
+        }
+        if src.is_none() && !binary_preprocessed && sampling.mipmap_mode == MipmapMode::Linear {
+            if let Some([w, h, scale]) = sampling.print_page {
+                if super::print_image_sampling::draw(
+                    canvas,
+                    &image,
+                    dst,
+                    &paint,
+                    (f64::from_bits(w), f64::from_bits(h)),
+                    f64::from_bits(scale),
+                ) {
                     return;
                 }
             }
@@ -515,31 +640,48 @@ pub(super) fn draw_image_bytes(
         let transform = canvas.local_to_device_as_3x3();
         // SVG는 위에서 이미 실제 장치 크기로 raster했다. 이를 다시 bitmap
         // 축소 경로에 넣으면 벡터의 가는 선까지 두 번 필터링하게 된다.
-        let prepared = (src.is_none()
-            && svg_size.is_none()
+        let prepared = (svg_size.is_none()
             && !binary_preprocessed
             && !matrix.has_perspective()
             && sampling.filter_mode != FilterMode::Nearest)
             .then(|| {
-                crate::renderer::bitmap_raster::prepare_bitmap(
-                    encoded.as_bytes(),
-                    crate::renderer::render_tree::BoundingBox::new(
-                        dst.x() as f64,
-                        dst.y() as f64,
-                        dst.width() as f64,
-                        dst.height() as f64,
-                    ),
-                    [
-                        transform.scale_x() as f64,
-                        transform.skew_y() as f64,
-                        transform.skew_x() as f64,
-                        transform.scale_y() as f64,
-                        transform.translate_x() as f64,
-                        transform.translate_y() as f64,
-                    ],
-                    sampling.profile,
-                    sampling.paper_grid,
-                )
+                let bbox = crate::renderer::render_tree::BoundingBox::new(
+                    dst.x() as f64,
+                    dst.y() as f64,
+                    dst.width() as f64,
+                    dst.height() as f64,
+                );
+                let matrix = [
+                    transform.scale_x() as f64,
+                    transform.skew_y() as f64,
+                    transform.skew_x() as f64,
+                    transform.scale_y() as f64,
+                    transform.translate_x() as f64,
+                    transform.translate_y() as f64,
+                ];
+                if let Some(source) = src {
+                    crate::renderer::bitmap_raster::prepare_cropped_bitmap(
+                        encoded.as_bytes(),
+                        bbox,
+                        matrix,
+                        sampling.profile,
+                        sampling.paper_grid,
+                        [
+                            source.x() as f64,
+                            source.y() as f64,
+                            source.width() as f64,
+                            source.height() as f64,
+                        ],
+                    )
+                } else {
+                    crate::renderer::bitmap_raster::prepare_bitmap(
+                        encoded.as_bytes(),
+                        bbox,
+                        matrix,
+                        sampling.profile,
+                        sampling.paper_grid,
+                    )
+                }
             })
             .flatten();
         let filtered = prepared
@@ -598,7 +740,7 @@ pub(super) fn draw_image_bytes(
         } else {
             sampling.options()
         };
-        if let Some(src) = src.as_ref() {
+        if let Some(src) = src.as_ref().filter(|_| filtered.is_none()) {
             canvas.draw_image_rect_with_sampling_options(
                 actual_image,
                 Some((src, SrcRectConstraint::Strict)),
@@ -987,7 +1129,9 @@ fn rasterize_svg_document_in_device_window(
     bytes: &[u8],
     window: SvgDeviceWindow,
 ) -> Option<Vec<u8>> {
-    if bytes.is_empty() || bytes.len() > MAX_SVG_FRAGMENT_BYTES {
+    // 완결 문서 경로(`rasterize_svg_document_to_png`)와 같은 문서 예산을 쓴다. 조각 상한을
+    // 쓰면 4MiB 를 넘는 완결 WMF/EPS 그림이 회색 자리표시자로 떨어진다(#8613).
+    if bytes.is_empty() || bytes.len() > MAX_SVG_DOCUMENT_BYTES {
         return None;
     }
     let options = svg_parse_options();

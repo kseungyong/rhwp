@@ -2,7 +2,7 @@
 kind: guide
 status: active
 canonical: mydocs/manual/README.md
-last_verified: 2026-10-23
+last_verified: 2026-10-28
 ---
 
 # manual 문서 지도
@@ -20,6 +20,7 @@ last_verified: 2026-10-23
 | Claude·Codex 재사용 capability 등록·중복 판단 | [에이전트 capability 카탈로그](agent_capability_registry.md) | 각 capability의 권위 playbook |
 | 외부 PR 검토, collaborator 처리, merge 후속 | [PR 리뷰·통합 워크플로우](pr_review_workflow.md) | [조건별 PR review 가이드](pr_review/README.md), [개발 환경 가이드](dev_environment_guide.md) |
 | rhwp 첫 외부 contributor PR | [PR 리뷰·통합 워크플로우](pr_review_workflow.md) | [첫 기여자 외부 PR 처리](pr_review/first_time_contributor.md), [조건별 PR review 가이드](pr_review/README.md) |
+| crates.io Rust/CLI/WASM 소비·초회 수동 게시·부분 실패 복구 | [crates.io 가이드](crates_io_guide.md) | [배포 가이드](publish_guide.md), [패키지 README](../../packaging/crates-io/README_PACKAGE.md) |
 | 로컬 빌드, 테스트, WASM 검증 | [개발 환경 가이드](dev_environment_guide.md) | [CLI 명령어 매뉴얼](cli_commands.md) |
 | 보안 때문에 제한되는 기능·자원 한도·일반 미지원 구분 | [보안 제한과 기능 사용 범위](security_feature_limits.md) | [CLI 명령어 매뉴얼](cli_commands.md), [에이전트 보안 매뉴얼](agent_codex/60_보안.md) |
 | 제품에서 선택적 Gym 평가 도구로 이동 | [선택적 Gym 안내](gym_optional_tool.md) | [Gym 벤치마크 운영 매뉴얼](gym_benchmark_operations.md) |
@@ -33,6 +34,7 @@ last_verified: 2026-10-23
 | CLI `--json`·MCP 도구 신규 추가 절차와 수용 기준 | [에이전트 표면 플레이북](agent_surface_playbook.md) | [CLI 명령어 매뉴얼](cli_commands.md), [MCP 통합 가이드](mcp_integration_guide.md) |
 | 실사례 여정 기반 버그 헌팅 | [버그 헌팅 playbook](bug_hunting_playbook.md) | [Claude bug-hunter 에이전트](../../.claude/agents/bug-hunter.md), [Codex bug-hunter Skill](../../.agents/skills/bug-hunter/SKILL.md), [정답지 비교 하네스](../../tools/fidelity_compare/README.md) |
 | 로컬 OWPML XML 스키마 자산 | [OWPML XML 스키마 reference](owpml_schema_reference.md) | [한컴 공식 OWPML 모델 참조 가이드](../tech/hwpx_hancom_reference.md) |
+| PDF 가져오기 개발자 온보딩·암호·Worker | [PDF 시작 안내](pdf_developer_onboarding.md) | [English](pdf_developer_onboarding_EN.md), [자원 정책](pdf_resource_policies.md), [코덱](pdf_image_codecs.md) |
 | PDF/SVG 기준 비교의 정책 | [시각 검증 문서 지도](verification/README.md) | [시각 검증 거버넌스](verification/visual_verification_governance.md), [PDF/SVG visual sweep 가이드](verification/visual_sweep_guide.md) |
 | RenderBackend 계약·픽스처 | [RenderBackend 계약 카탈로그](render_backend_contract_catalog.md) | [픽스처 목록](../tech/render_backend_fixture_catalog.md), [설계 배경](../tech/render_backend.md) |
 | Canvas·SVG·Native PNG 최종 출력 차이와 소비 경로 검증 | [출력 백엔드 소비 경로 검증](verification/renderer_backend_verification.md) | [시각 검증 거버넌스](verification/visual_verification_governance.md), [폰트 사고 대응](font_incident_response.md) |
@@ -41,6 +43,7 @@ last_verified: 2026-10-23
 | 페이지·서식·그림·폰트의 CLI 조회 | [rhwp-q 조회·진단 CLI](rhwp_query_cli.md) | [CLI 명령어 매뉴얼](cli_commands.md) |
 | AI 에이전트 호스트에 rhwp 를 MCP 도구로 연결 | [MCP 통합 가이드](mcp_integration_guide.md) | [CLI 명령어 매뉴얼](cli_commands.md), [CLI JSON 파이프라인 가이드](cli_json_pipeline_guide.md) |
 | 브라우저 확장 개발·배포 | [브라우저 확장 개발 가이드](browser_extension_dev_guide.md) | [Chrome/Edge 확장 빌드·배포](chrome_edge_extension_build_deploy.md) |
+| Studio PDF·링크·양식 단추·보호 복구 사용 | [Studio 문서 기능 가이드](studio_document_features.md) | [PDF 자원 정책](pdf_resource_policies.md), [보안 제한](security_feature_limits.md) |
 | Studio E2E·CDP 검증 | [E2E 조판 자동 검증](e2e_verification_guide.md) | [CDP E2E 가이드](e2e-cdp.md) |
 | Studio 스크롤·줌 계측과 surface/cache 비용 비교 | [개발 측정 패널 사용 안내](studio_scroll_probe_guide.md) | [#6042 최소 검증 증거](../working/assets/issue6042/README.md), [개발 환경 가이드](dev_environment_guide.md) |
 | 로컬 폰트 감지·이름·backend·정답지 불일치 대응 | [폰트 감지·대체 사고 대응 절차](font_incident_response.md) | [폰트 fallback 전략](../tech/font_fallback_strategy.md), [시각 검증 거버넌스](verification/visual_verification_governance.md) |
@@ -58,6 +61,8 @@ last_verified: 2026-10-23
 
 PDF 가져오기에서 필요한 JBIG2·JPEG 2000의 선택 빌드와 진단은
 [PDF 이미지 코덱 가이드](pdf_image_codecs.md)를 참고한다.
+CLI·Rust의 요청 프로필·명시적 한도와 Native 작업자 감독은
+[PDF 자원 정책](pdf_resource_policies.md)을 참고한다.
 
 ## HWP 원격 MCP 선택과 접근 범위
 

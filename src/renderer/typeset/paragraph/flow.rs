@@ -22,6 +22,18 @@ pub(in crate::renderer::typeset) fn place(
     input: ParagraphFlowInput<'_>,
     engine: &TypesetEngine,
 ) {
+    match place_with_storage(st, input, engine, &crate::storage::Unbounded) {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+pub(in crate::renderer::typeset) fn place_with_storage<S: crate::storage::Storage>(
+    st: &mut TypesetState,
+    input: ParagraphFlowInput<'_>,
+    engine: &TypesetEngine,
+    storage: &S,
+) -> Result<(), S::Error> {
     let dpi = engine.dpi;
     let ParagraphFlowInput {
         para_idx,
@@ -31,6 +43,7 @@ pub(in crate::renderer::typeset) fn place(
         styles,
         is_last_in_section,
     } = input;
+    collect_own_line_notes(st, engine, para_idx, para, fmt, styles);
     let stored_frame_shared_spacing =
         crate::renderer::float_placement::stored_frame_successor_shared_spacing_px(
             &st.paragraph_float_placements,
@@ -38,6 +51,37 @@ pub(in crate::renderer::typeset) fn place(
             fmt.spacing_before,
             st.current_height,
         );
+    let stored_frame_shared_spacing = if stored_frame_shared_spacing > 0.0 {
+        stored_frame_shared_spacing
+    } else {
+        crate::renderer::float_placement::stored_visible_host_successor_spacing(
+            &st.current_items,
+            paragraphs,
+            para_idx,
+            fmt.spacing_before,
+            (st.profile.hwpx_stored_layout() || st.profile.hwp5_stored_pagination_layout())
+                && !st.profile.session_edited(),
+            st.current_height,
+            dpi,
+        )
+    };
+    // [#8149] 인증 배치가 없는 빈 host 자리차지 표 상자 뒤도 같은 앞 간격 소비를 따른다.
+    let stored_frame_shared_spacing = if stored_frame_shared_spacing > 0.0 {
+        stored_frame_shared_spacing
+    } else {
+        crate::renderer::float_placement::empty_host_float_successor_absorbed_spacing_px(
+            st.current_items.last(),
+            paragraphs,
+            para_idx,
+            fmt.spacing_before,
+            (st.profile.hwpx_stored_layout() || st.profile.hwp5_stored_pagination_layout())
+                && !st.profile.session_edited(),
+            st.profile.hwpx_container(),
+            st.profile.hwp5_origin_hwpx(),
+            st.current_height,
+            dpi,
+        )
+    };
     st.reclaim_flow_by(stored_frame_shared_spacing.min(st.current_height));
     let previous_is_partial_table = st.current_items.last().is_some_and(
         |item| matches!(item, PageItem::PartialTable { para_index, .. } if *para_index < para_idx),
@@ -68,8 +112,7 @@ pub(in crate::renderer::typeset) fn place(
         split_safety,
         prev_is_partial_table,
         mut available,
-        footnote_margin_addback,
-    } = paragraph::prepare_fit_budget(
+    } = paragraph::prepare_fit_budget_with_storage(
         st,
         para_idx,
         para,
@@ -77,26 +120,30 @@ pub(in crate::renderer::typeset) fn place(
         paragraphs,
         engine.profile.get().session_edited(),
         dpi,
-    );
+        storage,
+    )?;
 
-    if paragraph::try_absorb_rowbreak_guide(
+    if paragraph::try_absorb_rowbreak_guide_with_storage(
         st,
         prev_is_partial_table,
         para,
         paragraphs,
         para_idx,
         dpi,
-    ) {
-        return;
+        storage,
+    )? {
+        return Ok(());
     }
 
     let early_format = paragraph::spacing::confirmed_format(st, para_idx, fmt, paragraphs);
     let early_format = early_format.as_ref().unwrap_or(fmt);
-    if paragraph::try_place_multicolumn_paragraph(st, para_idx, para, early_format, dpi) {
-        return;
+    if paragraph::try_place_multicolumn_paragraph_with_storage(
+        st, para_idx, para, fmt, dpi, storage,
+    )? {
+        return Ok(());
     }
 
-    if paragraph::try_absorb_empty_paragraph(
+    if paragraph::try_absorb_empty_paragraph_with_storage(
         st,
         para_idx,
         para,
@@ -104,8 +151,9 @@ pub(in crate::renderer::typeset) fn place(
         is_last_in_section,
         available,
         layout_drift_safety_px,
-    ) {
-        return;
+        storage,
+    )? {
+        return Ok(());
     }
 
     // 뒤 호스트의 절대 프레임이 저장 본문 재시작을 닫으면 분할 전에 소유를 예약한다.
@@ -148,6 +196,7 @@ pub(in crate::renderer::typeset) fn place(
                 dpi,
             ) {
                 st.defer_stored_frame(crate::renderer::typeset::DeferredStoredFrameControl {
+                    target_page: None,
                     following_body_para_index: None,
                     kind: crate::renderer::typeset::DeferredStoredFrameKind::AbsoluteShape,
                     para_index: owner,
@@ -212,11 +261,8 @@ pub(in crate::renderer::typeset) fn place(
                     if prefix_bottom <= physical_bottom {
                         let previous = st.available_height();
                         st.reserve_painted_footnote_area(height);
-                        // 진입에서 소비한 1회 각주 여백 환급도 함께 정산한다.
                         // float·본문 여유 등 다른 예약은 기존 예산에 그대로 남는다.
-                        available = (available - footnote_margin_addback + st.available_height()
-                            - previous)
-                            .max(0.0);
+                        available = (available + st.available_height() - previous).max(0.0);
                     }
                 }
             }
@@ -225,7 +271,7 @@ pub(in crate::renderer::typeset) fn place(
     if st.prefilled_line_prefixes.contains_key(&para_idx) {
         // 앞 쪽의 선행 조각이 소유한 줄을 whole-fit으로 다시 배치하지 않는다.
         let base_available = st.base_available_height();
-        paragraph::place_split_paragraph(
+        paragraph::place_split_paragraph_with_storage(
             st,
             para_idx,
             para,
@@ -241,8 +287,9 @@ pub(in crate::renderer::typeset) fn place(
             false,
             strict_after_empty_host_float,
             dpi,
-        );
-        return;
+            storage,
+        )?;
+        return Ok(());
     }
     let current_format = paragraph::spacing::confirmed_format(st, para_idx, fmt, paragraphs);
     let current_format = current_format.as_ref().unwrap_or(fmt);
@@ -259,6 +306,31 @@ pub(in crate::renderer::typeset) fn place(
         dpi,
     );
 
+    // 마지막 줄 앞의 줄이 참조한 각주는 그 뒤 본문 줄보다 먼저 쪽 아래를 차지한다.
+    // 마지막 줄의 각주는 들어가지 않으면 다음 쪽으로 이어지므로 통째 fit 에서 빼지 않는다.
+    let last_line = fmt.line_count().saturating_sub(1);
+    let mut earlier_notes: Vec<_> = st
+        .own_line_notes
+        .iter()
+        .filter(|note| note.para_index == para_idx && note.line < last_line)
+        .cloned()
+        .collect();
+    earlier_notes.sort_by_key(|note| (note.line, note.number));
+    let note_levels = st.own_line_note_levels(&earlier_notes, |line| {
+        available
+            - st.current_height
+            - fmt.spacing_before
+            - fmt.line_advances_sum(0..line)
+            - fmt.line_heights.get(line).copied().unwrap_or(0.0)
+    });
+    let own_note_cost = note_levels.last().map_or(0.0, |level| level.cost);
+    let whole_available = (available - own_note_cost).max(0.0);
+    if std::env::var_os("RHWP_DIAG_OWN_NOTES").is_some() && own_note_cost > 0.0 {
+        eprintln!(
+            "DIAG_OWN_WHOLE pi={para_idx} cost={own_note_cost:.1} available={whole_available:.1} current={:.1} fit_h={:.1} total={:.1}",
+            st.current_height, fmt.height_for_fit, fmt.total_height
+        );
+    }
     let paragraph::WholeFitDecision {
         fits,
         stored_vpos_rewind_break,
@@ -273,11 +345,11 @@ pub(in crate::renderer::typeset) fn place(
         strict_after_empty_host_float,
         forced_page_break_line,
         current_page_vpos_base,
-        available,
+        whole_available,
         dpi,
     );
     if fits {
-        paragraph::place_fitted_paragraph(
+        paragraph::place_fitted_paragraph_with_storage(
             st,
             para_idx,
             para,
@@ -288,11 +360,18 @@ pub(in crate::renderer::typeset) fn place(
             trimmed_sb_gate,
             body_bottom_vpos,
             dpi,
-        );
-        return;
+            storage,
+        )?;
+        st.register_own_line_notes_with_storage(
+            para_idx,
+            0..fmt.line_count(),
+            (fmt.total_height - fmt.height_for_fit).max(0.0),
+            storage,
+        )?;
+        return Ok(());
     }
 
-    if paragraph::try_place_overflow_paragraph(
+    if paragraph::try_place_overflow_paragraph_with_storage(
         st,
         para_idx,
         para,
@@ -307,11 +386,12 @@ pub(in crate::renderer::typeset) fn place(
         stored_vpos_rewind_break || stored_vpos_rewind_overflow_break,
         current_page_vpos_base,
         dpi,
-    ) {
-        return;
+        storage,
+    )? {
+        return Ok(());
     }
 
-    paragraph::place_after_failed_fit(
+    paragraph::place_after_failed_fit_with_storage(
         st,
         para_idx,
         para,
@@ -330,5 +410,116 @@ pub(in crate::renderer::typeset) fn place(
         native_hwp5_existing_footnote_boundary,
         current_page_vpos_base,
         dpi,
-    );
+        storage,
+    )?;
+
+    Ok(())
+}
+
+/// 문단의 본문 각주와 참조 줄을 모은다. 줄 대응은 저장 줄 상자가 측정 줄과
+/// 일대일일 때만 쓴다(재조판 줄은 저장 text_start 와 다른 컷을 가진다).
+fn collect_own_line_notes(
+    st: &mut TypesetState,
+    engine: &TypesetEngine,
+    para_idx: usize,
+    para: &Paragraph,
+    fmt: &FormattedParagraph,
+    styles: &ResolvedStyleSet,
+) {
+    let mut notes = Vec::new();
+    if fmt.line_count() == 0 || fmt.line_count() != para.line_segs.len() {
+        st.replace_own_line_notes(notes);
+        return;
+    }
+    let stored_profile =
+        st.profile.hwpx_stored_layout() || st.profile.hwp5_stored_pagination_layout();
+    let measure =
+        crate::renderer::typeset::notes::footnotes::measure::BodyFootnoteMeasure { engine, styles };
+    for (control_index, control) in para.controls.iter().enumerate() {
+        let crate::model::control::Control::Footnote(footnote) = control else {
+            continue;
+        };
+        if stored_profile
+            && !st.profile.session_edited()
+            && crate::renderer::stored_footnote_is_bodyless(footnote)
+        {
+            continue;
+        }
+        let Some(line) = crate::renderer::layout::control_line_seg_index(para, control_index)
+        else {
+            continue;
+        };
+        let block_content_height = measure.block_content_height(st, footnote, None);
+        let content_height =
+            block_content_height.unwrap_or_else(|| measure.content_height(st, footnote));
+        let mut lines = Vec::new();
+        for note_para in &footnote.paragraphs {
+            let composed = crate::renderer::composer::compose_paragraph(note_para);
+            if composed.lines.is_empty() || composed.lines.len() != note_para.line_segs.len() {
+                lines.clear();
+                break;
+            }
+            lines.extend(composed.lines.iter().map(|line| {
+                (
+                    crate::renderer::hwpunit_to_px(line.line_height, engine.dpi),
+                    crate::renderer::hwpunit_to_px(line.line_spacing, engine.dpi),
+                )
+            }));
+        }
+        let mut stored_split =
+            crate::renderer::typeset::notes::footnotes::boundary::native_hwp5_footnote_reset_fragments(
+                footnote, engine.dpi,
+            )
+            .filter(|split| !split.force_next_page);
+        if block_content_height.is_some() {
+            // 각주 안의 블록 표는 표 host 줄의 줄 높이·줄간격 밖을 차지한다. 조각 높이를
+            // 줄 합이 아니라 paint 와 같은 조각 측정에서 받아 비용·배치·예약이 같은 상자를 쓴다
+            // (i628 95쪽 각주 56: 줄 합 219.1px, 저장 사다리·paint·한컴 280.1px).
+            let fragment_height = |start_line: usize, end_line: usize| {
+                measure.block_content_height(
+                    st,
+                    footnote,
+                    Some(crate::renderer::pagination::FootnoteFragment {
+                        start_line,
+                        end_line,
+                        draw_separator: true,
+                        draw_number: start_line == 0,
+                    }),
+                )
+            };
+            if let Some(split) = stored_split.as_mut() {
+                if let (Some(prefix), Some(suffix)) = (
+                    fragment_height(split.prefix.start_line, split.prefix.end_line),
+                    fragment_height(split.suffix.start_line, split.suffix.end_line),
+                ) {
+                    split.prefix_height = prefix;
+                    split.suffix_height = suffix;
+                }
+            }
+            // 줄 단위 앞 조각 `0..end` 의 높이가 paint 조각 측정과 같도록 각 줄 높이에
+            // 그 줄까지의 전진을 싣는다(줄간격은 저장값 유지).
+            let prefix_heights: Option<Vec<f64>> = (1..=lines.len())
+                .map(|end| fragment_height(0, end))
+                .collect();
+            if let Some(prefix_heights) = prefix_heights {
+                let mut previous_end = 0.0;
+                let mut previous_spacing = 0.0;
+                for (line, end_height) in lines.iter_mut().zip(prefix_heights) {
+                    line.0 = (end_height - previous_end - previous_spacing).max(0.0);
+                    previous_end = end_height;
+                    previous_spacing = line.1;
+                }
+            }
+        }
+        notes.push(crate::renderer::typeset::OwnLineNote {
+            para_index: para_idx,
+            line,
+            control_index,
+            number: footnote.number,
+            content_height,
+            lines,
+            stored_split,
+        });
+    }
+    st.replace_own_line_notes(notes);
 }

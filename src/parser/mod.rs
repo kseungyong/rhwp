@@ -417,6 +417,7 @@ fn parse_hwp_inner_with_limits(
         }
     }?;
     document.seal_section_tail_provenance();
+    document.seal_loaded_memo_tails();
     Ok(document)
 }
 
@@ -472,6 +473,7 @@ fn parse_hwp_with_cfb(
         .consume(doc_info_data.len())
         .map_err(ParseError::CfbError)?;
     let (mut doc_info, doc_properties) = parse_doc_info_stream(&doc_info_data, encrypted)?;
+    doc_info::apply_v5024_strike_bits(&mut doc_info.char_shapes, &file_header.version);
     if let Ok(bytes) = cfb.read_stream_raw_limited(
         crate::model::native_font_program::HWP_STREAM,
         crate::model::native_font_program::MAX_BYTES,
@@ -481,9 +483,20 @@ fn parse_hwp_with_cfb(
     doc_info.raw_stream = Some(doc_info_data);
 
     // 4. BodyText 섹션별 파싱
+    //
+    // rhwp 저장 표지가 인증한 구역만 LineSeg tag bit 31 을 rhwp 합성 표지로 읽는다(#8939).
+    // 표지는 보조 스트림으로 남아 저장기가 원본 그대로 다시 쓰는 구역의 의미를 이어 받는다.
+    let rhwp_line_seg_sections = cfb
+        .read_stream_raw_limited(
+            crate::model::line_seg_tags::HWP_STREAM,
+            crate::model::line_seg_tags::MAX_BYTES,
+        )
+        .map(|bytes| crate::model::line_seg_tags::decode(&bytes))
+        .unwrap_or_default();
     let section_count = cfb.section_count();
     let sections = parse_sections_strict(
         &mut cfb,
+        &rhwp_line_seg_sections,
         section_count,
         compressed,
         distribution,
@@ -543,6 +556,7 @@ fn parse_hwp_with_cfb(
         .any(|(p, _)| p == crate::model::document::HWPX_ORIGIN_STREAM_PATH);
 
     let mut doc = Document {
+        memo_parents: Vec::new(),
         header: model_header,
         doc_properties,
         doc_info,
@@ -616,11 +630,39 @@ fn parse_hwp_with_cfb(
     if let Some(idx) = doc
         .extra_streams
         .iter()
+        .position(|(p, _)| p == crate::model::text_paint::HWP_STREAM)
+    {
+        let (_, bytes) = doc.extra_streams.remove(idx);
+        crate::model::text_paint::decode(&mut doc, &bytes);
+    }
+    if let Some(idx) = doc
+        .extra_streams
+        .iter()
         .position(|(p, _)| p == crate::model::hyperlink_format::HWP_STREAM)
     {
         let (_, bytes) = doc.extra_streams.remove(idx);
         if bytes.len() <= 16 * 1024 * 1024 {
             crate::model::hyperlink_format::decode(&mut doc, &bytes);
+        }
+    }
+    // 메모 댓글 관계. 읽지 못한 스트림은 원본으로 남긴다.
+    if let Some(idx) = doc
+        .extra_streams
+        .iter()
+        .position(|(p, _)| p == crate::model::memo_extended::HWP_STREAM)
+    {
+        let raw = &doc.extra_streams[idx].1;
+        let data = if doc.header.compressed {
+            cfb_reader::decompress_stream_limited(raw, crate::model::memo_extended::MAX_BYTES).ok()
+        } else {
+            Some(raw.clone())
+        };
+        if let Some(links) = data
+            .as_deref()
+            .and_then(crate::model::memo_extended::decode_hwp)
+        {
+            doc.extra_streams.remove(idx);
+            doc.memo_parents = links;
         }
     }
     Ok(doc)
@@ -800,16 +842,18 @@ fn decode_viewtext_paragraph_stream(
 
 fn parse_visible_section(
     data: &[u8],
+    previous: &mut [crate::model::document::Section],
     doc_info: &crate::model::document::DocInfo,
 ) -> Result<crate::model::document::Section, body_text::BodyTextError> {
     let projected = tracked_viewtext::project(data, doc_info)?;
-    body_text::parse_body_text_section(projected.as_deref().unwrap_or(data))
+    body_text::parse_section_with_previous(projected.as_deref().unwrap_or(data), previous)
 }
 
 /// CfbReader로 섹션들 파싱
 #[allow(clippy::too_many_arguments)]
 fn parse_sections_strict(
     cfb: &mut cfb_reader::CfbReader,
+    rhwp_line_seg_sections: &[[u8; 32]],
     section_count: u32,
     compressed: bool,
     distribution: bool,
@@ -874,7 +918,10 @@ fn parse_sections_strict(
             .consume(section_data.len())
             .map_err(ParseError::CfbError)?;
 
-        match parse_visible_section(&section_data, doc_info) {
+        let _rhwp_line_seg_tags = rhwp_line_seg_sections
+            .contains(&crate::model::line_seg_tags::section_digest(&section_data))
+            .then(body_text::RhwpLineSegTagScope::enter);
+        match parse_visible_section(&section_data, &mut sections, doc_info) {
             Ok(mut section) => {
                 // 원본 BodyText 스트림 보존 (라운드트립용)
                 section.raw_stream = Some(section_data);
@@ -947,6 +994,7 @@ fn parse_hwp_with_lenient(
         .consume(doc_info_data.len())
         .map_err(ParseError::CfbError)?;
     let (mut doc_info, doc_properties) = parse_doc_info_stream(&doc_info_data, encrypted)?;
+    doc_info::apply_v5024_strike_bits(&mut doc_info.char_shapes, &file_header.version);
     if let Ok(bytes) = lenient.read_stream_raw_limited(
         crate::model::native_font_program::HWP_STREAM,
         crate::model::native_font_program::MAX_BYTES,
@@ -1012,7 +1060,7 @@ fn parse_hwp_with_lenient(
             .consume(section_data.len())
             .map_err(ParseError::CfbError)?;
 
-        match parse_visible_section(&section_data, &doc_info) {
+        match parse_visible_section(&section_data, &mut sections, &doc_info) {
             Ok(mut section) => {
                 section.raw_stream = Some(section_data);
                 sections.push(section);
@@ -1058,6 +1106,7 @@ fn parse_hwp_with_lenient(
     };
 
     let mut doc = Document {
+        memo_parents: Vec::new(),
         header: model_header,
         doc_properties,
         doc_info,
@@ -1158,7 +1207,11 @@ fn load_bin_data_content_lenient(
         let is_storage = match bd.data_type {
             BinDataType::Embedding => false,
             BinDataType::Storage => true,
-            BinDataType::Link => continue,
+            BinDataType::Link => {
+                // 연결 레코드도 순번 자리를 지켜야 뒤 그림이 제 항목을 가리킨다.
+                contents.push(crate::model::bin_data::hwp5_link_slot());
+                continue;
+            }
         };
 
         let ext = if is_storage {
@@ -1341,7 +1394,34 @@ pub fn parse_pdf_with_metadata(
     data: &[u8],
     options: &pdf::PdfImportOptions,
 ) -> Result<ParsedDocument, ParseError> {
-    parse_pdf_unsealed(data, options).map(seal_parsed_document)
+    parse_pdf_with_metadata_and_policy(data, options, pdf::PdfImportPolicy::default())
+}
+
+/// Explicit policy with the same provenance sealing as format auto-detection.
+#[cfg(feature = "pdf-import")]
+pub fn parse_pdf_with_metadata_and_policy(
+    data: &[u8],
+    options: &pdf::PdfImportOptions,
+    policy: pdf::PdfImportPolicy,
+) -> Result<ParsedDocument, ParseError> {
+    parse_pdf_unsealed_with_policy(data, options, policy).map(seal_parsed_document)
+}
+
+#[cfg(feature = "pdf-import")]
+pub(crate) fn parse_pdf_with_metadata_and_request(
+    data: &[u8],
+    options: &pdf::PdfImportOptions,
+    policy: pdf::PdfImportPolicy,
+    request: std::sync::Arc<pdf_oxide::import_limits::ImportBudget>,
+    progress: &mut dyn FnMut(pdf::PdfImportProgress) -> Result<(), pdf::PdfImportError>,
+) -> Result<ParsedDocument, ParseError> {
+    let result = pdf::parse_pdf_with_request_and_progress(data, options, policy, request, progress)
+        .map_err(ParseError::PdfError)?;
+    Ok(seal_parsed_document(ParsedDocument {
+        document: result.document,
+        hml_metadata: None,
+        pdf_metadata: Some(result.metadata),
+    }))
 }
 
 #[cfg(feature = "pdf-import")]
@@ -1349,12 +1429,32 @@ fn parse_pdf_unsealed(
     data: &[u8],
     options: &pdf::PdfImportOptions,
 ) -> Result<ParsedDocument, ParseError> {
-    let result = pdf::parse_pdf_with_options(data, options).map_err(ParseError::PdfError)?;
+    parse_pdf_unsealed_with_policy(data, options, pdf::PdfImportPolicy::default())
+}
+
+#[cfg(feature = "pdf-import")]
+fn parse_pdf_unsealed_with_policy(
+    data: &[u8],
+    options: &pdf::PdfImportOptions,
+    policy: pdf::PdfImportPolicy,
+) -> Result<ParsedDocument, ParseError> {
+    let result = pdf::parse_pdf_with_policy(data, options, policy).map_err(ParseError::PdfError)?;
     Ok(ParsedDocument {
         document: result.document,
         hml_metadata: None,
         pdf_metadata: Some(result.metadata),
     })
+}
+
+#[cfg(feature = "pdf-import")]
+pub(crate) fn parse_pdf_editor_hwpx(
+    data: &[u8],
+    reservation: std::sync::Arc<dyn crate::storage::Reservation>,
+) -> Result<ParsedDocument, ParseError> {
+    hwpx::parse_hwpx_with_reservation(data, Some(reservation))
+        .map_err(ParseError::from)
+        .map(without_hml_metadata)
+        .map(seal_parsed_document)
 }
 
 /// 포맷 자동 감지 후 공통 IR과 입력 메타데이터를 파싱한다.
@@ -1381,7 +1481,20 @@ fn parse_document_inner(
     parse_document_inner_unsealed(data, password).map(seal_parsed_document)
 }
 
-fn seal_parsed_document(mut parsed: ParsedDocument) -> ParsedDocument {
+/// `DocumentCore` 로 여는 경로 전용 — DocInfo 만 봉인하고 본문 봉인은 호출자에게 맡긴다.
+///
+/// `DocumentCore::from_parsed_document` 는 로드 픽스업과 첫 paginate 뒤 본문을 다시
+/// 봉인하고, 그 사이에는 본문 봉인 값을 읽지 않는다(편집 신호는 봉인 유무와
+/// `raw_stream` 유무만 보는데 로드 픽스업은 `raw_stream` 을 지우지 않는다). 파서 말미의
+/// 본문 봉인은 덮어써질 뿐이므로 본문 전체 직렬화·해시를 한 번 줄인다.
+pub(crate) fn parse_document_for_core(
+    data: &[u8],
+    password: Option<&[u8]>,
+) -> Result<ParsedDocument, ParseError> {
+    parse_document_inner_unsealed(data, password).map(seal_parsed_doc_info)
+}
+
+fn seal_parsed_doc_info(mut parsed: ParsedDocument) -> ParsedDocument {
     // [#4493] 파싱과 모든 load fixup 이 끝난 마지막 지점에서 DocInfo raw 출처를
     // 봉인한다 — 이보다 앞(포맷별 파서 내부)에서 봉인하면 HWP3-변환본 spacing
     // 반감 같은 로드 보정이 봉인을 깨서, 무변경 문서의 원본 바이트 통과가 죽는다.
@@ -1390,9 +1503,14 @@ fn seal_parsed_document(mut parsed: ParsedDocument) -> ParsedDocument {
         .document
         .doc_info
         .seal_raw_provenance(&parsed.document.doc_properties);
+    parsed
+}
+
+fn seal_parsed_document(parsed: ParsedDocument) -> ParsedDocument {
+    let mut parsed = seal_parsed_doc_info(parsed);
     // [#4488/#4495] 본문 Section raw_stream 과 하위 컨트롤 raw 레코드도 같은
-    // 지점에서 봉인한다. DocumentCore 로 열리는 경로는 from_bytes 의 로드 픽스업
-    // (손상 lineseg 제거 등) 뒤에 다시 봉인된다.
+    // 지점에서 봉인한다. DocumentCore 로 열리는 경로는 이 봉인을 건너뛰고
+    // (`parse_document_for_core`) from_bytes 의 로드 픽스업 뒤에 한 번 봉인한다.
     parsed.document.seal_body_raw_provenance();
     parsed
 }
@@ -1442,7 +1560,10 @@ fn parse_document_inner_unsealed(
             })
         }
         #[cfg(feature = "pdf-import")]
-        FileFormat::Pdf => parse_pdf_unsealed(data, &pdf::PdfImportOptions::default()),
+        FileFormat::Pdf => parse_pdf_unsealed(
+            data,
+            &pdf::PdfImportOptions::with_password(password).map_err(ParseError::PdfError)?,
+        ),
         #[cfg(not(feature = "pdf-import"))]
         FileFormat::Pdf => Err(ParseError::UnsupportedFormat {
             code: "PDF_IMPORT_DISABLED",
@@ -2035,7 +2156,11 @@ fn load_bin_data_content(
         let is_storage = match bd.data_type {
             BinDataType::Embedding => false,
             BinDataType::Storage => true,
-            BinDataType::Link => continue,
+            BinDataType::Link => {
+                // 연결 레코드도 순번 자리를 지켜야 뒤 그림이 제 항목을 가리킨다.
+                contents.push(crate::model::bin_data::hwp5_link_slot());
+                continue;
+            }
         };
 
         // 스토리지 이름 생성: BIN0001.jpg (이미지) / BIN0001.OLE (OLE)

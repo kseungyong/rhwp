@@ -127,6 +127,7 @@ impl LayoutEngine {
                 _ => 0.0,
             }
             + stored_mixed_footer_leading;
+        let frame = self.header_footer_frame(area, is_header);
         for (i, para) in hf_paragraphs.iter().enumerate() {
             let paragraph_origin_y = y_offset;
             // 테이블 컨트롤이 있으면 테이블 렌더링
@@ -136,7 +137,48 @@ impl LayoutEngine {
                 .controls
                 .iter()
                 .any(|c| matches!(c, Control::Picture(_)));
-            if has_table {
+            if has_table
+                && para.controls.iter().all(|control| {
+                    !matches!(control, Control::Table(table) if !table.common.treat_as_char)
+                })
+            {
+                // 글줄에 참여하는 표는 본문·각주와 같은 줄 배치 결과를 소비한다.
+                // 표만 따로 배치하면 바깥여백과 같은 줄의 앞뒤 글을 잃는다.
+                if let Some((plan, measured)) =
+                    self.header_footer_inline_table_plan(para, i, styles, area, y_offset)
+                {
+                    self.layout_inline_flow_plan(
+                        tree,
+                        area_node,
+                        para,
+                        styles,
+                        area,
+                        outer_section_index.unwrap_or(0),
+                        i,
+                        bin_data_content,
+                        &measured,
+                        &plan,
+                    );
+                    y_offset = area.y + plan.end;
+                } else {
+                    let comp = self.compose_header_footer_paragraph(para, page_number, styles);
+                    y_offset = self
+                        .layout_inline_table_paragraph(
+                            tree,
+                            area_node,
+                            para,
+                            Some(&comp),
+                            styles,
+                            area,
+                            y_offset,
+                            outer_section_index.unwrap_or(0),
+                            i,
+                            bin_data_content,
+                            &[],
+                        )
+                        .flow_bottom;
+                }
+            } else if has_table {
                 for (ci, ctrl) in para.controls.iter().enumerate() {
                     if let Control::Table(t) = ctrl {
                         let alignment = styles
@@ -169,6 +211,11 @@ impl LayoutEngine {
                         };
                         let table_y = y_offset + line_anchor_offset;
                         let table_area = table_area.unwrap_or(area);
+                        let frame_origin = self.header_footer_table_frame_origin(
+                            t.as_ref(),
+                            &frame,
+                            paragraph_origin_y,
+                        );
                         y_offset = self.layout_table(
                             tree,
                             area_node,
@@ -193,7 +240,7 @@ impl LayoutEngine {
                             false,
                             is_header,
                             0.0,
-                            None,
+                            frame_origin,
                             Self::standalone_table_char_border_fill(Some(para), t.as_ref(), styles),
                         );
                     }
@@ -348,6 +395,8 @@ impl LayoutEngine {
                 // 머리말·꼬리말의 Paper/Page 개체도 이 틀 안에서 오프셋을 잰다.
                 // 그림의 배치 계약과 같으며, 본문의 물리 용지 원점을 전달하면
                 // Paper-Left/Right 글상자가 본문 여백 밖으로 이동한다.
+                // 꼬리말 틀의 높이는 꼬리말 여백이다(`header_footer_frame`) — `area` 는
+                // 아래 여백까지 품어 아래 정렬 글상자가 쪽 맨 아래로 내려갔다.
                 for (ci, ctrl) in para.controls.iter().enumerate() {
                     if let Control::Shape(_) = ctrl {
                         self.layout_shape(
@@ -359,8 +408,8 @@ impl LayoutEngine {
                             if has_tac_shape { hf_shape_section } else { 0 },
                             styles,
                             area,
-                            area,
-                            area,
+                            &frame,
+                            &frame,
                             y_offset,
                             Alignment::Left,
                             bin_data_content,
@@ -420,8 +469,8 @@ impl LayoutEngine {
                             0,
                             styles,
                             area,
-                            area,
-                            area,
+                            &frame,
+                            &frame,
                             paragraph_origin_y,
                             Alignment::Left,
                             bin_data_content,
@@ -432,9 +481,7 @@ impl LayoutEngine {
                     }
                 }
             }
-            if y_offset >= area.y + area.height {
-                break;
-            }
+            // 한컴은 머리말·꼬리말 틀을 넘친 문단도 본문 위에 겹쳐 그린다. 넘친 문단을 버리지 않는다.
         }
         let local_composed: Vec<_> = hf_paragraphs
             .iter()
@@ -460,5 +507,173 @@ impl LayoutEngine {
         );
         *self.para_border_ranges.borrow_mut() = parent_border_ranges;
         self.border_box_override.set(parent_border_override);
+    }
+
+    /// 저장 줄이 없는 TAC 표는 본문과 같은 상자·줄 소속·점유 결과를 사용한다.
+    /// 글자용 합성 기준선으로 표 상단을 다시 추측하지 않는다. 필드 치환과
+    /// 그림·도형의 머리말 전용 주소는 각자의 기존 소비 경로에 남긴다.
+    fn header_footer_inline_table_plan(
+        &self,
+        para: &Paragraph,
+        para_index: usize,
+        styles: &ResolvedStyleSet,
+        area: &LayoutRect,
+        y: f64,
+    ) -> Option<(
+        crate::renderer::inline_flow::InlineFlowPlan,
+        Vec<MeasuredTable>,
+    )> {
+        if !crate::renderer::para_has_no_stored_line_segs(para)
+            || para
+                .text
+                .chars()
+                .any(|ch| matches!(ch, '\u{0015}' | '\u{0016}' | '\u{0017}'))
+            || !para.controls.iter().all(|control| {
+                matches!(control, Control::Table(table) if table.common.treat_as_char)
+                    || matches!(
+                        control,
+                        Control::SectionDef(_)
+                            | Control::ColumnDef(_)
+                            | Control::PageNumberPos(_)
+                            | Control::PageNumCtrl(_)
+                    )
+            })
+        {
+            return None;
+        }
+        let style = styles.para_styles.get(para.para_shape_id as usize)?;
+        let profile = self.profile.get();
+        let measurer = crate::renderer::height_measurer::HeightMeasurer::new(self.dpi)
+            .with_stored_geometry_policy(profile.stored_geometry_policy())
+            .with_native_hwp5(profile.hwp5_stored_pagination_layout())
+            .with_hwpx_stored_layout(profile.hwpx_stored_layout())
+            .with_session_edited(profile.session_edited());
+        let measured: Vec<_> = para
+            .controls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, control)| match control {
+                Control::Table(table) => {
+                    Some(measurer.measure_table(table, para_index, index, styles))
+                }
+                _ => None,
+            })
+            .collect();
+        let container = LayoutRect {
+            x: area.x + style.margin_left,
+            width: area.width - style.margin_left - style.margin_right,
+            ..*area
+        };
+        let (body_x, body_y, body_width, body_height) = self.current_body_area.get();
+        let body = LayoutRect {
+            x: body_x,
+            y: body_y,
+            width: body_width,
+            height: body_height,
+        };
+        let paper = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: self.current_paper_width.get(),
+            height: self.current_page_height.get(),
+        };
+        let frame = crate::renderer::float_placement::ObjectPlacementFrame {
+            container: &container,
+            column: area,
+            body: &body,
+            paper: &paper,
+            paragraph_y: y,
+            alignment: style.alignment,
+            dpi: self.dpi,
+        };
+        let mut plan =
+            crate::renderer::inline_flow::plan(para, para_index, styles, &measured, &frame, &[])?;
+        plan.relative_to(area.x, area.y);
+        Some((plan, measured))
+    }
+
+    /// 머리말·꼬리말 안 용지·쪽 기준 개체를 재는 틀.
+    ///
+    /// 한/글은 머리말·꼬리말에 놓인 개체의 용지·쪽 기준 오프셋을 물리 용지나 본문
+    /// 영역이 아니라 그 머리말·꼬리말 틀에서 잰다(그림은 #6608). 틀은 본문 왼쪽 끝·
+    /// 본문 폭, 세로는 머리말이면 위 여백에서 머리말 여백까지, 꼬리말이면 본문
+    /// 아래끝에서 꼬리말 여백까지다.
+    ///
+    /// `footer_area` 는 본문 아래끝부터 아래 여백까지 품는다(쪽 계산이 쓰는 rect 라
+    /// 그대로 둔다). 꼬리말 틀의 높이는 `build_footer` 의 `margin_footer` 와 같은
+    /// 관용구로 되찾는다 — 아래 정렬 개체가 아래 여백 끝까지 내려가지 않게.
+    pub(super) fn header_footer_frame(&self, area: &LayoutRect, is_header: bool) -> LayoutRect {
+        if is_header {
+            return *area;
+        }
+        let page_height = self.current_page_height.get();
+        if page_height <= 0.0 {
+            return *area;
+        }
+        LayoutRect {
+            height: (page_height - (area.y + area.height)).max(0.0),
+            ..*area
+        }
+    }
+
+    /// 머리말·꼬리말에 직접 놓인 용지·쪽 기준 부동 표의 원점 `(x, 위끝)`.
+    ///
+    /// `layout_table` 은 이 표를 본문 표처럼 용지 원점에서 재어, 위 여백만큼 위로
+    /// 올린 머리말 표(용지 기준 세로 −위 여백)를 쪽 위로 내보내 잘랐고, 꼬리말 표는
+    /// 쪽 맨 위(용지)·본문 위끝(쪽)·용지 오른쪽 아래 구석(아래·오른쪽 정렬)에 그렸다.
+    /// 한/글 2024 PDF 실측: 글앞으로·자리차지·글뒤로·어울림 넷 모두 틀 원점이다.
+    /// 정렬과 바깥 여백은 본문의 쪽·종이 기준 표와 같은 식이고(가로
+    /// `compute_table_x_position`, 세로 `absolute_table_vertical_geometry`) 기준만
+    /// `header_footer_frame` 이다. 문단·단 기준 가로는 종전 경로가 이미 머리말·꼬리말
+    /// 영역(`table_area`) 안에서 풀므로 `None` 으로 남긴다.
+    pub(super) fn header_footer_table_frame_origin(
+        &self,
+        table: &crate::model::table::Table,
+        frame: &LayoutRect,
+        paragraph_y: f64,
+    ) -> Option<(Option<f64>, f64)> {
+        if !table.common.treat_as_char
+            && table.common.vert_rel_to == VertRelTo::Para
+            && table.common.vert_align == VertAlign::Top
+            && table.common.text_wrap == TextWrap::TopAndBottom
+            && table.common.flow_with_text
+        {
+            // 본문 수용 계획이 없는 머리말·꼬리말도 문단 원점에서 바깥 상자를 연다.
+            // 가로 여백은 compute_table_x_position이 소비하므로 다시 더하지 않는다.
+            let lead =
+                crate::renderer::float_placement::topbottom_flow_vertical_offset_hu(&table.common);
+            return Some((
+                None,
+                paragraph_y + hwpunit_to_px(lead + i32::from(table.outer_margin_top), self.dpi),
+            ));
+        }
+        if table.common.treat_as_char
+            || !matches!(table.common.vert_rel_to, VertRelTo::Paper | VertRelTo::Page)
+        {
+            return None;
+        }
+        let width = hwpunit_to_px(signed_hwpunit(table.common.width).max(0), self.dpi);
+        let height = hwpunit_to_px(signed_hwpunit(table.common.height).max(0), self.dpi);
+        let x = match table.common.horz_rel_to {
+            HorzRelTo::Paper | HorzRelTo::Page => {
+                let h_offset =
+                    hwpunit_to_px(signed_hwpunit(table.common.horizontal_offset), self.dpi);
+                let slack = (frame.width - width).max(0.0);
+                Some(match table.common.horz_align {
+                    HorzAlign::Left | HorzAlign::Inside => frame.x + h_offset,
+                    HorzAlign::Center => frame.x + slack / 2.0 + h_offset,
+                    HorzAlign::Right | HorzAlign::Outside => frame.x + slack - h_offset,
+                })
+            }
+            HorzRelTo::Column | HorzRelTo::Para => None,
+        };
+        let (top, _) = crate::renderer::float_placement::absolute_table_vertical_geometry(
+            table,
+            frame.y,
+            frame.height,
+            height,
+            self.dpi,
+        );
+        Some((x, top))
     }
 }

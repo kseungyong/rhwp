@@ -88,6 +88,13 @@ fn project_where(
     para: &Paragraph,
     owns: impl Fn(AutoNumberType) -> bool,
 ) {
+    if !para
+        .controls
+        .iter()
+        .any(|control| matches!(control, Control::AutoNumber(_)))
+    {
+        return;
+    }
     let sources = para.control_source_positions();
     for (index, control) in para.controls.iter().enumerate() {
         let Control::AutoNumber(number) = control else {
@@ -114,6 +121,7 @@ fn project_where(
             space_metric: SpaceMetric::Stored,
             regenerated_font_metrics: super::text_metric_origin::regenerated_row(para, 0),
             literal_figure_space: false,
+            literal_soft_hyphen: false,
             ..Default::default()
         };
         for run in super::split_runs_by_lang(vec![run]) {

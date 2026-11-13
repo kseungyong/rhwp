@@ -15,8 +15,9 @@ use crate::model::shape::{common_obj_offsets, ShapeObject};
 /// 밴드는 **위치·크기·기준·정렬·어울림 종류·바깥 여백**이 함께 정하므로 전부 넣는다.
 /// 글자처럼 취급(`treat_as_char`)은 밴드를 만들지 않지만, 그 토글 자체가 밴드의
 /// 유무를 바꾸므로 포함한다.
+/// [#8399] 어울림 도형도 같은 밴드를 만든다 — 도형 속성 편집이 같은 지문을 쓴다.
 #[derive(PartialEq, Eq)]
-struct PictureBandGeometry {
+pub(super) struct PictureBandGeometry {
     horizontal_offset: i32,
     vertical_offset: i32,
     width: u32,
@@ -30,7 +31,9 @@ struct PictureBandGeometry {
     margin: (i16, i16, i16, i16),
 }
 
-fn picture_band_geometry(common: &crate::model::shape::CommonObjAttr) -> PictureBandGeometry {
+pub(super) fn picture_band_geometry(
+    common: &crate::model::shape::CommonObjAttr,
+) -> PictureBandGeometry {
     PictureBandGeometry {
         horizontal_offset: common.horizontal_offset as i32,
         vertical_offset: common.vertical_offset as i32,
@@ -1252,6 +1255,166 @@ impl DocumentCore {
 
         caption_created
     }
+    /// 띄운 그림(글자처럼 취급 아님)을 다른 문단·셀 문단으로 옮겨 붙이고 위치를 새로 정한다.
+    ///
+    /// 개체를 끌어 다른 쪽에 놓으면 한컴은 개체의 조판 부호(앵커)를 놓은 자리의 문단으로
+    /// 옮긴다. 앵커가 원래 쪽에 남으면 개체는 원래 쪽 기준으로 그려져 쪽 밖으로 잘린다.
+    /// 그림 데이터(BinData)는 그대로 두고 컨트롤만 옮긴다. 셀 경로가 비면 본문 문단이다.
+    /// 오프셋은 그림의 기존 위치 기준(가로·세로)에 대한 HWPUNIT 값이다. 표 칸 문단으로 옮기면
+    /// 기준을 세로 문단·가로 단으로 바꾸고 본문 영역 제한을 켠다(한컴 칸 그림 저장 형태). 이때
+    /// 오프셋은 그 칸 문단 기준으로 해석되므로, 호출자는 옮긴 뒤 실제 배치와의 차이를 보정한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relocate_floating_picture_native(
+        &mut self,
+        src_section: usize,
+        src_para: usize,
+        src_cell_path: &[(usize, usize, usize)],
+        src_control: usize,
+        dst_section: usize,
+        dst_para: usize,
+        dst_char_offset: usize,
+        dst_cell_path: &[(usize, usize, usize)],
+        horz_offset: i32,
+        vert_offset: i32,
+    ) -> Result<String, HwpError> {
+        if dst_section >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                dst_section
+            )));
+        }
+        // 옮기기 전에 도착 문단이 있는지 확인해, 실패하면 문서를 바꾸지 않는다.
+        Self::resolve_cell_paragraph_mut(
+            &mut self.document.sections[dst_section],
+            dst_para,
+            dst_cell_path,
+        )?;
+        // 도착 컨테이너의 종류도 제거 전에 검증한다. 그림 캡션 등 지원하지 않는
+        // 경로를 나중에 거절하면 원본 그림만 먼저 사라질 수 있다.
+        let into_table_cell = !dst_cell_path.is_empty()
+            && !Self::cell_path_terminates_at_textbox(
+                &self.document.sections[dst_section],
+                dst_para,
+                dst_cell_path,
+            )?;
+        let picture = {
+            let section = self.document.sections.get_mut(src_section).ok_or_else(|| {
+                HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", src_section))
+            })?;
+            let para = Self::resolve_cell_paragraph_mut(section, src_para, src_cell_path)?;
+            match para.controls.get(src_control) {
+                Some(Control::Picture(pic)) if !pic.common.treat_as_char => {}
+                Some(Control::Picture(_)) => {
+                    return Err(HwpError::RenderError(
+                        "글자처럼 취급하는 그림은 옮겨 붙일 수 없습니다".to_string(),
+                    ))
+                }
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "지정된 컨트롤이 그림이 아닙니다".to_string(),
+                    ))
+                }
+            }
+            let removed = para.remove_control(src_control);
+            Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+            section.raw_stream = None;
+            removed
+        };
+        if src_cell_path.is_empty() {
+            if let Some(active) = self.active_field.as_mut() {
+                if active.section_idx == src_section
+                    && active.para_idx == src_para
+                    && active.cell_path.is_none()
+                    && active.control_idx > src_control
+                {
+                    active.control_idx -= 1;
+                }
+            }
+        }
+        let dst_path = if dst_section == src_section && dst_para == src_para {
+            Self::path_after_control_removal(src_cell_path, src_control, dst_cell_path)
+        } else {
+            dst_cell_path.to_vec()
+        };
+        let mut picture = picture;
+        if let Control::Picture(pic) = &mut picture {
+            pic.common.horizontal_offset = horz_offset as u32;
+            pic.common.vertical_offset = vert_offset as u32;
+            if into_table_cell {
+                // 표 칸 문단 안 그림은 한컴 저장본처럼 세로 문단·가로 단 기준에 본문 영역 제한(bit 13)을
+                // 켠다. 종이 기준이나 제한 없음이면 한컴은 칸이 아니라 바깥 문단·종이 기준으로 그린다.
+                let common = &mut pic.common;
+                common.vert_rel_to = crate::model::shape::VertRelTo::Para;
+                common.horz_rel_to = crate::model::shape::HorzRelTo::Column;
+                common.flow_with_text = true;
+                common.attr =
+                    (common.attr & !((0x3 << 3) | (0x3 << 8))) | (2 << 3) | (2 << 8) | (1 << 13);
+            }
+        }
+        let new_ctrl_idx = {
+            let section = &mut self.document.sections[dst_section];
+            section.raw_stream = None;
+            let target = Self::resolve_cell_paragraph_mut(section, dst_para, &dst_path)?;
+            let new_ctrl_idx = Self::control_insert_index(target, dst_char_offset);
+            target.align_ctrl_data_records();
+            target.controls.insert(new_ctrl_idx, picture);
+            target.ctrl_data_records.insert(new_ctrl_idx, None);
+            target.shift_for_inline_control_insert(new_ctrl_idx, dst_char_offset);
+            target.control_mask |= 0x00000800;
+            new_ctrl_idx
+        };
+        if let Some(&(table_idx, _, _)) = src_cell_path.first() {
+            self.mark_cell_control_dirty(src_section, src_para, table_idx);
+        }
+        if let Some(&(table_idx, _, _)) = dst_path.first() {
+            self.mark_cell_control_dirty(dst_section, dst_para, table_idx);
+        }
+        for section_idx in [src_section, dst_section] {
+            self.mark_section_dirty(section_idx);
+            self.recompose_section(section_idx);
+        }
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::PictureDeleted {
+            section: src_section,
+            para: src_para,
+            ctrl: src_control,
+        });
+        self.event_log.push(DocumentEvent::PictureInserted {
+            section: dst_section,
+            para: dst_para,
+        });
+        // 소비자는 삭제 전 hit-test 경로를 재사용하지 않고 실제 도착 소유 경로를 쓴다.
+        let cell_path: Vec<_> = dst_path
+            .iter()
+            .map(|&(control, cell, para)| {
+                serde_json::json!({
+                    "controlIndex": control, "cellIndex": cell, "cellParaIndex": para
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "ok": true, "sec": dst_section, "paraIdx": dst_para,
+            "controlIdx": new_ctrl_idx, "cellPath": cell_path
+        })
+        .to_string())
+    }
+
+    /// 같은 본문 문단 아래에서 `src_path` 문단의 `removed` 번 컨트롤이 빠진 뒤의 `dst_path`.
+    /// 도착 경로가 그 문단의 뒤쪽 컨트롤(표)을 거치면 번호가 하나 당겨진다.
+    fn path_after_control_removal(
+        src_path: &[(usize, usize, usize)],
+        removed: usize,
+        dst_path: &[(usize, usize, usize)],
+    ) -> Vec<(usize, usize, usize)> {
+        let mut path = dst_path.to_vec();
+        let depth = src_path.len();
+        if path.len() > depth && path[..depth] == *src_path && path[depth].0 > removed {
+            path[depth].0 -= 1;
+        }
+        path
+    }
+
     /// 그림 컨트롤을 문단에서 삭제한다 (네이티브).
     pub fn delete_picture_control_native(
         &mut self,
@@ -1324,33 +1487,11 @@ impl DocumentCore {
     /// 기존 이미지와 스트림 이름이 충돌해 저장 시 이미지가 뒤바뀌거나
     /// 소실된다. (insert_picture_native 와 그림 지정이 규칙 공유.)
     pub(crate) fn register_embedded_bin_data(&mut self, image_data: &[u8], extension: &str) -> u16 {
-        use crate::model::bin_data::{
-            BinData, BinDataCompression, BinDataContent, BinDataStatus, BinDataType,
-        };
-        let position_id = self.document.bin_data_content.len() as u16 + 1;
-        let storage_id = self.document.next_bin_data_storage_id();
-        self.document.bin_data_content.push(BinDataContent {
-            id: storage_id,
-            data: crate::model::bin_data::BinDataBytes::from_shared(image_data.to_vec()),
-            extension: extension.to_string(),
-        });
-        // attr: bits 0-3=1(Embedding), bits 4-5=0(Default), bits 8-9=1(Success)
-        let bin_attr: u16 = 0x0101;
-        self.document.doc_info.bin_data_list.push(BinData {
-            raw_data: None,
-            attr: bin_attr,
-            data_type: BinDataType::Embedding,
-            compression: BinDataCompression::Default,
-            status: BinDataStatus::Success,
-            abs_path: None,
-            rel_path: None,
-            storage_id,
-            extension: Some(extension.to_string()),
-        });
-        self.document.doc_info.raw_stream = None; // DocInfo 재직렬화
-                                                  // [#3315] 여기서 bin_data_epoch 를 올리지 않는다 — 새 id 를 덧붙일 뿐 기존
-                                                  // id→바이트는 그대로다. 올리면 무관한 그림의 소비자 캐시까지 함께 버려진다.
-        position_id
+        crate::model::bin_data::register_embedded_bin_data(
+            &mut self.document,
+            image_data,
+            extension,
+        )
     }
 
     /// [Task #2230] 기존 Picture 컨트롤에 이미지를 지정한다 — 그림 미지정
@@ -1498,9 +1639,91 @@ impl DocumentCore {
         paper_offset_x_hu: Option<i32>,
         paper_offset_y_hu: Option<i32>,
     ) -> Result<String, HwpError> {
-        use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
+        self.insert_picture_native_anchored(
+            section_idx,
+            para_idx,
+            char_offset,
+            cell_path,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+            paper_offset_x_hu,
+            paper_offset_y_hu,
+            false,
+        )
+    }
+
+    /// 표 셀 경로의 그림을 **그 셀 문단 안**에 넣는다 (`cell_path` 필수).
+    ///
+    /// [`Self::insert_picture_native`] 의 셀 분기는 그림을 표를 가진 본문 문단에 띄운다(#1151).
+    /// 한컴에서 셀 안 커서로 서명·도장을 넣고 저장한 문서는 그림을 셀 문단의 컨트롤로 담는다
+    /// (가로 기준 단, 세로 기준 문단). 그렇게 넣어야 행 높이·표 이동·쪽 나눔에서 그림이 셀과
+    /// 함께 움직인다. 오프셋은 단·문단 기준(HWPUNIT, 음수 허용)이며 `None` 이면 0 이다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_picture_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        cell_path: &[(usize, usize, usize)],
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        offset_x_hu: Option<i32>,
+        offset_y_hu: Option<i32>,
+    ) -> Result<String, HwpError> {
+        if cell_path.is_empty() {
+            return Err(HwpError::RenderError(
+                "셀 안 그림 넣기에는 셀 경로가 필요합니다".to_string(),
+            ));
+        }
+        self.insert_picture_native_anchored(
+            section_idx,
+            para_idx,
+            char_offset,
+            cell_path,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+            offset_x_hu,
+            offset_y_hu,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_picture_native_anchored(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        cell_path: &[(usize, usize, usize)],
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        paper_offset_x_hu: Option<i32>,
+        paper_offset_y_hu: Option<i32>,
+        anchor_in_cell: bool,
+    ) -> Result<String, HwpError> {
+        use crate::model::image::Picture;
         use crate::model::paragraph::{CharShapeRef, LineSeg};
-        use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
+        use crate::model::shape::{CommonObjAttr, HorzRelTo, VertRelTo};
         // 유효성 검사
         if section_idx >= self.document.sections.len() {
             return Err(HwpError::RenderError(format!(
@@ -1537,63 +1760,32 @@ impl DocumentCore {
             false
         };
 
+        // 셀 자체가 있어도 마지막 문단 번호는 잘못될 수 있다. BinData 등록 전에
+        // 실제 삽입 문단까지 검증해 실패한 요청이 문서 자원을 남기지 않게 한다.
+        if cell_path_is_textbox || anchor_in_cell {
+            self.resolve_paragraph_by_path(section_idx, para_idx, cell_path)?;
+        }
+
         // --- 1·2. BinData 등록 (콘텐츠 + 메타데이터) ---
         // [Task #2230] 그림 지정(assign_picture_image_native)과 규칙 공유를 위해
         // register_embedded_bin_data 로 추출.
         let position_id = self.register_embedded_bin_data(image_data, extension);
 
-        // --- 공통 자원 ---
-        let shape_attr = ShapeComponentAttr {
-            original_width: width,
-            original_height: height,
-            current_width: width,
-            current_height: height,
-            local_file_version: 1,
-            render_sx: 1.0,
-            render_sy: 1.0,
-            ..Default::default()
-        };
-        let bx = [0i32, 0, width as i32, 0];
-        let by = [width as i32, height as i32, 0, height as i32];
-        let crop = CropInfo {
-            left: 0,
-            top: 0,
-            right: (natural_width_px * 75) as i32,
-            bottom: (natural_height_px * 75) as i32,
-        };
-        // [#3719 §6-5] crop 이 기준으로 삼는 전체 좌표 범위를 IR 에도 남긴다.
-        //
-        // 종전에는 `img_dim` 을 기본값 (0,0) 으로 두었는데, HWP5 직렬화기는 그 경우
-        // `crop.right/bottom` 을 원본 크기 자리에 기록하고(control.rs 의 #1929 폴백)
-        // HWP5 파서는 그 값을 다시 `img_dim` 으로 적재한다. 그래서 **삽입 직후 IR 과
-        // 저장본 재파싱 IR 이 항상 이 한 필드만큼 어긋났다** — `edit insert-image
-        // --verify` 가 정상 삽입에도 exit 3 을 내는 형태였다(실측 diffCount=1,
-        // `imgDim: expected=(0,0) actual=(3000,1500)`).
-        //
-        // 값은 직렬화기가 이미 쓰던 것과 같고, 렌더러의 폴백(`compute_image_crop_src`
-        // 는 imgDim 이 없으면 crop.right/bottom 을 같은 자리에 쓴다)과도 같은 배율이라
-        // 그림이 놓이는 결과는 바뀌지 않는다. HWPX 산출은 종전 `imgDim 0/0` 대신 실제
-        // 좌표 범위를 얻는다(HWP5 산출과의 비대칭 해소).
-        let img_dim = ((natural_width_px * 75), (natural_height_px * 75));
-        let image_attr = ImageAttr {
-            bin_data_id: position_id,
-            brightness: 0,
-            contrast: 0,
-            effect: ImageEffect::RealPic,
-            transparency: 0,
-            external_path: None,
-        };
-
         if !cell_path.is_empty() {
-            if cell_path_is_textbox {
+            if cell_path_is_textbox || anchor_in_cell {
                 // === 글상자 내부 picture 분기 (#1322 maintainer fix) ===
+                // (`insert_picture_in_cell_native` 의 표 셀 문단 삽입도 이 분기를 쓴다.)
                 // hitTest 의 글상자 sentinel path (`cellIdx=0`) 가 넘어온 경우에는
                 // Picture 를 body paragraph 의 sibling 으로 띄우지 않고, 실제 text_box
                 // paragraph 안에 삽입한다. 글상자 내부 좌표계는 text_box content box
                 // 기준이므로 caller 가 전달한 offset 은 Para-relative 로 해석한다.
-                let (offset_x_hu, offset_y_hu) = match (paper_offset_x_hu, paper_offset_y_hu) {
-                    (Some(x), Some(y)) => (x, y),
-                    _ => (0, 0),
+                let offset_x_hu = paper_offset_x_hu.unwrap_or(0);
+                let offset_y_hu = paper_offset_y_hu.unwrap_or(0);
+                // 표 셀 문단 안 그림은 한컴 저장본처럼 가로 기준을 단(셀 내용 영역)으로 둔다.
+                let (horz_rel_to, horz_rel_bits) = if cell_path_is_textbox {
+                    (HorzRelTo::Para, 3u32)
+                } else {
+                    (HorzRelTo::Column, 2u32)
                 };
 
                 // CommonObjAttr (text_box 내부 floating):
@@ -1601,34 +1793,46 @@ impl DocumentCore {
                 //   bits 15-17=width_criterion(4=Absolute),
                 //   bits 18-20=height_criterion(2=Absolute),
                 //   bits 21-23=text_wrap(0=Square)
-                let common_attr: u32 = (2 << 3) | (3 << 8) | (4 << 15) | (2 << 18) | (1 << 26);
+                // 표 셀 문단 안 그림은 한컴처럼 본문 영역 제한(bit 13)을 켠다. 꺼 두면 한컴은
+                // 셀이 아니라 표를 둔 바깥 문단 기준으로 위치를 잡아 셀 밖(표 머리)에 그린다.
+                let in_table_cell = !cell_path_is_textbox;
+                let common_attr: u32 = (2 << 3)
+                    | (horz_rel_bits << 8)
+                    | ((in_table_cell as u32) << 13)
+                    | (4 << 15)
+                    | (2 << 18)
+                    | (1 << 26);
                 let common = CommonObjAttr {
                     ctrl_id: 0x67736F20,
                     attr: common_attr,
                     numbering_type: crate::model::shape::ObjectNumberingType::Picture,
-                    hwp5_gen_shape_attr_bit26: true,
                     treat_as_char: false,
                     vert_rel_to: VertRelTo::Para,
-                    horz_rel_to: HorzRelTo::Para,
+                    horz_rel_to,
                     text_wrap: crate::model::shape::TextWrap::Square,
-                    horizontal_offset: offset_x_hu.max(0) as u32,
-                    vertical_offset: offset_y_hu.max(0) as u32,
+                    flow_with_text: in_table_cell,
+                    horizontal_offset: if cell_path_is_textbox {
+                        offset_x_hu.max(0)
+                    } else {
+                        offset_x_hu
+                    } as u32,
+                    vertical_offset: if cell_path_is_textbox {
+                        offset_y_hu.max(0)
+                    } else {
+                        offset_y_hu
+                    } as u32,
                     width,
                     height,
                     z_order: 1,
                     description: description.to_string(),
                     ..Default::default()
                 };
-                let pic = Picture {
+                let pic = Picture::from_embedded_image(
                     common,
-                    shape_attr,
-                    border_x: bx,
-                    border_y: by,
-                    crop,
-                    img_dim,
-                    image_attr,
-                    ..Default::default()
-                };
+                    position_id,
+                    natural_width_px,
+                    natural_height_px,
+                );
 
                 let (new_ctrl_idx, logical_after) = {
                     let section = &mut self.document.sections[section_idx];
@@ -1657,6 +1861,10 @@ impl DocumentCore {
                     (new_ctrl_idx, logical_after)
                 };
 
+                if !cell_path_is_textbox {
+                    // 셀 문단이 바뀌었으므로 최외곽 표 host 문단의 측정 revision도 무효화한다.
+                    self.mark_cell_control_dirty(section_idx, para_idx, cell_path[0].0);
+                }
                 self.mark_section_dirty(section_idx);
                 self.recompose_section(section_idx);
                 self.paginate_if_needed();
@@ -1693,7 +1901,6 @@ impl DocumentCore {
                 ctrl_id: 0x67736F20,
                 attr: common_attr,
                 numbering_type: crate::model::shape::ObjectNumberingType::Picture,
-                hwp5_gen_shape_attr_bit26: true,
                 treat_as_char: false,
                 vert_rel_to: VertRelTo::Paper,
                 horz_rel_to: HorzRelTo::Paper,
@@ -1706,16 +1913,12 @@ impl DocumentCore {
                 description: description.to_string(),
                 ..Default::default()
             };
-            let pic = Picture {
+            let pic = Picture::from_embedded_image(
                 common,
-                shape_attr,
-                border_x: bx,
-                border_y: by,
-                crop,
-                img_dim,
-                image_attr,
-                ..Default::default()
-            };
+                position_id,
+                natural_width_px,
+                natural_height_px,
+            );
 
             // table 같은 paragraph 의 sibling control 로 append.
             //
@@ -1775,7 +1978,6 @@ impl DocumentCore {
             ctrl_id: 0x67736F20, // "gso " — GenShape
             attr: common_attr,
             numbering_type: crate::model::shape::ObjectNumberingType::Picture,
-            hwp5_gen_shape_attr_bit26: true,
             treat_as_char: false,
             vert_rel_to: VertRelTo::Paper,
             horz_rel_to: HorzRelTo::Paper,
@@ -1789,16 +1991,8 @@ impl DocumentCore {
             ..Default::default()
         };
 
-        let pic = Picture {
-            common,
-            shape_attr,
-            border_x: bx,
-            border_y: by,
-            crop,
-            img_dim,
-            image_attr,
-            ..Default::default()
-        };
+        let pic =
+            Picture::from_embedded_image(common, position_id, natural_width_px, natural_height_px);
 
         // 현재 paragraph 의 sibling control 로 끼운다 (새 paragraph 생성 X).
         self.document.sections[section_idx].raw_stream = None;

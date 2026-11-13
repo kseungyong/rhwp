@@ -68,6 +68,9 @@ pub(crate) fn raster_line_geometry(
     if ![px, py, ex, ey].into_iter().all(f64::is_finite) {
         return original;
     }
+    if style.preserve_fractional_position {
+        return (line.x1, line.y1, line.x2, line.y2, raster_width);
+    }
     let (shift_x, shift_y) = if ex != 0.0 && ey == 0.0 {
         (0.0, py.floor() + 0.5 - py)
     } else if ex == 0.0 && ey != 0.0 {
@@ -92,4 +95,21 @@ pub(crate) fn raster_line_geometry(
     } else {
         original
     }
+}
+
+/// 출력 변환 `[a, b, c, d]`의 역행렬에서 최소 단위 벡터 길이를 구한다.
+pub(crate) fn minimum_width([a, b, c, d]: [f64; 4]) -> Option<f64> {
+    if ![a, b, c, d].iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let determinant = a * d - b * c;
+    if !determinant.is_finite() || determinant == 0.0 {
+        return None;
+    }
+    let unit = (d.hypot(b) / determinant.abs()).min(c.hypot(a) / determinant.abs());
+    (unit.is_finite() && unit > 0.0).then_some(unit)
+}
+
+pub(crate) fn width(source: f64, minimum: Option<f64>) -> f64 {
+    minimum.map_or(source, |minimum| source.max(minimum))
 }

@@ -1,6 +1,6 @@
 //! 글자처럼 취급하는 개체의 슬롯과 문단 소유권을 함께 옮긴다.
 
-use super::{header_footer_apply_from_u8, helpers::get_textbox_from_shape_mut, DocumentCore};
+use super::{header_footer_apply_from_u8, helpers::get_textbox_at_mut, DocumentCore};
 use crate::{
     error::HwpError,
     model::{
@@ -210,8 +210,8 @@ fn paragraph_mut<'a>(
                 }
                 cell.paragraphs.get_mut(child)
             }
-            Control::Shape(s) if cell == 0 => {
-                get_textbox_from_shape_mut(s).and_then(|t| t.paragraphs.get_mut(child))
+            Control::Shape(s) => {
+                get_textbox_at_mut(s, cell).and_then(|t| t.paragraphs.get_mut(child))
             }
             Control::Picture(p) if cell == 0 => {
                 p.caption.as_mut().and_then(|c| c.paragraphs.get_mut(child))
@@ -347,7 +347,7 @@ fn caret_slot(para: &Paragraph, logical: usize) -> Result<(u32, usize), HwpError
     Ok((raw, ci))
 }
 
-fn active_shape(para: &Paragraph, pos: u32) -> u32 {
+pub(crate) fn active_shape(para: &Paragraph, pos: u32) -> u32 {
     para.char_shapes
         .iter()
         .rfind(|run| run.start_pos <= pos)
@@ -429,13 +429,14 @@ fn sync_markpen_marks(para: &mut Paragraph, extras: Vec<MarkpenMark>) {
     para.markpen_marks.sort_by_key(|mark| mark.utf16_pos);
 }
 
-struct Slot {
-    control: Control,
-    data: Option<Vec<u8>>,
-    shapes: Vec<CharShapeRef>,
-    tags: Vec<RangeTag>,
+/// 문단에서 뗀 8유닛 컨트롤 슬롯. 글자 모양·영역은 슬롯 시작 기준 좌표다.
+pub(crate) struct Slot {
+    pub(crate) control: Control,
+    pub(crate) data: Option<Vec<u8>>,
+    pub(crate) shapes: Vec<CharShapeRef>,
+    pub(crate) tags: Vec<RangeTag>,
 }
-fn remove_slot(para: &mut Paragraph, ci: usize) -> Result<(Slot, u32), HwpError> {
+pub(crate) fn remove_slot(para: &mut Paragraph, ci: usize) -> Result<(Slot, u32), HwpError> {
     let raw = control_stream_slots(para)
         .get(ci)
         .copied()
@@ -538,10 +539,16 @@ fn remove_slot(para: &mut Paragraph, ci: usize) -> Result<(Slot, u32), HwpError>
         .checked_sub(8)
         .ok_or_else(|| invalid("문단 슬롯 수가 잘못되었습니다"))?;
     para.invalidate_layout_inputs();
+    para.forget_para_text_if_emptied();
     Ok((slot, raw))
 }
 
-fn insert_slot(para: &mut Paragraph, raw: u32, ci: usize, slot: Slot) -> Result<(), HwpError> {
+pub(crate) fn insert_slot(
+    para: &mut Paragraph,
+    raw: u32,
+    ci: usize,
+    slot: Slot,
+) -> Result<(), HwpError> {
     let count = para
         .char_count
         .checked_add(8)

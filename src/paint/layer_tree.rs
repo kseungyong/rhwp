@@ -19,6 +19,22 @@ pub struct PageLayerTree {
 }
 
 impl PageLayerTree {
+    /// 명시적 인쇄 세대가 없으면 기존 Print layer의 기하 정책을 보존한다.
+    pub fn preserves_raster_text_geometry(&self) -> bool {
+        self.profile == RenderProfile::Print && self.resources.print_2024_raster().unwrap_or(true)
+    }
+
+    /// Print raster는 인쇄 세대와 무관하게 원본 clip의 장치 포함 경계를 사용한다.
+    ///
+    /// 기준 raster(PDFium)는 한컴 PDF의 축 정렬 clip을 바깥 정수 화소로 넓히고, 1칸 미만
+    /// 직교선은 중심이 든 화소로 옮긴다(`raster_stroke::raster_line_geometry`). 칸 clip
+    /// 경계에 놓인 괘선은 한컴 2020 Print PDF에서도 그 화소에 그려지므로, 소수 clip을
+    /// 쓰면 선이 든 화소 행이 잘린다(#8986). 글자 기하
+    /// (`preserves_raster_text_geometry`)는 세대별 정책을 유지한다.
+    pub fn uses_raster_clip_coverage(&self) -> bool {
+        self.profile == RenderProfile::Print
+    }
+
     pub fn new(page_width: f64, page_height: f64, mut root: LayerNode) -> Self {
         let mut next_text_source_id = 0;
         bind_text_run_sources(&mut root, &mut next_text_source_id);
@@ -359,6 +375,8 @@ pub enum ClipKind {
     TableCell,
     TextBox,
     Generic,
+    /// 원본 물리 clip을 보존하고 raster에서만 장치 픽셀의 포함 경계를 적용한다.
+    PrintBitmapFill,
 }
 
 #[derive(Debug, Clone)]

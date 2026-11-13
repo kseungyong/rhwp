@@ -176,7 +176,6 @@ pub(in crate::renderer::typeset) struct BlockTableContinuationPreparedState {
     pub(in crate::renderer::typeset) total_footnote_height: f64,
     pub(in crate::renderer::typeset) queue_table_footnotes: bool,
     pub(in crate::renderer::typeset) table_footnotes: Vec<TableCellFootnote>,
-    pub(in crate::renderer::typeset) footnote_margin: f64,
     pub(in crate::renderer::typeset) host_spacing_total: f64,
     pub(in crate::renderer::typeset) host_spacing_before: f64,
     pub(in crate::renderer::typeset) host_spacing_after_only: f64,
@@ -208,6 +207,10 @@ pub(in crate::renderer::typeset) struct BlockTableContinuationPreparedState {
     /// 고정 선언 높이보다 실측 내용이 크게 넘치는 native HWP5 RowBreak 표가 마지막
     /// continuation fragment에서 URL 각주를 붙일 때의 실제 경계 완화 여부.
     pub(in crate::renderer::typeset) relax_terminal_table_footnote_fit: bool,
+    /// 같은 빈 문단의 앞 자리차지 표 뒤에 글줄 한 줄 자리가 없어 이 표가 다음 단/쪽으로
+    /// 이월됐다는 이월 시점의 사실. 그 글줄도 함께 밀려 이 표 끝 뒤에 놓이므로, 끝 조각이
+    /// 단/쪽을 꽉 채우면 글줄 몫의 다음 단/쪽이 생긴다.
+    pub(in crate::renderer::typeset) host_line_trails_table: bool,
 }
 
 /// [#2424] 한 continuation iteration이 caller-controlled step에 돌려주는 진행 상태.

@@ -31,7 +31,7 @@ export const MUTATING_METHODS: readonly string[] = [
   'splitParagraphInCell', 'mergeParagraphInCell', 'splitParagraphInCellByPath',
   'mergeParagraphInCellByPath',
   // 표 구조/속성
-  'createTable', 'createTableEx', 'deleteTableControl', 'insertTableRow', 'splitTable', 'mergeTableWithNext',
+  'createTable', 'createTableEx', 'createTableInCellByPath', 'deleteTableControl', 'insertTableRow', 'splitTable', 'mergeTableWithNext',
   'insertTableColumn', 'deleteTableRow', 'deleteTableColumn', 'mergeTableCells',
   'splitTableCell', 'splitTableCellInto', 'splitTableCellsInRange', 'resizeTableCells',
   'resizeTableCellsByPath', // [#7189] 중첩 표 셀 크기 조절 — 평면 resizeTableCells 의 경로 변형
@@ -40,9 +40,11 @@ export const MUTATING_METHODS: readonly string[] = [
   'pasteTableCellsTransposed', 'transposeTableCellsInPlace', 'pasteTableCellsTransposedAsTable',
   'evaluateTableFormula',
   // 그림/도형/수식 개체
-  'insertPicture', 'assignPictureImage', 'setPictureProperties',
+  'insertPicture', 'insertPictureInCell', 'relocateFloatingPicture',
+  'assignPictureImage', 'setPictureProperties',
   'setHeaderFooterPictureProperties', 'setCellPicturePropertiesByPath',
   'setCellShapePropertiesByPath', 'deletePictureControl', 'deleteCellPictureControlByPath',
+  'deleteCellShapeControlByPath',
   'createShapeControl', 'setShapeProperties', 'deleteShapeControl', 'changeShapeZOrder',
   'applyShapeZOrderPairs', // [#5769 후속] z 절대 대입 — SetZOrderCommand 의 undo/redo 경로
   'groupShapes', 'ungroupShape', 'moveLineEndpoint', 'updateConnectorsInSection',
@@ -61,6 +63,7 @@ export const MUTATING_METHODS: readonly string[] = [
   'setCharShapeIdInCell', 'setCharShapeIdInCellByPath',
   'setCharShapeRuns', 'setCharShapeRunsInCellByPath',
   'applyParaFormat', 'setParaShapeId', 'applyParaFormatInCell', 'setCellParaShapeId',
+  'applyParaFormatInCellByPath', 'setCellParaShapeIdByPath',
   // 스타일/번호 정의 (DocInfo 변이 포함)
   'updateStyle', 'updateStyleShapes', 'createStyle', 'deleteStyle', 'applyStyle',
   'applyCellStyle', 'createNumbering', 'ensureDefaultNumbering', 'ensureDefaultBullet',
@@ -73,7 +76,7 @@ export const MUTATING_METHODS: readonly string[] = [
   // 필드/양식/찾아바꾸기/책갈피
   'insertHyperlink', 'updateHyperlink', 'replaceHyperlinkText', 'removeHyperlink',
   'setFieldValue', 'setFieldValueByName', 'removeFieldAt', 'insertClickHereField',
-  'updateClickHereProps', 'setFormValue', 'setFormValueInCell',
+  'updateClickHereProps', 'setFormValue', 'setFormValueInCell', 'applyFormActionUpdates',
   'replaceText', 'replaceOne', 'replaceAll',
   'addBookmark', 'deleteBookmark', 'renameBookmark',
   // lineseg 재계산 (#177 — 저장 lineseg 를 실제로 변경)

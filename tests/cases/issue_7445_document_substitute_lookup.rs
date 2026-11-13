@@ -1,5 +1,15 @@
+//! 관계형(대체 선택·원본 보존) 및 고정형(독립 Print 제목의 ±2CSSpx 좌표).
+//! 주석 갱신: 2026-11-08T09:59:39+09:00. 직전 파일 변경 7f76cee60e38fceb63feacaff706cf984b19c427 (Git 커밋 시각 2026-11-08T06:19:56+09:00).
+//! 실측 source: 65195e9730f35bdbd7ea0c9a393e07e66125202e. 96 DPI·print·보정 전 2px raw 실루엣.
+//! HWP 전 46쪽 최저 Native 94.65% / fresh WASM 94.55%; 46쪽 각각 99.78% / 100.00%.
+//! HWPX 전 46쪽 최저 Native 94.62% / fresh WASM 94.43%; 46쪽 각각 100.00% / 100.00%.
+//! 측정 시각·TSV·독립 Print와 직접 판독 PNG: mydocs/pr/assets/planet6897_20261106/substitute-lookup-r46/README.md.
+//! Rust 검사는 mock 프로그램 계획을 공급하며 실제 설치 글꼴에 의존하지 않는다. 아래 주석은 이전 이력이다.
 //! 한컴 2020/2024 독립 Print의 문서 대체 필드 선택 계약.
-//! 합성 API 입력이며 설치한 글꼴이나 실물 좌표의 증거로 사용하지 않는다.
+//! 검사 구분: 앞의 API 2개는 관계형(선택·원본 보존)이며 설치 글꼴에 의존하지 않는다.
+//! `document_substitute_preserves_the_print_heading_owner_and_width`는 별도 실물 고정형이다.
+//! Native/fresh WASM 일치율: API 검사는 비해당. 실물 제목의 px 검사는 해당 함수 앞에 근거를 명시한다.
+//! 주석 갱신: 2026-11-07 21:45 KST. 원본 프로그램 인증 계약에 맞게 반환값 검사를 보정한다.
 #![cfg(not(target_arch = "wasm32"))]
 use rhwp::{renderer::font_environment::FontEnvironment, DocumentCore};
 use serde_json::{json, Value};
@@ -151,16 +161,44 @@ fn document_substitute_selection_preserves_program_and_user_precedence() {
     assert_eq!(r["layoutName"]["normalizedFace"], "HCR Batang");
     assert_eq!(c.export_hwp_native().unwrap(), raw);
     let primary = core("HCR Batang", "Arial", 1, false, false);
-    assert!(
+    let primary_selection =
         FontEnvironment::from_available_programs(&primary.document().doc_info, &programs)
             .unwrap()
-            .is_none()
+            .expect("준비된 원본 프로그램의 신원을 인증한다");
+    let primary_selection = serde_json::to_value(primary_selection).unwrap();
+    assert_eq!(
+        primary_selection["selectedPrograms"]["HCR Batang"]["programId"],
+        "mock-hcr"
+    );
+    assert_eq!(
+        primary_selection["selectedPrograms"]["HCR Batang"]["query"],
+        "HCR Batang"
+    );
+    assert_eq!(
+        primary_selection["substitutions"]["HCR Batang"],
+        "HCR Batang"
+    );
+    assert!(
+        primary_selection["selectionRules"].is_null(),
+        "원본을 문서 대체로 분류하지 않는다"
     );
     let present = json!([{ "query":"a로케트", "family":"a로케트", "programId":"mock-original", "trueType":true }]).to_string();
-    assert!(
+    let explicit_before = serde_json::to_value(c.font_environment()).unwrap();
+    let present_selection =
         FontEnvironment::from_available_programs(&c.document().doc_info, &present)
             .unwrap()
-            .is_none()
+            .expect("현재 준비된 원본 프로그램을 기록한다");
+    let present_selection = serde_json::to_value(present_selection).unwrap();
+    assert_eq!(
+        present_selection["selectedPrograms"]["a로케트"]["programId"],
+        "mock-original"
+    );
+    assert_eq!(present_selection["substitutions"]["a로케트"], "a로케트");
+    assert!(present_selection["selectionRules"].is_null());
+    assert_eq!(
+        serde_json::to_value(c.font_environment()).unwrap(),
+        explicit_before,
+        "가용성 계획 계산은 사용자가 명시한 현재 선택을 덮어쓰지 않는다"
     );
     for (embedded, sub_embedded) in [(true, false), (false, true)] {
         let c = core("a로케트", "HCR Batang", 1, embedded, sub_embedded);
@@ -283,9 +321,13 @@ fn document_substitute_preserves_the_print_heading_owner_and_width() {
             "독립 Print 닫는 괄호 끝 ±2CSSpx: {right}"
         );
         assert!(
-            group
-                .iter()
-                .all(|r| r["style"]["fontFamily"] == "Haansoft Batang"),
+            group.iter().all(|r| {
+                r["style"]["fontFamily"]
+                    .as_str()
+                    .and_then(|families| families.split(',').next())
+                    .map(str::trim)
+                    == Some("Haansoft Batang")
+            }),
             "독립 Print의 선택 프로그램"
         );
         assert_eq!(

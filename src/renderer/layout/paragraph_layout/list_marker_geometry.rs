@@ -1,6 +1,8 @@
 //! 번호·글머리표가 공통으로 점유하는 줄 앞 영역과 마커 문자열 측정.
 
-use super::super::text_measurement::{estimate_text_width_exact, resolved_to_text_style};
+use super::super::text_measurement::{
+    char_style_to_text_style, estimate_text_width_exact, resolved_to_text_style,
+};
 use super::{hwpunit_to_px, MarkerHead, ResolvedStyleSet, TextStyle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,7 +15,7 @@ pub(crate) struct ListMarkerGeometry {
     pub rest_line_px: f64,
     /// 마커 글자의 x — 첫 줄 본문 시작 기준(보통 음수).
     pub marker_dx_px: f64,
-    /// 영역이 있어 마커를 그린다.
+    /// 영역과 표시 문자열이 모두 있어 마커를 그린다.
     pub marker_visible: bool,
 }
 
@@ -45,13 +47,51 @@ pub(super) fn marker_text_style(
     char_shape_id: u32,
     text: &str,
 ) -> TextStyle {
-    let lang = text
-        .chars()
+    resolved_to_text_style(styles, char_shape_id, marker_lang(text))
+}
+
+fn marker_lang(text: &str) -> usize {
+    text.chars()
+        .map(super::map_pua_bullet_char)
         .find(|&ch| !crate::renderer::composer::is_lang_neutral(ch))
         .map(crate::renderer::style_resolver::detect_lang_category)
         // 독립 ASCII 구두점에는 따라갈 본문 언어가 없다. 마커 자체의 Latin 슬롯을 쓴다.
-        .unwrap_or_else(|| if text.is_ascii() { 1 } else { 0 });
-    resolved_to_text_style(styles, char_shape_id, lang)
+        .unwrap_or_else(|| if text.is_ascii() { 1 } else { 0 })
+}
+
+/// 기준 크기 0 인 글자 모양. 한/글 '본문 글자 크기 따름'은 번호 글자 모양을 이렇게 저장하고
+/// 번호를 문단 끝 글자 모양의 크기로 그린다(한/글 12.30 Mac).
+fn follows_body_size(styles: &ResolvedStyleSet, id: u32) -> bool {
+    styles
+        .source_char_shapes
+        .get(id as usize)
+        .is_some_and(|shape| shape.base_size == 0)
+}
+
+/// 머리 모양이 참조한 글자 모양 `id` 의 마커 스타일. 기준 크기 0 이면 문단 끝 글자 모양
+/// `end_id` 의 기준 크기로 다시 해소하고 글꼴·장평·꾸밈은 참조한 글자 모양을 따른다.
+pub(super) fn head_marker_text_style(
+    styles: &ResolvedStyleSet,
+    id: u32,
+    end_id: u32,
+    text: &str,
+) -> TextStyle {
+    let lang = marker_lang(text);
+    match (
+        styles.char_styles.get(id as usize),
+        styles.source_char_shapes.get(id as usize),
+        styles.char_styles.get(end_id as usize),
+    ) {
+        (Some(style), Some(shape), Some(body)) if follows_body_size(styles, id) => {
+            char_style_to_text_style(
+                styles,
+                &style.with_base_size(shape, body.font_size),
+                id,
+                lang,
+            )
+        }
+        _ => resolved_to_text_style(styles, id, lang),
+    }
 }
 
 /// 마커 뒤 거리는 별도 속성이므로 문자열 마지막 글자 뒤 자간은 번호 너비에 넣지 않는다.
@@ -71,18 +111,23 @@ pub(super) fn marker_text_width(text: &str, style: &TextStyle) -> f64 {
 }
 
 /// 상대 크기는 glyph에 적용한다. '%' 거리의 기준은 참조 글자모양의 기본 크기다.
-/// 명시된 머리 글자모양과 본문 상속 경로가 같은 선택 규칙을 사용한다.
+/// 명시된 머리 글자모양과 본문 상속 경로가 같은 선택 규칙을 사용한다. 본문 글자 크기를 따르는
+/// 머리 글자모양은 번호를 그리는 크기인 문단 끝 글자모양 `end_id` 의 크기를 기준으로 한다.
 pub(super) fn nominal_marker_size(
     styles: &ResolvedStyleSet,
     head: MarkerHead,
     fallback_id: u32,
+    end_id: u32,
     fallback_size: f64,
 ) -> f64 {
-    let id = if head.char_shape_id != 0
-        && head.char_shape_id != u32::MAX
+    let id = if head.char_shape_id != u32::MAX
         && (head.char_shape_id as usize) < styles.char_styles.len()
     {
-        head.char_shape_id
+        if follows_body_size(styles, head.char_shape_id) {
+            end_id
+        } else {
+            head.char_shape_id
+        }
     } else {
         fallback_id
     };
@@ -115,7 +160,16 @@ pub(super) fn list_marker_geometry_for(
     } else {
         distance_font_size * head.text_distance as f64 / 100.0
     };
-    let area_px = (glyph_px + hu(head.width_adjust) + distance_px).max(0.0);
+    // bit2가 꺼진 번호·개요는 형식의 예약 칸을 쓴다. 실제 글리프 폭은
+    // 정렬과 paint에 계속 사용한다. 이 영역을 줄 나눔과 최종 배치가 함께 소비한다.
+    let reference_px = if !bullet && head.attr & (1 << 2) == 0 {
+        head.reference_width_em
+            .map(|em| f64::from(em) * style.font_size * style.ratio)
+            .unwrap_or(glyph_px)
+    } else {
+        glyph_px
+    };
+    let area_px = (reference_px + hu(head.width_adjust) + distance_px).max(0.0);
     let (first_line_px, rest_line_px) = if head.attr & (1 << 3) != 0 {
         // 첫 줄 본문 = max(영역, 들여쓰기⁺), 이어지는 줄 = 첫 줄 − 들여쓰기.
         // 문단 들여쓰기가 준 시작 위에 얹는 양은 두 줄이 같다.
@@ -136,6 +190,6 @@ pub(super) fn list_marker_geometry_for(
         first_line_px,
         rest_line_px,
         marker_dx_px: align_dx - area_px,
-        marker_visible: area_px > 0.0,
+        marker_visible: area_px > 0.0 && !text.is_empty(),
     }
 }

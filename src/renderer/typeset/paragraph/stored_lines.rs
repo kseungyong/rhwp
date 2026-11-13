@@ -128,6 +128,36 @@ fn stored_frame_prefix(
             }
         }
     }
+    // A close tail alone cannot identify the frame: a genuinely consumed
+    // prefix can be shorter than the line-metric tolerance. The old opening
+    // prefix stops owning this ladder only after complete accepted paragraphs
+    // actually start another source frame, using paint's same origin query.
+    let accepted_source_restart = st.current_items.windows(2).any(|pair| {
+        let (
+            PageItem::FullParagraph { para_index: before },
+            PageItem::FullParagraph { para_index: after },
+        ) = (&pair[0], &pair[1])
+        else {
+            return false;
+        };
+        paragraphs
+            .get(*before)
+            .zip(paragraphs.get(*after))
+            .is_some_and(|(before, after)| {
+                [before, after].iter().all(|para| {
+                    !para.stored_text_partition_is_dirty()
+                        && !para.cell_format_vpos_dirty
+                        && !para.line_segs.is_empty()
+                        && para
+                            .line_segs
+                            .iter()
+                            .all(|line| !super::is_synthetic_line_seg(line))
+                }) && crate::renderer::height_cursor::paragraph_origin_rewinds(before, after)
+            })
+    });
+    if accepted_source_restart {
+        return None;
+    }
     // 완전한 TAC 줄이 새 단의 원점에서 수용되고 뒤 저장 줄까지 같은
     // 전진 끝으로 이어지면 새 저장 프레임이 이미 확립됐다. 옛 host의
     // 양수 vpos만 보고 그 뒤 모든 쪽 경계를 무효화하지 않는다.

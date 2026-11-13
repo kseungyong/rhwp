@@ -6,15 +6,36 @@
 pub(crate) mod helpers;
 pub(crate) use helpers::*;
 
+/// 문단 서식 JSON(`--props` 등)이 바꿀 속성을 하나라도 담는지 (#8439). 어댑터가 아무 키도
+/// 읽지 못한 입력을 성공으로 처리하지 않도록 미리 확인할 때 쓴다.
+pub fn para_format_props_have_effect(props_json: &str) -> bool {
+    helpers::para_format_props_have_effect(props_json)
+}
+
+/// 글자 서식 JSON 이 바꿀 속성을 하나라도 담는지 (#8439).
+pub fn char_format_props_have_effect(props_json: &str) -> bool {
+    helpers::char_format_props_have_effect(props_json)
+}
+
+#[cfg(feature = "pdf-import")]
+mod pdf_import_session;
+#[cfg(feature = "pdf-import")]
+pub use pdf_import_session::PdfImportSession;
+
 pub mod builders;
 mod canvas_metric_requests;
 mod canvas_metrics;
 mod native_pua_fonts;
 pub use native_pua_fonts::NativePuaFontRequest;
 mod font_environment;
+mod host_font_environment;
 mod loaded_frame_restore;
 mod table_reflow_owners;
+mod tac_host_rows;
 pub use canvas_metric_requests::{CanvasMetricBatch, CanvasMetricReply, CanvasMetricRequest};
+pub use host_font_environment::{
+    DeclaredFontFallbackRequest, ObservedFontFallback, ObservedFontSource,
+};
 mod commands;
 pub use commands::paragraph_block::{
     FillTemplateRequest, FillTemplateResult, ImportParagraphBlockLimits,
@@ -26,7 +47,7 @@ pub use commands::paragraph_block::{
     TemplateFillTarget, TemplateOperation, TemplateOperationResult, TemplateScope,
     TEMPLATE_REQUEST_MAX_BYTES,
 };
-pub use commands::{TableColumnWidths, TableCreationOptions};
+pub use commands::{ComposeHost, TableColumnWidths, TableCreationOptions};
 pub mod converters;
 pub(crate) mod html_table_import;
 mod html_table_width;
@@ -73,6 +94,19 @@ pub(crate) fn header_footer_apply_from_u8(value: u8) -> HeaderFooterApply {
         2 => HeaderFooterApply::Odd,
         _ => HeaderFooterApply::Both,
     }
+}
+
+/// 머리말·꼬리말 편집 API의 `applyTo`가 이 값 이상이면 구역의 `applyTo - 16`번째 바탕쪽을 가리킨다.
+///
+/// 바탕쪽 문단도 머리말처럼 쪽 하나에 그리는 독립 문단 목록이라, 글 입력·지우기·문단 나누기·
+/// 서식·캐럿·선택 질의를 같은 API로 편집한다.
+pub const MASTER_PAGE_APPLY_BASE: u8 = 16;
+
+/// `applyTo`가 바탕쪽을 가리키면 그 바탕쪽 번호.
+pub(crate) fn master_page_slot(apply_to: u8) -> Option<usize> {
+    apply_to
+        .checked_sub(MASTER_PAGE_APPLY_BASE)
+        .map(usize::from)
 }
 
 /// core 열거형을 Studio/WASM의 `applyTo` 숫자로 변환한다.
@@ -196,6 +230,7 @@ pub struct DocumentCore {
     pub(crate) hft_outline_fonts: crate::renderer::hft_outline::HftOutlineFonts,
     pub(crate) metafile_fonts: crate::paint::metafile_fonts::MetafileFonts,
     pub(crate) font_environment: Option<crate::renderer::font_environment::FontEnvironment>,
+    pub(crate) host_font_environment: Option<host_font_environment::HostFontEnvironment>,
     /// 구역별 구성된 문단 목록
     pub(crate) composed: Vec<Vec<ComposedParagraph>>,
     /// 본문 동적 필드의 쪽 소속/표시값이 수렴하지 않으면 출력을 명시적으로 거부한다.
@@ -225,6 +260,8 @@ pub struct DocumentCore {
     pub(crate) show_control_codes: bool,
     /// 투명선 표시 여부
     pub(crate) show_transparent_borders: bool,
+    /// 편집 화면의 바탕쪽을 흐리게 그릴지(한컴: 편집 화면에서는 본문보다 흐리게, 인쇄는 본래 모양)
+    pub(crate) dim_master_pages: bool,
     /// 잘림 보기 (body/셀 클리핑 활성화 여부)
     pub(crate) clip_enabled: bool,
     /// 디버그 오버레이 표시 여부 (문단/표 경계 + pi/ci 라벨)
@@ -269,8 +306,9 @@ pub struct DocumentCore {
     pub(crate) layer_tree_json_cache: RefCell<Vec<Vec<(u16, String)>>>,
     /// [#4969 Q3-E5] 페이지 레이어 트리 캐시 — (출력옵션 지문, immutable tree).
     /// page render tree와 같은 세대에서 무효화하며, 페이지당 최근 변형 4개로 제한한다.
-    /// `ResourceArena`의 font bytes는 `Arc<[u8]>`라 캐시 hit clone이 payload를 복제하지 않는다.
-    pub(crate) page_layer_tree_cache: RefCell<Vec<Vec<(u16, PageLayerTree)>>>,
+    /// Native의 공유 조회는 node·text·image payload를 깊게 복제하지 않는다.
+    /// 기존 소유값 조회는 호출자가 독립적으로 수정할 수 있는 clone을 반환한다.
+    pub(crate) page_layer_tree_cache: RefCell<Vec<Vec<(u16, Arc<PageLayerTree>)>>>,
     /// 그림 신원 키(`imageKey`)의 문서 단위 세대 번호 (Task #3315).
     ///
     /// `bin_data_id` 는 append-only 라 세션 중 id→바이트가 안정하지만, undo 스냅샷
@@ -403,13 +441,14 @@ impl DocumentCore {
             fonts.insert(default.to_string());
         }
         let mut font_substitutions = std::collections::BTreeSet::new();
+        let environment = self.resolved_font_environment();
         for (lang_idx, lang_fonts) in self.document.doc_info.font_faces.iter().enumerate() {
             for (font_idx, _) in lang_fonts.iter().enumerate() {
                 let decision = lookup_font_name_in_environment(
                     &self.document.doc_info,
                     lang_idx,
                     font_idx as u16,
-                    self.font_environment.as_ref(),
+                    environment,
                 );
                 // 실제 paint가 소비하는 glyph 공급자도 Studio가 준비해야 한다.
                 // primary만 노출하면 측정한 대체 face를 브라우저가 로드하지 못한다.
@@ -425,9 +464,9 @@ impl DocumentCore {
             }
         }
         for section in &self.document.sections {
-            queries::equation_fonts::collect(&section.paragraphs, &mut fonts);
+            queries::content_fonts::collect(&section.paragraphs, &mut fonts);
             for master in &section.section_def.master_pages {
-                queries::equation_fonts::collect(&master.paragraphs, &mut fonts);
+                queries::content_fonts::collect(&master.paragraphs, &mut fonts);
             }
         }
         let fonts_json: Vec<String> = fonts
@@ -502,7 +541,7 @@ impl DocumentCore {
         let mut styles = crate::renderer::style_resolver::resolve_styles_with_environment(
             &self.document,
             self.dpi,
-            self.font_environment.as_ref(),
+            self.resolved_font_environment(),
             self.effective_layout_profile(),
         );
         styles.native_pua_fonts = self.native_pua_fonts.clone();
@@ -535,8 +574,10 @@ impl DocumentCore {
     /// 변경 시 페이지네이션 결과가 달라지므로 모든 섹션을 재페이지네이션한다.
     pub fn set_hangul2024_compat(&mut self, enabled: bool) {
         if self.hangul2024_compat != enabled {
+            let previous_script_metrics = self.styles.script_metrics;
             self.hangul2024_compat = enabled;
-            if self.rebuild_resolved_styles() {
+            let equation_frames_changed = self.rebuild_resolved_styles();
+            if equation_frames_changed || previous_script_metrics != self.styles.script_metrics {
                 self.recompose_all_with_horizontal_shaping();
             }
             for d in self.dirty_sections.iter_mut() {
@@ -565,6 +606,7 @@ impl DocumentCore {
             hft_outline_fonts: Default::default(),
             metafile_fonts: Default::default(),
             font_environment: None,
+            host_font_environment: None,
             composed: Vec::new(),
             body_page_field_error: None,
             render_normalization: RenderNormalizationState::default(),
@@ -578,6 +620,7 @@ impl DocumentCore {
             annotate_metric_font: false,
             show_control_codes: false,
             show_transparent_borders: false,
+            dim_master_pages: false,
             clip_enabled: true,
             debug_overlay: false,
             respect_vpos_reset: false,

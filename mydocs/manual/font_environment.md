@@ -2,7 +2,7 @@
 kind: guide
 status: active
 canonical: mydocs/manual/cli_commands.md
-last_verified: 2026-10-20
+last_verified: 2026-11-06
 ---
 
 # 명시적 조판 폰트 환경
@@ -29,6 +29,7 @@ last_verified: 2026-10-20
 
 ```bash
 rhwp export-svg input.hwp --font-environment environment.json -o output/svg --font-style
+rhwp export-png input.hwp --font-environment environment.json -o output/png --profile print
 rhwp export-render-tree input.hwp --font-environment environment.json -o output/tree
 rhwp export-pdf input.hwp --font-environment environment.json -o output/result.pdf
 
@@ -43,8 +44,10 @@ Visual Sweep은 Native와 `--wasm-pkg` 양쪽에 동일한 환경을 적용하�
 내용으로 확인한다. #6389 편람의 KoPub PDF p68과 no-ttf PDF p69는 같은 내용이므로 단순히 같은
 페이지 번호끼리 비교해서는 안 된다.
 
-옵션을 생략하면 종전 동작과 출력 계약을 유지한다. SVG JSON manifest에는 설정한
-`fontEnvironment`가 추가된다. CLI 지원 명령은 위 세 가지이며 다른 명령의 전역 옵션은 아니다.
+명시적 환경을 생략한 Native 출력은 내장·설치된 글꼴을 먼저 확인하고, 없는 글꼴을 등록된
+공개 웹폰트로 보완한다. 일반 대체는 원본 프로그램 공급과 구분하며 미지원·공급 실패도 보고한다.
+명시적 환경을 지정하면 그 선택을 따른다. 출력 JSON의 `fontEnvironment`에는 실제 적용한
+환경이 기록된다. 명령별 지원은 [CLI 명령 참조](cli_commands.md)를 확인한다.
 
 ## Rust와 WASM
 
@@ -62,6 +65,13 @@ document.setFontEnvironment(undefined); // 기본 조판 복원
 
 - 매핑 key는 문서의 정확한 font face 이름, value는 최종 단일 face 이름이다. 재귀 치환하지 않는다.
 - 환경 ID/이름의 빈 문자열, 앞뒤 공백, 제어 문자, CSS family chain 등을 거부한다.
+- 문서의 원본 대체를 자동 관측할 때도 같은 단일 face 이름 규칙을 적용한다.
+  `산돌고딕 L\,한컴돋움` 같은 목록 표기의 원본 이름이나 부적합한 대체 이름은
+  관측 요청에서 제외하고 다른 정상 요청은 계속 처리한다. 원본 글꼴 이름을 분해하거나
+  바꾸지 않으며, 호출자가 명시한 환경의 검증 규칙은 유지한다.
+- 미해소된 원본 TTF 이름에 쉼표가 있고 같은 레코드에 유효한 비내장 단일 TTF 대체가
+  선언돼 있으면, 그 대체를 측정과 paint의 공통 첫 face로 사용한다. 원본 이름 일부를
+  내부 체인의 별도 후보로 해석하지 않는다. 정상 단일 face와 내장 프로그램의 우선순위는 보존한다.
 - 내장 폰트는 미설치로 처리하지 않고 기존 이름을 유지한다. 매핑하지 않은 폰트도 기존 규칙을 따른다.
 - 환경을 바꾸면 스타일·문단 구성·측정·페이지 캐시를 재구성한다. 이전 Canvas 측정 세션은 폐기된다.
 - 같은 환경의 반복 적용은 no-op이다. 편집 batch 중 변경은 거부한다.
@@ -71,6 +81,24 @@ document.setFontEnvironment(undefined); // 기본 조판 복원
 
 이 설정은 빠진 글꼴 파일을 제공하지 않는다. 출력 backend가 목표 폰트를 사용할 수 있어야 하며,
 최종 시각 판정은 [Visual Sweep](verification/visual_sweep_guide.md)의 직접 비교 절차를 따른다.
+
+## 표시용 치환과 실제 프로그램 선택의 출처
+
+`preserveSourceMetrics: true`인 표시용 대체는 원본의 언어별 폭 표·공백·인쇄 프레임을 보존한다.
+공급한 웹폰트의 family 이름만으로 원본 메트릭까지 바꾸지 않는다. 반면 실제 공급자가 원본 또는
+문서의 대체 글꼴을 조회해 선택한 HFT 프로그램은 그 프로그램의 문장부호 계약을 유지한다.
+예를 들어 문서의 `명조` 조회가 프로그램 내부 family `Myeongjo`로 해소돼도 이름의 차이만으로
+일반 표시 치환으로 취급하지 않는다.
+
+공통 프로그램 선택 생산자는 `selectedPrograms`에 원본 이름별 `query`, `family`, `programId`,
+`trueType`, `openTypeCff`를 기록한다. 언어·font ID마다 선택이 다른 `documentSubstitutions`에도
+조회 이름 `query`를 보존한다. 측정 소비자는 조회 이름이 해당 슬롯의 원본·문서 지정 후보에 속하고
+선택 대상도 그대로인 경우에만 이 출처를 사용한다. 일반 웹폰트 치환으로 선택을 덮어쓸 때는
+해당 원본의 이전 프로그램 출처를 제거한다.
+
+이 정보는 실제 프로그램 공급 snapshot에서 생성하며, 설치·선택을 추정해 수동으로 채우지 않는다.
+프로그램 ID와 선언만으로 글리프 공급이나 PDF 일치를 인증하지 않으며 실제 바이트·cmap·backend
+소비와 독립 출력 대조는 별도로 확인한다.
 
 ## 같은 이름의 TrueType·HFT 프로그램 구분
 

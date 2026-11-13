@@ -4,7 +4,9 @@ use super::super::font_lookup::{
 };
 use super::super::synthetic_typeface::{unemboldened_typeface, unobliqued_typeface};
 use crate::renderer::{internal_font_family_members, TextStyle};
-use skia_safe::{font, Font, FontMgr, Typeface};
+use skia_safe::{
+    font, font_arguments::VariationPosition, Canvas, Font, FontArguments, FontMgr, Paint, Typeface,
+};
 use std::{cell::RefCell, collections::HashMap};
 
 pub(in crate::renderer::skia) fn compatibility_glyph(font: &Font, text: &str) -> Option<char> {
@@ -18,7 +20,143 @@ pub(in crate::renderer::skia) fn compatibility_glyph(font: &Font, text: &str) ->
 }
 
 thread_local! {
+    static OUTLINE_REPLAY_FACES: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     static OWN_HEAVY_FACES: RefCell<HashMap<(u32, String), bool>> = RefCell::new(HashMap::new());
+    static SYSTEM_PROGRAM_FACES: RefCell<SystemProgramFaces> = RefCell::new(SystemProgramFaces::default());
+    static VERIFIED_SYSTEM_GLYPHS: RefCell<HashMap<(u32, u32, char), bool>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Default)]
+struct SystemProgramFaces {
+    faces: HashMap<u32, Option<SystemProgramFace>>,
+    bytes: usize,
+}
+
+#[derive(Clone)]
+struct SystemProgramFace {
+    face: Typeface,
+    static_truetype: bool,
+}
+
+/// 시스템 face의 조회 메트릭과 실제 paint가 같은 프로그램을 소비하게 한다.
+/// 등록된 같은 이름의 여러 버전에서 OS face의 cmap과 그리기 프로그램이 어긋나도
+/// 선택한 face가 제공하는 바이트를 다시 열면 같은 glyph 번호·윤곽을 함께 소유한다.
+fn system_program_face(font_mgr: &FontMgr, original: &Typeface) -> Option<SystemProgramFace> {
+    const MAX_FACES: usize = 256;
+    const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+    let id = original.unique_id();
+    if let Some(found) = SYSTEM_PROGRAM_FACES.with(|cache| cache.borrow().faces.get(&id).cloned()) {
+        return found;
+    }
+    let prepared = (|| {
+        let (bytes, index) = original.to_font_bytes()?;
+        if bytes.len() > MAX_SOURCE_BYTES {
+            return None;
+        }
+        let index = u32::try_from(index).ok()?;
+        let mut face = super::super::font_catalog::typeface_from_data(font_mgr, &bytes, index)?;
+        let coordinates = original.variation_design_position().unwrap_or_default();
+        if !coordinates.is_empty() {
+            let mut arguments =
+                FontArguments::new().set_variation_design_position(VariationPosition {
+                    coordinates: &coordinates,
+                });
+            // nonzero TTC face를 독립 SFNT로 복구한 경우의 실제 index도 보존한다.
+            let physical_index = face
+                .to_existing_font_data()
+                .and_then(|(_, index)| usize::try_from(index).ok())
+                .unwrap_or(usize::try_from(index).ok()?);
+            arguments.set_collection_index(physical_index);
+            face = face.clone_with_arguments(&arguments)?;
+        }
+        let static_truetype = index == 0
+            && bytes.get(..4) != Some(b"ttcf")
+            && original.font_style() == face.font_style()
+            && original.read_table_tags().is_some_and(|tags| {
+                tags.contains(&u32::from_be_bytes(*b"glyf"))
+                    && [
+                        *b"fvar", *b"COLR", *b"SVG ", *b"sbix", *b"CBLC", *b"CBDT", *b"EBLC",
+                        *b"EBDT",
+                    ]
+                    .iter()
+                    .all(|tag| !tags.contains(&u32::from_be_bytes(*tag)))
+            });
+        Some((
+            SystemProgramFace {
+                face,
+                static_truetype,
+            },
+            bytes.len(),
+        ))
+    })();
+    let retained = prepared.as_ref().map_or(0, |(_, bytes)| *bytes);
+    let face = prepared.map(|(face, _)| face);
+    SYSTEM_PROGRAM_FACES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.faces.len() >= MAX_FACES
+            || cache.bytes.saturating_add(retained) > MAX_RETAINED_BYTES
+        {
+            cache.faces.clear();
+            cache.bytes = 0;
+        }
+        cache.bytes += retained;
+        cache.faces.insert(id, face.clone());
+    });
+    face
+}
+
+/// 실제 glyph ID·무힌팅 윤곽·자연 전진이 같은 정적 TTF만 OS의 raster 설정을 유지한다.
+/// CFF·TTC·가변·컬러 face와 불일치 glyph는 기존 실제 프로그램 재개방을 그대로 쓴다.
+fn same_static_glyph(original: &Typeface, prepared: &Typeface, character: char) -> bool {
+    let key = (original.unique_id(), prepared.unique_id(), character);
+    if let Some(same) = VERIFIED_SYSTEM_GLYPHS.with(|cache| cache.borrow().get(&key).copied()) {
+        return same;
+    }
+    let glyph = original.unichar_to_glyph(character as i32);
+    let same = glyph != 0 && glyph == prepared.unichar_to_glyph(character as i32) && {
+        let size = original.units_per_em().unwrap_or(0) as f32;
+        let make_font = |face: &Typeface| {
+            let mut font = Font::new(face.clone(), size);
+            font.set_hinting(skia_safe::FontHinting::None);
+            font.set_subpixel(true);
+            font.set_baseline_snap(false);
+            font
+        };
+        let a = make_font(original);
+        let b = make_font(prepared);
+        size > 0.0
+            && a.get_path(glyph)
+                .zip(b.get_path(glyph))
+                .is_some_and(|(a, b)| !a.is_empty() && a == b)
+            && a.measure_str(character.to_string(), None).0
+                == b.measure_str(character.to_string(), None).0
+    };
+    VERIFIED_SYSTEM_GLYPHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, same);
+    });
+    same
+}
+
+fn candidate_typeface(candidate: &TypefaceCandidate, font_mgr: &FontMgr, sample: &str) -> Typeface {
+    if matches!(candidate.source, "system" | "legacy") {
+        if let Some(prepared) = system_program_face(font_mgr, &candidate.typeface) {
+            if prepared.static_truetype
+                && !sample.is_empty()
+                && sample.chars().all(|character| {
+                    same_static_glyph(&candidate.typeface, &prepared.face, character)
+                })
+            {
+                return candidate.typeface.clone();
+            }
+            return prepared.face;
+        }
+    }
+    candidate.typeface.clone()
 }
 
 fn owns_intrinsic_heavy_face(typeface: &Typeface, style: &TextStyle) -> bool {
@@ -60,23 +198,55 @@ pub(super) fn for_text(
     size: f32,
     style: &TextStyle,
     font_mgr: &FontMgr,
+    geometric_text: bool,
 ) -> Option<Font> {
-    if let Some(ch) = sample.chars().find(|ch| !ch.is_whitespace()) {
-        return select_typeface_for_character(chain, ch)
-            .map(|candidate| finish(candidate.typeface.clone(), size, style, font_mgr));
+    if let Some(ch) = sample
+        .chars()
+        .find(|ch| !crate::renderer::text_glyph_visibility::is_nonprinting_character(*ch))
+    {
+        return select_typeface_for_character(chain, ch).map(|candidate| {
+            finish(
+                candidate_typeface(candidate, font_mgr, sample),
+                size,
+                style,
+                font_mgr,
+                geometric_text,
+            )
+        });
     }
     if let Some(candidate) = chain.first() {
-        Some(finish(candidate.typeface.clone(), size, style, font_mgr))
+        Some(finish(
+            candidate_typeface(candidate, font_mgr, sample),
+            size,
+            style,
+            font_mgr,
+            geometric_text,
+        ))
     } else {
         let mut font = Font::default();
         font.set_size(size);
         font.set_edging(font::Edging::AntiAlias);
         font.set_subpixel(true);
+        preserve_geometry(&mut font, geometric_text);
         Some(font)
     }
 }
 
-fn finish(tf: Typeface, size: f32, style: &TextStyle, font_mgr: &FontMgr) -> Font {
+pub(super) fn preserve_geometry(font: &mut Font, geometric_text: bool) {
+    if geometric_text {
+        font.set_subpixel(true);
+        font.set_hinting(skia_safe::FontHinting::None);
+        font.set_baseline_snap(false);
+    }
+}
+
+fn finish(
+    tf: Typeface,
+    size: f32,
+    style: &TextStyle,
+    font_mgr: &FontMgr,
+    geometric_text: bool,
+) -> Font {
     let tf = if style.italic {
         unobliqued_typeface(font_mgr, &tf).unwrap_or(tf)
     } else {
@@ -103,6 +273,7 @@ fn finish(tf: Typeface, size: f32, style: &TextStyle, font_mgr: &FontMgr) -> Fon
     if style.fixed_glyph_advances {
         font.set_baseline_snap(false);
     }
+    preserve_geometry(&mut font, geometric_text);
     if style.is_visually_bold() && !is_bold_face && !owns_heavy {
         font.set_embolden(true);
     }
@@ -112,4 +283,55 @@ fn finish(tf: Typeface, size: f32, style: &TextStyle, font_mgr: &FontMgr) -> Fon
         font.set_skew_x(crate::renderer::text_transform::SYNTHETIC_ITALIC_SKEW as f32);
     }
     font
+}
+
+/// bitmap·색상·가변 글꼴은 별도 재생 계약이다. 단색 SFNT 윤곽만 수용한다.
+fn has_monochrome_source_outline(font: &Font) -> bool {
+    let face = font.typeface();
+    OUTLINE_REPLAY_FACES.with(|cache| {
+        let id = face.unique_id();
+        if let Some(supported) = cache.borrow().get(&id) {
+            return *supported;
+        }
+        let supported = face.read_table_tags().is_some_and(|tags| {
+            let contains = |tag: &[u8; 4]| tags.contains(&u32::from_be_bytes(*tag));
+            [*b"glyf", *b"CFF "].iter().any(contains)
+                && ![
+                    *b"EBLC", *b"EBDT", *b"CBLC", *b"CBDT", *b"bloc", *b"bdat", *b"sbix", *b"COLR",
+                    *b"SVG ", *b"fvar",
+                ]
+                .iter()
+                .any(contains)
+        });
+        if cache.borrow().len() < 256 {
+            cache.borrow_mut().insert(id, supported);
+        }
+        supported
+    })
+}
+
+/// Print의 독립 glyph는 실제 선택한 Font의 윤곽을 기존 paint·원점에 재생한다.
+/// 여러 scalar의 shaping과 path가 없는 glyph는 원래 텍스트 재생에 맡긴다.
+pub(super) fn draw_positioned_cluster(
+    canvas: &Canvas,
+    text: &str,
+    origin: (f32, f32),
+    font: &Font,
+    paint: &Paint,
+    geometric_text: bool,
+) {
+    if geometric_text && has_monochrome_source_outline(font) {
+        let mut characters = text.chars();
+        if let Some(character) = characters.next().filter(|_| characters.next().is_none()) {
+            let glyph = font.unichar_to_glyph(character as i32);
+            if let Some(path) = font.get_path(glyph) {
+                canvas.save();
+                canvas.translate(origin);
+                canvas.draw_path(&path, paint);
+                canvas.restore();
+                return;
+            }
+        }
+    }
+    canvas.draw_str(text, origin, font, paint);
 }

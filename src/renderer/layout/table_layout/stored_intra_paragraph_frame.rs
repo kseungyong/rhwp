@@ -25,14 +25,16 @@ impl LayoutEngine {
                 .render_normalization
                 .borrow()
                 .cell_frame_reflowed(table, cell)
-                && units
-                    .iter()
-                    .any(|unit| Self::stored_in_paragraph_unit_is_original_restart(cell, unit))
+                && units.iter().any(|unit| {
+                    self.stored_in_paragraph_unit_is_original_restart(table, cell, unit)
+                })
         })
     }
 
     /// 행 분해와 상위 투영은 동일한 원본 줄의 재시작을 판별한다.
     pub(super) fn stored_in_paragraph_unit_is_original_restart(
+        &self,
+        table: &Table,
         cell: &Cell,
         unit: &CellUnit,
     ) -> bool {
@@ -48,7 +50,7 @@ impl LayoutEngine {
         };
         if paragraph.stored_text_partition_is_dirty()
             || paragraph.cell_format_vpos_dirty
-            || !paragraph.controls.is_empty()
+            || !crate::renderer::cell_paragraph_has_only_text_metadata(paragraph)
         {
             return false;
         }
@@ -61,7 +63,15 @@ impl LayoutEngine {
         let synthetic = crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY;
         previous.tag & synthetic == 0
             && current.tag & synthetic == 0
-            && previous.vertical_pos > 0
+            && (previous.vertical_pos > 0
+                || (previous.vertical_pos == 0
+                    && unit.stored_frame_break_before
+                    && matches!(
+                        self.stored_zero_origin_text_frame_break_witness(
+                            table, cell, previous, current,
+                        ),
+                        Some(super::stored_zero_origin::SavedZeroOriginWitness::OpeningFrame)
+                    )))
             && current.vertical_pos == 0
             && previous.line_height > 0
             && current.line_height > 0
@@ -81,6 +91,10 @@ impl LayoutEngine {
         // 첫 행의 원점도 0으로 정규화한다. 원본 줄과 같은 물리 상자를
         // 인증하는 조건은 아래에서 뒤 행과 동일하게 적용한다.
         if !self.stored_plain_text_cell_frame(table, cell)
+            || self
+                .render_normalization
+                .borrow()
+                .nested_table_has_reflowed_host(table)
             || table.common.height == 0
             || table.common.height > i32::MAX as u32
         {
@@ -125,6 +139,20 @@ impl LayoutEngine {
             + hwpunit_to_px(table.cell_spacing as i32, self.dpi)
                 * usize::from(cell.row_span).saturating_sub(1) as f64;
         let end = hwpunit_to_px(table.common.height as i32, self.dpi);
+        if std::env::var_os("RHWP_DIAG_SCAN").is_some() {
+            eprintln!(
+                "DIAG_SCAN STORED_CELL_FRAME table={:p} row={} span={} origin={:.6} current={:.6} end={:.6} cached={}",
+                table,
+                row,
+                cell.row_span,
+                origin,
+                current,
+                end,
+                self.stored_frame_row_plans
+                    .borrow()
+                    .contains_key(&(table as *const Table as usize)),
+            );
+        }
         // A completed opening row or a later frame cannot authenticate this
         // partial source row. Unknown zero-height rows are not a physical origin.
         if !origin.is_finite() || !current.is_finite() || end <= origin || end >= origin + current {
@@ -173,7 +201,19 @@ impl LayoutEngine {
             }
             let line = paragraph.line_segs.get(unit.vis_start)?;
             if let Some(before) = previous {
-                if line.vertical_pos == 0 && before.vertical_pos > 0 {
+                if line.vertical_pos == 0
+                    && (before.vertical_pos > 0
+                        || (unit.stored_frame_break_before
+                            && units[index - 1].para_idx == unit.para_idx
+                            && matches!(
+                                self.stored_zero_origin_text_frame_break_witness(
+                                    table, cell, before, line,
+                                ),
+                                Some(
+                                    super::stored_zero_origin::SavedZeroOriginWitness::OpeningFrame
+                                )
+                            )))
+                {
                     let ink = hwpunit_to_px(
                         before.vertical_pos.checked_add(before.line_height)?,
                         self.dpi,

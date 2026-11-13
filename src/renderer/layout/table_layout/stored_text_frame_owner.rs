@@ -13,20 +13,18 @@ impl LayoutEngine {
         (profile.hwp5_stored_pagination_layout() || profile.hwpx_stored_layout())
             && !profile.session_edited()
             && !table.common.treat_as_char
-            && table.page_break == TablePageBreak::RowBreak
+            && table.layout_page_break() == TablePageBreak::RowBreak
             && table.common.height > 0
             && !frame_reflowed
     }
 
     pub(crate) fn native_stored_table_has_fragment_frames(&self, table: &Table) -> bool {
-        self.profile.get().hwp5_stored_pagination_layout()
-            && self.original_stored_table_frame_is_usable(
-                table,
-                self.render_normalization
-                    .borrow()
-                    .table_text_reflowed(table),
-            )
-            && Self::stored_row_boxes_exceed_object_frame(table)
+        self.original_stored_table_frame_is_usable(
+            table,
+            self.render_normalization
+                .borrow()
+                .table_text_reflowed(table),
+        ) && self.indexed_stored_row_boxes_exceed_object_frame(table)
     }
 
     /// 부모의 저장 조각 좌표계가 남아 있는가. 옛 컷의 수용 가능 여부와는 별도다.
@@ -35,7 +33,7 @@ impl LayoutEngine {
         let profile = self.profile.get();
         if !(profile.hwp5_stored_pagination_layout() || profile.hwpx_stored_layout())
             || table.common.treat_as_char
-            || table.page_break != TablePageBreak::RowBreak
+            || table.layout_page_break() != TablePageBreak::RowBreak
             || table.common.height == 0
         {
             return false;
@@ -207,7 +205,7 @@ impl LayoutEngine {
                     .cell_frame_reflowed(table, cell),
             )
             && stored_text_paragraphs_share_vpos_frame(cell, styles, self.dpi)
-            && (Self::stored_row_boxes_exceed_object_frame(table)
+            && (self.indexed_stored_row_boxes_exceed_object_frame(table)
                 || opening_text_frame_end_hu(cell, table, styles, self.dpi)
                     .is_some_and(|end| (end - i64::from(table.common.height)).abs() <= 2))
     }

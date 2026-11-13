@@ -73,6 +73,15 @@ static VERIFIED_TECHNICAL_1_PRESENT: [bool; 256] = [
 ];
 
 fn verified_technical_symbol_entry(metric: &FontMetric, ch: char) -> Option<(bool, u16)> {
+    // 같은 HBATANG 35f84328…의 Arrows 전체 cmap/hmtx: 112개 모두
+    // 1024/1024em이다. 독립 편람 Print의 결측 화살표도 이 프로그램을 쓴다.
+    // 기존 DB의 미수집 구간만 보충하며 다른 face·굵기·기울임은 추정하지 않는다.
+    if (0x2190..=0x21FF).contains(&(ch as u32))
+        && (metric.name, metric.em_size, metric.bold, metric.italic)
+            == ("Haansoft Batang", 1024, false, false)
+    {
+        return Some((true, 1024));
+    }
     // 독립 한컴 2020 Print의 Batang 프로그램: U+25A1 전진은 911/1024em이다.
     // 기존 DB가 수집하지 않은 기하 기호를 전각 추정으로 바꾸지 않는다.
     // 근거: 2599643_port_call_form-2020.pdf의 xref 12, glyph 15, hmtx.
@@ -112,9 +121,20 @@ pub(crate) fn verified_program_has_glyph(metric: &FontMetric, ch: char) -> Optio
             // H2HDRM.TTF e50c7200521c3ea59840e5dd42e79708905a74a607f2300ed862fe2491caf831:
             // 원 프로그램 cmap의 확인된 결측이다. 폭 표의 미수집을 뜻하지 않는다.
             ("HYHeadLine-Medium", 1024, false, false) if ch == '\u{2024}' => return Some(false),
+            // [#8419] batang.ttc 51d9a8d4205239c865e24b6eb7e6e6dbacfd59c3e2c46f623db0af45e169c9d8:
+            // Batang regular cmap에 U+2024·U+2027이 모두 없지만 공급자는 U+2024만
+            // 독립 Print로 확인했다. U+2027의 기존 처리는 바꾸지 않는다.
+            ("Batang", 1024, false, false) if ch == '\u{2024}' => return Some(false),
+            // gulim.TTC ed750275…776c의 GulimChe regular cmap 결측.
+            // 독립2020 Print에서 공급자를 확인한 U+2024만 해소한다.
+            ("GulimChe", 1024, false, false) if ch == '\u{2024}' => return Some(false),
             // H2MJSM.TTF/gulim.TTC의 실제 cmap 결측. 서로 다른 기호
             // 슬롯을 교차한 Print에서 각각 HBATANG/HDOTUM 공급도 확인했다.
             ("HYSinMyeongJo-Medium" | "Gulim", 1024, false, false) => return Some(false),
+            // [#8619] gulim.ttc 05a38ff214ee932c6147a4e697b494040fd68ce654795f10f723c01d7bb8ee12:
+            // Dotum regular cmap에 U+2024·U+2027이 모두 없지만 공급자는 U+2024만
+            // 독립 Print로 확인했다. U+2027의 기존 처리는 바꾸지 않는다.
+            ("Dotum", 1024, false, false) if ch == '\u{2024}' => return Some(false),
             ("Haansoft Batang", 1024, false, false) => return Some(true),
             ("Haansoft Dotum", 1024, false, false) => return Some(true),
             _ => {}

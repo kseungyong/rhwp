@@ -247,7 +247,8 @@ fn source_character(
     }
     for (control, position) in para.controls.iter().zip(control_positions) {
         // shortcut: 겹침 런의 원문 소유권을 전달할 때까지 첫 겹침부터 뒤 주소는 확정하지 않는다.
-        if (matches!(control, Control::CharOverlap(_)) && position <= logical_offset)
+        if (matches!(control, Control::CharOverlap(_) | Control::Ruby(_))
+            && position <= logical_offset)
             || (control.is_logical_inline() && position == logical_offset)
         {
             return None;
@@ -464,6 +465,28 @@ fn metric_entry_provenance(
         provenance.known_limitations.push("Published advances do not establish the installed paint font or recover a missing PDF font program.".into());
         return Ok(provenance);
     }
+    if let Some(source) =
+        crate::renderer::font_metrics_data::nimbus_roman_metric_source(metric.metric)
+    {
+        let mut provenance = unlinked_provenance(
+            json!({
+                "sourceBoundaryId":"rust-metric.verified-sfnt",
+                "candidateKind":"metric-entry", "sourceFace":metric.metric.name,
+                "targetOrPolicy":format!("metric-entry:{}",metric.entry_index),
+                "conditions":{"bold":metric.metric.bold,"italic":metric.metric.italic,
+                    "emSize":metric.metric.em_size,"sfntSource":source},
+                "order":null,
+            }),
+            "verified-sfnt-advances",
+        )
+        .map_err(|error| HwpError::RenderError(format!("font trace provenance: {error}")))?;
+        provenance.evidence_anchor = source.into();
+        provenance.reason = Some("verifiedSfntAdvancesOutsideHistoricalLedger".into());
+        provenance.known_limitations.push(
+            "Measured advances do not establish the installed paint font or recover a missing PDF font program.".into(),
+        );
+        return Ok(provenance);
+    }
     let mut identity = json!({
         "sourceBoundaryId": "rust-metric.metric-table",
         "candidateKind": "metric-entry",
@@ -539,6 +562,28 @@ fn transform_steps(
                 }
                 .into(),
             ),
+        });
+    }
+    // [#8079] 실제 Bold 면도 전진폭은 보통 면에서 — 측정과 같은 조건·helper 로 판정한다.
+    let latin_slot = ch
+        .is_ascii_punctuation()
+        .then_some(run.style.ascii_punct_latin.as_deref())
+        .flatten();
+    let source_font_is_hft =
+        latin_slot.map_or(run.style.source_font_is_hft, |l| l.source_font_is_hft);
+    if !source_font_is_hft
+        && decision.width_source == "embeddedMetric"
+        && decision.metric.is_some_and(|metric| {
+            crate::renderer::font_metrics_data::regular_advance_metric(metric.metric)
+                .and_then(|regular| regular.get_width(ch))
+                .is_some()
+        })
+    {
+        steps.push(DecisionStep {
+            kind: "regularAdvanceForBold".into(),
+            input: Some("bold".into()),
+            output: Some("regularMetricAdvance".into()),
+            reason: Some("boldFaceDrawsAtRegularAdvance".into()),
         });
     }
     if (run.style.ratio - 1.0).abs() > f64::EPSILON {
@@ -841,7 +886,13 @@ impl DocumentCore {
         page_num: u32,
         options_json: &str,
         native_observer: Option<
-            &dyn Fn(&str, char, bool, bool) -> crate::renderer::font_decision::BackendDecision,
+            &dyn Fn(
+                &str,
+                char,
+                bool,
+                bool,
+                bool,
+            ) -> crate::renderer::font_decision::BackendDecision,
         >,
         native_unavailable_reason: &'static str,
     ) -> Result<String, HwpError> {
@@ -864,7 +915,13 @@ impl DocumentCore {
         page_num: u32,
         requested_limits: TraceLimits,
         native_observer: Option<
-            &dyn Fn(&str, char, bool, bool) -> crate::renderer::font_decision::BackendDecision,
+            &dyn Fn(
+                &str,
+                char,
+                bool,
+                bool,
+                bool,
+            ) -> crate::renderer::font_decision::BackendDecision,
         >,
         native_unavailable_reason: &'static str,
         tree: &PageRenderTree,
@@ -905,7 +962,7 @@ impl DocumentCore {
                                 &self.document.doc_info,
                                 language_slot,
                                 shape.font_ids[language_slot],
-                                self.font_environment.as_ref(),
+                                self.resolved_font_environment(),
                             )
                         })
                 });
@@ -1100,13 +1157,14 @@ impl DocumentCore {
                                 ch,
                                 run.style.bold,
                                 run.style.italic,
+                                run.style.source_font_is_ttf,
                             )
                         }),
                         native_unavailable_reason,
                     ),
                     layout_metric,
                     provenance,
-                    oracle: self.font_environment.as_ref().map_or_else(
+                    oracle: self.resolved_font_environment().map_or_else(
                         OracleDecision::not_provided,
                         |env| OracleDecision {
                             status: "declared".into(),

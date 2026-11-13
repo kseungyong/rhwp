@@ -737,9 +737,19 @@ fn paint_op_work_units(op: &PaintOp) -> usize {
             .saturating_add(form.appearance.font_family.len())
             .saturating_add(form.name.len()),
         PaintOp::RawSvg { raw, .. } => raw.svg.len(),
-        PaintOp::FootnoteMarker { marker, .. } => {
-            marker.text.len().saturating_add(marker.font_family.len())
-        }
+        PaintOp::FootnoteMarker { marker, .. } => marker
+            .text
+            .len()
+            .saturating_add(marker.font_family.len())
+            .saturating_add(
+                marker
+                    .source_run
+                    .as_ref()
+                    .and_then(|run| run.layout_positions.as_ref())
+                    .map_or(0, |positions| {
+                        positions.len().saturating_mul(std::mem::size_of::<f64>())
+                    }),
+            ),
         PaintOp::ControlLabel { label, .. } => label.len(),
         PaintOp::Line { .. }
         | PaintOp::Rectangle { .. }
@@ -797,7 +807,7 @@ fn text_visual_geometry_is_valid(
     run: &TextRunNode,
     replay_text: &str,
 ) -> bool {
-    [
+    if ![
         bbox.x,
         bbox.y,
         bbox.width,
@@ -811,19 +821,29 @@ fn text_visual_geometry_is_valid(
     ]
     .iter()
     .all(|value| value.is_finite())
-        && bbox.width >= 0.0
-        && bbox.height >= 0.0
-        && run.style.font_size > 0.0
-        && run.style.ratio > 0.0
-        && run
-            .replay_positions_for(
-                &replay_text
-                    .chars()
-                    .take(crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN)
-                    .collect::<String>(),
-            )
-            .iter()
-            .all(|position| position.is_finite())
+        || bbox.width < 0.0
+        || bbox.height < 0.0
+        || run.style.font_size < 0.0
+        || run.style.ratio < 0.0
+    {
+        return false;
+    }
+    let positive_scale = run.style.font_size > 0.0 && run.style.ratio > 0.0;
+    // 크기가 있는 장평 0 또는 손상된 기하를 글꼴 질의 전에 계속 거절한다.
+    if !positive_scale && !(run.style.font_size == 0.0 && bbox.width == 0.0) {
+        return false;
+    }
+    let positions = run.replay_positions_for(
+        &replay_text
+            .chars()
+            .take(crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN)
+            .collect::<String>(),
+    );
+    // 논리 원문·caret 상자는 보존하되 크기와 모든 전진이 0인 run에는 잉크가 없다.
+    let zero_size_no_ink = run.style.font_size == 0.0
+        && positions.len() == replay_text.chars().count() + 1
+        && positions.iter().all(|position| *position == 0.0);
+    (positive_scale || zero_size_no_ink) && positions.iter().all(|position| position.is_finite())
 }
 
 // Validate the same producer-owned drawing serialized to the browser. Raw form
@@ -1629,7 +1649,7 @@ impl CanvasKitReplayPlanBuilder {
                 } else if run
                     .char_overlap
                     .as_ref()
-                    .is_none_or(|overlap| overlap.border_type > 4)
+                    .is_none_or(|overlap| overlap.border_type > 13)
                 {
                     Some("invalidCharOverlap")
                 } else {
@@ -2222,6 +2242,7 @@ fn clip_kind_detail(clip_kind: ClipKind) -> &'static str {
         ClipKind::TableCell => "tableCell",
         ClipKind::TextBox => "textBox",
         ClipKind::Generic => "generic",
+        ClipKind::PrintBitmapFill => "printBitmapFill",
     }
 }
 
@@ -2236,7 +2257,12 @@ fn text_run_transition_detail(
     if !text_visual_geometry_is_valid(bbox, run, &display_text) {
         return Some("invalidGeometry");
     }
-    let has_paint_effects = run.style.outline_type != 0
+    // 위 질의가 증명한 잉크 없는 원문에는 glyph·shaping 자원이 필요하지 않다.
+    if run.style.font_size == 0.0 {
+        return None;
+    }
+    let has_paint_effects = run.style.text_paint.is_some()
+        || run.style.outline_type != 0
         || run.style.shadow_type != 0
         || run.style.emboss
         || run.style.engrave
@@ -2248,7 +2274,7 @@ fn text_run_transition_detail(
             0x1100..=0x11ff | 0xa960..=0xa97f | 0xd7b0..=0xd7ff
         )
     });
-    // Boxed-PUA + 장평/effects already replay as a vector box; old Hangul does not.
+    // Enclosed PUA + 장평/effects already replay as a vector frame; old Hangul does not.
     if text_requires_complex_shaping(&display_text) || (has_paint_effects && has_old_hangul) {
         return Some("scriptTextRequiresShaping");
     }
@@ -2262,8 +2288,9 @@ fn text_requires_complex_shaping(text: &str) -> bool {
             code_point,
             0x1100..=0x11ff | 0xa960..=0xa97f | 0xd7b0..=0xd7ff
         );
-        let is_boxed_pua = matches!(code_point, 0xf02b1..=0xf02c4);
-        if is_old_hangul || is_boxed_pua {
+        // 합성 PUA 기호는 글리프가 아니라 테두리와 안쪽 글자로 replay 한다.
+        // Studio nominal replay 와 같은 판정이다(네모 0 U+F02B0 포함).
+        if is_old_hangul || super::enclosed_pua(ch).is_some() {
             return false;
         }
 
@@ -2282,6 +2309,8 @@ fn text_requires_complex_shaping(text: &str) -> bool {
                 | 0x1d400..=0x1d7ff
                 // 독립 SFNT 글리프로 재생하는 두 그림자 원형 기호. M/Cf는 아래에서 보류한다.
                 | 0x1f53e..=0x1f53f
+                // Wingdings bdash2의 일대일 표시 투영. 결합 문자 가드는 그대로 적용한다.
+                | 0x1f8ad
                 | 0x20000..=0x323af
         );
         let category_requires_shaping = matches!(
@@ -2393,6 +2422,7 @@ fn resolved_image_kind_detail(value: ResolvedImageKind) -> &'static str {
         ResolvedImageKind::FormatConverted => "formatConverted",
         ResolvedImageKind::SourceWindow => "sourceWindow",
         ResolvedImageKind::OutputDevice => "outputDevice",
+        ResolvedImageKind::OutputDeviceWindow => "outputDeviceWindow",
         ResolvedImageKind::BakedWatermark => "bakedWatermark",
     }
 }
@@ -3145,6 +3175,7 @@ mod tests {
             border_type: 1,
             inner_char_size: 100,
             composition: None,
+            empty_ink: false,
         });
         superscript
             .style
@@ -3204,6 +3235,7 @@ mod tests {
             border_type: 1,
             inner_char_size: 100,
             composition: None,
+            empty_ink: false,
         });
         let rotated_tree = tree_with_ops(vec![PaintOp::char_overlap(bbox(), rotated)]);
         let rotated_plan =
@@ -3220,9 +3252,10 @@ mod tests {
     fn malformed_and_vertical_special_visuals_fail_closed_while_rotation_is_direct() {
         let mut invalid_overlap = text_run("A");
         invalid_overlap.char_overlap = Some(CharOverlapInfo {
-            border_type: 9,
+            border_type: 14,
             inner_char_size: 100,
             composition: None,
+            empty_ink: false,
         });
         let mut invalid_leader = text_run("A");
         invalid_leader
@@ -3303,8 +3336,9 @@ mod tests {
             CanvasKitBoundedWorkCount::Exceeded
         );
 
+        // Hanyang PUA 옛한글 한 글자는 자모 셋으로 펼쳐진다(1→3 표시 투영).
         let pua_source =
-            "\u{F012B}".repeat(crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN / 3 + 1);
+            "\u{E0BC}".repeat(crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN / 3 + 1);
         assert!(pua_source.chars().count() <= crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN);
         assert!(
             expand_pua_render_text(&pua_source).chars().count()
@@ -3350,7 +3384,7 @@ mod tests {
         );
 
         let projected_text =
-            "\u{F012B}".repeat(CANVASKIT_DOCUMENT_PREFLIGHT_MAX_WORK_UNITS as usize / 3 + 1);
+            "\u{E0BC}".repeat(CANVASKIT_DOCUMENT_PREFLIGHT_MAX_WORK_UNITS as usize / 3 + 1);
         assert!(
             projected_text.chars().count() < CANVASKIT_DOCUMENT_PREFLIGHT_MAX_WORK_UNITS as usize
         );
@@ -3499,6 +3533,7 @@ mod tests {
         let tree = tree_with_ops(vec![PaintOp::footnote_marker(
             bbox(),
             FootnoteMarkerNode {
+                source_run: None,
                 number: 1,
                 text: "1)".to_string(),
                 base_font_size: 12.0,

@@ -19,19 +19,29 @@ impl BodyFootnoteMeasure<'_> {
         paragraphs: &[crate::model::paragraph::Paragraph],
     ) -> Option<f64> {
         let page = st.pages.last().filter(|page| !page.footnotes.is_empty())?;
+        let policy = st.footnote_frame_policy();
+        let notes = if policy.spans_page() {
+            std::borrow::Cow::Borrowed(page.footnotes.as_slice())
+        } else {
+            std::borrow::Cow::Owned(
+                page.footnotes
+                    .iter()
+                    .filter(|note| {
+                        policy.target(note.column_index) == policy.target(st.current_column)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
         let layout = self.configured_layout(st);
-        if !layout.footnote_area_has_stored_lines(
-            &page.footnotes,
-            paragraphs,
-            st.layout.body_area.width,
-        ) {
+        if !layout.footnote_area_has_stored_lines(&notes, paragraphs, st.footnote_area_width()) {
             return None;
         }
         Some(layout.estimate_footnote_area_height_with_metrics(
-            &page.footnotes,
+            &notes,
             paragraphs,
             self.styles,
-            st.layout.body_area.width,
+            st.footnote_area_width(),
             st.footnote_separator_overhead,
             st.footnote_between_notes_margin,
         ))
@@ -58,7 +68,7 @@ impl BodyFootnoteMeasure<'_> {
             .footnote_with_block_table_content_height(
                 footnote,
                 self.styles,
-                st.layout.body_area.width,
+                st.footnote_area_width(),
                 fragment,
             )
     }
@@ -69,8 +79,26 @@ impl BodyFootnoteMeasure<'_> {
             .footnote_paragraphs_content_height(
                 &footnote.paragraphs,
                 self.styles,
-                st.layout.body_area.width,
+                st.footnote_area_width(),
                 None,
+                0.0,
+            )
+    }
+
+    /// 앵커 쪽에 반드시 남는 각주 첫 줄의 높이. 한/글은 각주를 줄 단위로 다음 쪽에
+    /// 이어 놓을 수 있어 앵커 줄이 들어가는지는 이 높이로 판정한다.
+    pub fn first_line_content_height(&self, st: &TypesetState, footnote: &Footnote) -> f64 {
+        self.configured_layout(st)
+            .footnote_paragraphs_content_height(
+                &footnote.paragraphs,
+                self.styles,
+                st.footnote_area_width(),
+                Some(FootnoteFragment {
+                    start_line: 0,
+                    end_line: 1,
+                    draw_separator: true,
+                    draw_number: true,
+                }),
                 0.0,
             )
     }
@@ -100,7 +128,7 @@ impl crate::renderer::typeset::TypesetEngine {
             && layout.footnote_area_has_stored_lines(
                 &page.footnotes,
                 paragraphs,
-                st.layout.body_area.width,
+                st.footnote_area_width(),
             )
         {
             return;
@@ -111,7 +139,7 @@ impl crate::renderer::typeset::TypesetEngine {
             &page.footnotes,
             paragraphs,
             styles,
-            st.layout.body_area.width,
+            st.footnote_area_width(),
             st.footnote_separator_overhead,
             st.footnote_between_notes_margin,
         );

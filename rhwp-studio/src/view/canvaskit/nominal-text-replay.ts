@@ -1,3 +1,5 @@
+import { enclosedPua } from '../../core/enclosed-pua.ts';
+
 // 일반 glyph replay의 문자 범위 계약. 조합/형식 문자와 복합 script는 계속 shaping 경로로 보낸다.
 const COMPLEX_SHAPING_UNICODE_CATEGORY = /[\p{M}\p{Cf}\p{Emoji_Modifier}]/u;
 const STANDALONE_PICTOGRAPH = /\p{Extended_Pictographic}/u;
@@ -8,8 +10,7 @@ export function textRequiresComplexShaping(text: string): boolean {
     const isOldHangul = (codePoint >= 0x1100 && codePoint <= 0x11ff)
       || (codePoint >= 0xa960 && codePoint <= 0xa97f)
       || (codePoint >= 0xd7b0 && codePoint <= 0xd7ff);
-    const isBoxedPua = codePoint >= 0xf02b0 && codePoint <= 0xf02c4;
-    if (isOldHangul || isBoxedPua) continue;
+    if (isOldHangul || enclosedPua(codePoint)) continue;
 
     const nominalGlyphReplayIsSafe = codePoint <= 0x02ff
       || (codePoint >= 0x0370 && codePoint <= 0x058f)
@@ -26,6 +27,12 @@ export function textRequiresComplexShaping(text: string): boolean {
       || STANDALONE_PICTOGRAPH.test(character)
       // 기존 그림자 원형 기호는 Extended_Pictographic 속성이 없는 일반 기호다.
       || (codePoint >= 0x1f53e && codePoint <= 0x1f53f)
+      // Wingdings bdash2의 단독 표시 기호. 아래 결합 문자 가드는 그대로 유지한다.
+      || codePoint === 0x1f8ad
+      // 보충 사설 사용 영역도 BMP 사설 영역과 같이 공급된 단일 글리프를 재생한다.
+      // 결합 문자·변형 선택자·연결자는 아래 범주 검사에서 계속 보류한다.
+      || (codePoint >= 0xf0000 && codePoint <= 0xffffd)
+      || (codePoint >= 0x100000 && codePoint <= 0x10fffd)
       || (codePoint >= 0x20000 && codePoint <= 0x323af);
     if (!nominalGlyphReplayIsSafe || COMPLEX_SHAPING_UNICODE_CATEGORY.test(character)) {
       return true;

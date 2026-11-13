@@ -170,7 +170,35 @@ impl TypesetEngine {
                     cut_row_h[r]
                 };
                 let h = row_query.required_height(base, consumed, cs_before);
-                if r == cursor_row || consumed + cs_before + h <= avail_for_rows {
+                let required = consumed + cs_before + h;
+                // 블록 스캔과 같은 물리 상자를 행별로 더해도 합산 순서의 끝자리 오차가
+                // 생긴다. HU/px 여유를 더하지 않고 누적 연산 규모의 f64 오차만 구분한다.
+                let roundoff = f64::EPSILON
+                    * (required.abs() + avail_for_rows.abs()).max(1.0)
+                    * (r - cursor_row + 3) as f64;
+                let fits = required <= avail_for_rows
+                    || (required.is_finite()
+                        && avail_for_rows.is_finite()
+                        && required - avail_for_rows <= roundoff);
+                // 이월 게이트가 첫 rowspan 묶음을 0행 뒤에서 자르기로 정했고 0행 칸들의
+                // 내용과 안 여백이 남은 공간에 들면, 0행은 선언이 넘쳐도 쪽 바닥에서 닫힌다
+                // (#8105 행 수용 규칙과 같은 계약). 걸친 병합 칸의 남은 선언은 다음 조각이
+                // 잇는다(한/글 2020: HPV 코호트 보고서 18쪽 9×9 표 0행 2500HU 가 2229HU 로
+                // 닫히고, 19쪽 첫 행은 병합 칸 5000HU 의 나머지 2771HU 다).
+                let opening_rest = (avail_for_rows - consumed - cs_before).max(0.0);
+                if !fits
+                    && r == 0
+                    && r == cursor_row
+                    && v.opening_block_cuts_after_first_row
+                    && mt.row_cells_content_fit(r, opening_rest)
+                {
+                    consumed += cs_before + opening_rest;
+                    r += 1;
+                    end_row = r;
+                    end_row_height_override = Some(opening_rest);
+                    return true;
+                }
+                if r == cursor_row || fits {
                     consumed += cs_before + h;
                     r += 1;
                     end_row = r;
@@ -346,6 +374,65 @@ impl TypesetEngine {
                         return false;
                     }
                 }
+                // [#8891] 표 중간에서 병합 칸이 **시작하는** 행. 그 칸의 저장 글줄이 칸 안에서 쪽
+                // 프레임을 다시 시작했다면(vpos 되감김) 저장본은 그 칸을 이 쪽 경계에서 나눴다.
+                // 이 행에서 닫히는 일반 칸 내용이 남은 공간에 들면 행을 쪽 바닥에서 닫고, 병합
+                // 칸의 나머지는 걸침 셀 원장이 다음 조각에 잇는다(한/글 2020: HPV 코호트 보고서
+                // 77쪽 구역 2 표 20행 선언 1650HU → 1560HU, 병합 칸 첫 줄만 77쪽). 되감김 기록이
+                // 없으면 내용이 들어도 행을 통째로 넘긴다(1480000-201900510 113쪽 27행).
+                if mt.allows_row_break_split()
+                    && can_intra_split
+                    && r > cursor_row
+                    && !has_prior_rowspan_cover
+                    && !row_has_nested
+                    && rest > 0.0
+                    && row_start_cut.is_empty()
+                    && table
+                        .cells
+                        .iter()
+                        .any(|cell| cell.row as usize == r && cell.row_span > 1)
+                {
+                    let table::scan::row::RowBandProbe {
+                        probe,
+                        visible_height,
+                    } = row_query.probe_band(row_start_cut, rest);
+                    let ordinary_fit = table
+                        .cells
+                        .iter()
+                        .filter(|cell| cell.row as usize == r && cell.row_span <= 1)
+                        .all(|cell| {
+                            mt.cells
+                                .iter()
+                                .find(|m| m.row == cell.row as usize && m.col == cell.col as usize)
+                                .is_some_and(|m| {
+                                    m.total_content_height + m.padding_top + m.padding_bottom < rest
+                                })
+                        });
+                    let span_records_page_reset = table
+                        .cells
+                        .iter()
+                        .filter(|cell| cell.row as usize == r && cell.row_span > 1)
+                        .any(|cell| {
+                            layout_engine.cell_records_internal_page_reset(cell, table, styles)
+                        });
+                    if std::env::var("RHWP_DIAG_SCAN").is_ok() {
+                        eprintln!(
+                            "DIAG_SCAN SPAN_OPEN_BAND r={r} h={h:.1} rest={rest:.1} visible={visible_height:.1} fully={} ordinary_fit={ordinary_fit} reset={span_records_page_reset}",
+                            probe.fully_consumed
+                        );
+                    }
+                    if span_records_page_reset
+                        && ordinary_fit
+                        && probe.fully_consumed
+                        && visible_height <= rest + 0.5
+                    {
+                        consumed += cs_before + rest;
+                        r += 1;
+                        end_row = r;
+                        end_row_height_override = Some(rest);
+                        return false;
+                    }
+                }
                 // [#2236 진단] rowspan 행 경계 정지 — 동작 불변.
                 if std::env::var("RHWP_DIAG_SCAN").is_ok() {
                     eprintln!(
@@ -384,6 +471,7 @@ impl TypesetEngine {
                 row_start_cut,
                 row_count,
                 is_continuation,
+                source_frame_origin_unverified: v.source_frame_origin_unverified,
                 profile: &st.profile,
             }
             .resolve(
@@ -433,7 +521,13 @@ impl TypesetEngine {
             // 둘째 줄을 다음 쪽 첫머리에 둔다. 기록이 없는 표 15·18 은 쪽 끝 행을 가르지
             // 않는다). 행이 쪽 중간에 오면 기록을 따르지 않는다.
             let rest_after_whole_row = avail_for_rows - consumed - cs_before - row_total;
-            let stored_restart_page_cut = (whole_row_fits
+            // 온전한 행 상자 판정이 반올림 차로 떨어져도, 행의 모든 셀 내용(안 여백 포함)이
+            // 남은 밴드에 들면 아래 행내 분할은 모든 줄을 이 쪽에 둔다 — 행 전체를 둔다는
+            // 같은 결정이다. 그 결정에도 같은 저장 재시작 컷을 적용한다.
+            let whole_row_content_fits = whole_row_fits
+                || layout_engine.row_complete_cut_content_height(table, r, styles)
+                    <= avail_for_rows - consumed - cs_before + 0.5;
+            let stored_restart_page_cut = (whole_row_content_fits
                 && r > cursor_row
                 && row_start_cut.is_empty()
                 && r + 1 < row_count
@@ -703,6 +797,8 @@ impl TypesetEngine {
                 enabled: source_tail_enabled,
                 mid_frame_only,
             } = source_tail_query.gate(&res);
+            let source_frame_owned =
+                layout_engine.row_start_owns_stored_frame(table, r, row_start_cut, styles);
             let mut uses_source_frame_tail = false;
             if source_tail_enabled {
                 // Capacity can pass an authenticated source frame even when
@@ -770,6 +866,7 @@ impl TypesetEngine {
             // 재시작이 용량 컷보다 뒤면 예산을 넘으므로 종전 용량 컷을 쓴다.
             let mut stored_restart_continuation_cut = false;
             if !row_start_cut.is_empty()
+                && source_frame_owned
                 && !uses_source_frame_tail
                 && !res.fully_consumed
                 && mt.allows_row_break_split()
@@ -1040,15 +1137,28 @@ impl TypesetEngine {
                 // 그린다(한/글 2020: 1613000 188쪽 행 26 «6. 모니터링» 선언 2614HU 34.9px, 남은 29.9px —
                 // 아래 괘선 1040.6 = 닫는 선, 189쪽은 행 27 부터). 남는 선언 몫은 다음 조각이 행 자신의
                 // 칸 선언으로 다시 재고, 1280HU 이하이면 쪽 경계에서 버린다.
+                // [#8464] 수용 판정의 «내용»은 글줄 상자와 칸 안 여백 전체다 — 보이는 글자가 없는
+                // 빈 줄도 줄 상자와 여백을 차지한다(한/글 2020: 새터민 보고서 111쪽 빈 간격 행
+                // 줄 100 + 여백 282HU 가 남은 3.9px 에 안 들어 112쪽 첫머리로 간다). 남은 공간에
+                // 25px 같은 하한은 없다(합성 `samples/issue8464`, 남은 17~20px 에서도 수용).
+                // 이 근거는 자리차지 표의 것이다. 어울림 표는 같은 형상에서 한/글이 행을 넘긴
+                // 사례가 있어(수산업법 시행령 별표 6, 남은 25.2px · 내용 19.8px) 종전 하한을 둔다.
                 let declared_overflow_rest = (avail_for_rows - consumed - cs_before).max(0.0);
+                let page_rest_admits_content_row = matches!(
+                    table.common.text_wrap,
+                    crate::model::shape::TextWrap::TopAndBottom
+                ) || declared_overflow_rest >= MIN_TOP_KEEP_PX;
                 if mt.allows_row_break_split()
+                    && page_rest_admits_content_row
                     && r > cursor_row
                     && !rowspan_touched[r]
                     && row_start_cut.is_empty()
                     && !res.end_cut.is_empty()
-                    && row_total > declared_overflow_rest + 0.5
-                    && res.consumed_height + padding <= declared_overflow_rest + 0.5
-                    && declared_overflow_rest >= MIN_TOP_KEEP_PX
+                    && row_total > declared_overflow_rest
+                    && layout_engine.row_content_fits_page_rest(
+                        res.consumed_height + mt.max_padding_for_row(r),
+                        declared_overflow_rest,
+                    )
                 {
                     if std::env::var("RHWP_DIAG_SCAN").is_ok() {
                         eprintln!(
@@ -1128,6 +1238,37 @@ impl TypesetEngine {
                         eprintln!(
                             "DIAG_SCAN BAND_CUT r={} limit={:.1} content={:.1} row_total={:.1}",
                             r, split_end_limit, res.consumed_height, row_total
+                        );
+                    }
+                    return false;
+                }
+                // 위 밴드 컷이 받지 않은 행 중, 앞 행의 병합 칸 안쪽에만 있는 행은 글줄과
+                // 안 여백이 남은 높이에 다 들어가면 이 쪽에서 남은 높이로 끝난다. 다음
+                // 쪽은 다음 행이 선언 높이로 시작하고, 남는 빈 띠의 크기는 조건이 아니다
+                // (한/글 2020 합성 `samples/rowspan-band-fit`: 줄간격·안 여백·글자 크기를 바꾼
+                // 네 계열에서 문턱은 늘 «내용 + 안 여백 ≤ 남은 높이»). 병합 칸이 이 행에서
+                // 시작하거나 끝나면 그 칸의 남은 내용을 같은 행의 컷으로 이어야 하므로 제외한다.
+                let band_rest = (avail_for_rows - consumed - cs_before).max(0.0);
+                let covered_row_closes = rowspan_touched[r]
+                    && !table::scan::row::row_bounds_a_rowspan(table, r)
+                    && mt.allows_row_break_split()
+                    && r > cursor_row
+                    && res.fully_consumed
+                    && !res.end_cut.is_empty()
+                    && row_total > band_rest + 0.5
+                    && table::scan::row::row_box_fits(res.consumed_height + padding, band_rest);
+                if covered_row_closes {
+                    consumed += cs_before + band_rest;
+                    r += 1;
+                    end_row = r;
+                    end_row_height_override = Some(band_rest);
+                    if std::env::var("RHWP_DIAG_SCAN").is_ok() {
+                        eprintln!(
+                            "DIAG_SCAN COVERED_ROW_CLOSE r={} rest={:.1} content={:.1} row_total={:.1}",
+                            r - 1,
+                            band_rest,
+                            res.consumed_height,
+                            row_total
                         );
                     }
                     return false;
@@ -1319,7 +1460,10 @@ impl TypesetEngine {
             let source_blank_band = layout_engine
                 .stored_nested_plain_cut_frame_extra(table, r, row_start_cut, &res.end_cut, styles)
                 .map(|extra| {
-                    (split_total + extra).min((avail_for_rows - consumed - cs_before).max(0.0))
+                    (split_total + extra).min(
+                        (v.blank_row_available_height().min(avail_for_rows) - consumed - cs_before)
+                            .max(0.0),
+                    )
                 })
                 .filter(|height| *height > split_total);
             let split_total = source_blank_band.unwrap_or(split_total);
@@ -1660,12 +1804,19 @@ impl TypesetEngine {
                 // CellUnit cut omits.  Preserve that measured difference; a
                 // document-independent pixel tolerance would otherwise let
                 // unrelated rows consume a physical page tail.
+                // The cut was chosen by `advance_row_cut_for_physical_band`,
+                // which treats HU→px rounding noise up to
+                // `ROW_CUT_CAPACITY_FP_EPSILON_PX` as an exact fit. The same
+                // comparison rule applies here; otherwise a cut that fills the
+                // band exactly is rejected for float noise and loses a line
+                // (#8529).
                 let hwpx_stored_rowbreak_cut = st.profile.hwpx_stored_layout()
                     && !table.common.treat_as_char
                     && mt.allows_row_break_split()
                     && !mixed_nested_owner_guard;
-                let measured_rowbreak_paint_tail =
-                    (split_total - res.consumed_height - padding).max(0.0);
+                let measured_rowbreak_paint_tail = (split_total - res.consumed_height - padding)
+                    .max(0.0)
+                    + crate::renderer::layout::table_layout::ROW_CUT_CAPACITY_FP_EPSILON_PX;
                 let stored_frame_tail_overflow = if uses_source_frame_tail {
                     // `split_total` is the painted row footprint, whereas
                     // the source frame is selected in CellUnit content
@@ -1791,6 +1942,7 @@ impl TypesetEngine {
                             source_first_fragment_overflow_allowance
                         } else if hwpx_stored_rowbreak_cut {
                             (split_total2 - res2.consumed_height - padding).max(0.0)
+                                + crate::renderer::layout::table_layout::ROW_CUT_CAPACITY_FP_EPSILON_PX
                         } else if native_split_continuation_row_tail || mixed_nested_owner_guard {
                             0.1
                         } else {
@@ -1960,13 +2112,14 @@ impl TypesetEngine {
         {
             let accepted_height = consumed - consumed_before_row - cs_before;
             let available = (avail_for_rows - consumed_before_row - cs_before).max(0.0);
-            if let Some(declared) = layout_engine.reflow_row_declared_first_frame(
+            if let Some(declared) = layout_engine.row_declared_first_frame(
                 table,
                 scan_start_row,
                 mt.row_heights[scan_start_row],
+                &split_end_cut,
                 styles,
             ) {
-                let frame_height = declared.min(available);
+                let frame_height = declared.height.min(available);
                 if accepted_height > 0.0 && frame_height > accepted_height + 0.5 {
                     consumed += frame_height - accepted_height;
                     end_row_height_override = Some(frame_height);

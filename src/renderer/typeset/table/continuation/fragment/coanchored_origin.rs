@@ -36,7 +36,7 @@ impl TypesetEngine {
         let table = input.source.table;
         if !std::ptr::eq(table, input.source.row_geometry_table)
             || !matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             || !input.prepared.source_next_positive_rewind
@@ -141,7 +141,7 @@ impl TypesetEngine {
     ) -> Option<ParagraphFloatPlacement> {
         let para = input.source.paragraph;
         let table = input.source.table;
-        if !st.profile.hwp5_stored_pagination_layout()
+        if !(st.profile.hwp5_stored_pagination_layout() || st.profile.hwpx_stored_layout())
             || st.profile.session_edited()
             || input.start.is_continuation
             || input.start.cursor_row != 0

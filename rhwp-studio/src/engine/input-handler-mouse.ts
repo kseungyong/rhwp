@@ -559,6 +559,7 @@ export function onClick(this: any, e: MouseEvent): void {
                 origHorzOffset: multiMoveRefs[0].origHorzOffset,
                 origVertOffset: multiMoveRefs[0].origVertOffset,
                 startPageX: px, startPageY: py,
+                grabOffsetX: px - minX, grabOffsetY: py - minY,
                 lastPageX: px, lastPageY: py,
                 totalDeltaH: 0, totalDeltaV: 0,
                 pageIndex: pi,
@@ -701,6 +702,7 @@ export function onClick(this: any, e: MouseEvent): void {
                     origHorzOffset: props.horzOffset,
                     origVertOffset: props.vertOffset,
                     startPageX: px, startPageY: py,
+                    grabOffsetX: px - picBbox.x, grabOffsetY: py - picBbox.y,
                     lastPageX: px, lastPageY: py,
                     totalDeltaH: 0, totalDeltaV: 0,
                     pageIndex: pi,
@@ -2086,6 +2088,9 @@ function finishMouseUp(this: any, _e: MouseEvent): void {
       && hfSel.start.charOffset === hfSel.end.charOffset;
     if (samePos) this.cursor.clearSelection();
   }
+
+  // 연속 형광펜 모드: 드래그로 잡은 블록에 바로 칠한다
+  this.applyHighlightPenToSelection();
 
   // [Task #779] mouseup 영역 의 updateCaret 은 scrollCaretIntoView skip.
   // 본질: cursor 변경 trigger 영역 (mousedown / drag selection move 등) 에서 이미 cursor 위치

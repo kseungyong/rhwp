@@ -5,6 +5,7 @@ use super::*;
 /// 해소된 글자 스타일 (CharShape + FontFace → 렌더링용)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCharStyle {
+    pub text_paint: Option<crate::model::text_paint::TextPaintStyle>,
     /// 글꼴 이름 (한국어 = 기본값, font_families[0]과 동일)
     pub font_family: String,
     /// 7개 언어 카테고리별 글꼴 이름
@@ -24,9 +25,18 @@ pub struct ResolvedCharStyle {
     pub font_families_hft_hangul: Vec<bool>,
     /// 대체 여부와 무관하게 보존하는 원본 프로그램 종류다.
     pub font_families_source_hft: Vec<bool>,
+    /// 유형 미상과 구별한 원본 언어 슬롯의 명시적 TTF 선언이다.
+    pub font_families_source_ttf: Vec<bool>,
+    /// 실제 원본 주 이름으로 선택한 프로그램. 대체 후보의 신원과 구분한다.
+    pub font_families_primary_program:
+        Vec<Option<crate::renderer::font_environment::FontProgramIdentity>>,
+    /// 독립 Print로 굵기 전진 계약을 확인한 원본 HFT 프로그램이다.
+    pub font_families_verified_hft_bold_tracking: Vec<bool>,
     pub font_families_hft_print_frame: Vec<bool>,
     /// 세션이 명시적으로 선택한 프로그램의 자연 윤곽 폭을 보존한다.
     pub font_families_preserve_glyph_ink: Vec<bool>,
+    /// 언어 슬롯별 명시적인 자연 전진 선택. paint의 윤곽 보존과 구분한다.
+    pub font_families_natural_program_metrics: Vec<bool>,
     /// 언어 슬롯이 대체되지 않은 원본 HFT 기호 전각 폭을 갖는지.
     pub font_families_hft_fullwidth_dot: Vec<bool>,
     /// [#7418] 한/글이 한글 뒤 ASCII 구두점도 **영문 슬롯** 글꼴로 재고 그리는가.
@@ -138,8 +148,12 @@ impl Default for ResolvedCharStyle {
             font_families_glyph_fallback_advance_explicit: Vec::new(),
             font_families_hft_hangul: Vec::new(),
             font_families_source_hft: Vec::new(),
+            font_families_source_ttf: Vec::new(),
+            font_families_primary_program: Vec::new(),
+            font_families_verified_hft_bold_tracking: Vec::new(),
             font_families_hft_print_frame: Vec::new(),
             font_families_preserve_glyph_ink: Vec::new(),
+            font_families_natural_program_metrics: Vec::new(),
             font_families_hft_fullwidth_dot: Vec::new(),
             ascii_punct_latin_slot: false,
             explicit_latin_slot: false,
@@ -161,6 +175,7 @@ impl Default for ResolvedCharStyle {
             ratio: 1.0,
             ratios: Vec::new(),
             border_fill_id: 0,
+            text_paint: None,
             outline_type: 0,
             shadow_type: 0,
             shadow_color: 0x00B2B2B2,
@@ -248,6 +263,36 @@ impl ResolvedCharStyle {
             0
         };
         self.font_families_source_hft
+            .get(slot)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// 표시용 대체 글꼴과 구분해 원본 언어 슬롯의 TTF 선언을 조회한다.
+    pub fn source_ttf_for_lang(&self, lang_index: usize) -> bool {
+        let slot = if lang_index < self.font_families.len()
+            && !self.font_families[lang_index].is_empty()
+        {
+            lang_index
+        } else {
+            0
+        };
+        self.font_families_source_ttf
+            .get(slot)
+            .copied()
+            .unwrap_or(false)
+            && !self.source_hft_for_lang(slot)
+    }
+
+    pub fn verified_hft_bold_tracking_for_lang(&self, lang_index: usize) -> bool {
+        let slot = if lang_index < self.font_families.len()
+            && !self.font_families[lang_index].is_empty()
+        {
+            lang_index
+        } else {
+            0
+        };
+        self.font_families_verified_hft_bold_tracking
             .get(slot)
             .copied()
             .unwrap_or(false)
@@ -456,6 +501,8 @@ pub struct ResolvedBorderStyle {
     pub image_fill: Option<ResolvedImageFill>,
     /// 대각선 속성 비트 (BorderFill.attr)
     pub diagonal_attr: u16,
+    /// 자동으로 나뉜 표의 경계는 셀의 네 변 대신 diagonal 선을 소비한다.
+    pub break_cell_separate_line: bool,
     /// 대각선 정보
     pub diagonal: DiagonalLine,
     /// 중심선 방향
@@ -496,6 +543,7 @@ impl Default for ResolvedBorderStyle {
             gradient: None,
             image_fill: None,
             diagonal_attr: 0,
+            break_cell_separate_line: false,
             diagonal: DiagonalLine::default(),
             center_line: CenterLine::None,
         }
@@ -505,12 +553,28 @@ impl Default for ResolvedBorderStyle {
 /// 해소된 스타일 세트 (DocInfo에서 변환)
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedStyleSet {
+    /// 문단 모양과 독립적인 현재 구역의 기본 탭 폭. 내부 composition/측정/배치
+    /// 범위에서만 설정하며 문서의 공유 문단 모양을 변경하지 않는다.
+    pub(crate) section_tab_width_bits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 원본 HWP3 또는 그 HWPX 변환의 글꼴 꾸밈 출처.
+    pub(crate) source_hwp3_native: bool,
     /// 문서 지정 대체가 있어도 현재 선택은 자기 메트릭을 가진 원본 TTF인 슬롯.
     /// 값은 문서가 선언한 대체 프로그램의 해소 결과다. 저장 줄 전체가 이 대체
     /// 프로그램의 채움과 일치하고 현재 원본 프로그램과 다른 경우에만 사용한다.
     pub(crate) source_program_projection_slots:
-        std::collections::HashMap<(u32, usize), ResolvedCharStyle>,
+        std::sync::Arc<std::collections::HashMap<(u32, usize), ResolvedCharStyle>>,
+    /// 측정과 paint에 함께 전파하는 세션의 첨자 계약이다.
+    pub script_metrics: crate::renderer::script_metrics::ScriptMetricsContract,
     pub(crate) native_pua_fonts: std::sync::Arc<crate::renderer::native_pua_fonts::NativePuaFonts>,
+    /// 표시용 대체는 같은 family의 다른 원본 슬롯이 등록한 폭도 소비하지 않는다.
+    /// 공급 요청과 실제 측정이 같은 스타일·언어별 소유 판정을 읽는다.
+    pub(crate) display_only_otf_slots: std::sync::Arc<std::collections::HashSet<(u32, usize)>>,
+    /// 명시적 자연 전진 세션에서만 미분류 원본의 자동 TTF 조회를 선택 범위로 제한한다.
+    /// 기본 공급과 원본 메트릭 유지 환경은 기존 프로그램 전진 계약을 보존한다.
+    pub(crate) inferred_ttf_requires_selection: bool,
+    /// 원본과 같은 프로그램 이름을 유지한 언어 슬롯이다. 대체 표시용 TTF가
+    /// 같은 family로 등록돼 있어도 원본 TrueType 전진의 근거로 승격하지 않는다.
+    pub(crate) unsubstituted_font_slots: Vec<[bool; LANG_COUNT]>,
     /// HWP5 저장 겹침은 다시 열 때 -80%~+20% 범위로 해소된다.
     /// XML 입력의 원래 값과 구분하며 모델의 저장 바이트는 보존한다.
     pub(crate) char_overlap_size_bounds: Option<(i8, i8)>,
@@ -530,6 +594,8 @@ pub struct ResolvedStyleSet {
     /// Shared session measurements for DB-missing glyphs, not document styles.
     pub supplemental_metrics:
         Option<std::sync::Arc<crate::renderer::supplemental_metrics::SupplementalMetricSnapshot>>,
+    /// 스타일 번호별 글자 모양 번호 (styles[id].char_shape_id). 덧말 스타일이 쓴다.
+    pub style_char_shapes: Vec<u32>,
     /// 글자 스타일 목록 (char_shapes[id]에 대응)
     pub char_styles: Vec<ResolvedCharStyle>,
     /// 문단 스타일 목록 (para_shapes[id]에 대응)
@@ -560,6 +626,86 @@ pub struct ResolvedStyleSet {
 }
 
 impl ResolvedStyleSet {
+    pub(crate) fn section_tab_scope(&self, spacing: u32, dpi: f64) -> SectionTabScope {
+        // HWPX tabStop 8000 = tabStopVal 4000 = 40pt. 정의가 없는 0은
+        // 기존 기본값 4000 HWPUNIT을 사용한다. u32 전 범위를 f64로 정확히 읽는다.
+        let width = f64::from(if spacing == 0 { 8000 } else { spacing }) * dpi / 14400.0;
+        let previous = self
+            .section_tab_width_bits
+            .swap(width.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        SectionTabScope {
+            bits: std::sync::Arc::clone(&self.section_tab_width_bits),
+            previous,
+        }
+    }
+
+    pub(crate) fn default_tab_width(&self, fallback: f64) -> f64 {
+        let bits = self.section_tab_key();
+        if bits == 0 {
+            fallback
+        } else {
+            f64::from_bits(bits)
+        }
+    }
+
+    pub(crate) fn section_tab_key(&self) -> u64 {
+        self.section_tab_width_bits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn allows_native_otf_metrics(&self, char_style_id: u32, lang: usize) -> bool {
+        !self.display_only_otf_slots.contains(&(char_style_id, lang))
+    }
+
+    /// 원본 프로그램의 조회 성공과 그 전진을 소비할 권한은 다르다.
+    /// 미분류 face의 자동 조회는 기존 HFT 표시 프로그램의 소유를 보존한다.
+    /// TTF 선언, 확인된 원본 프로그램 신원 또는 명시적 자연 전진 선택만
+    /// 별도 TrueType 전진을 소비한다.
+    pub(crate) fn native_otf_metrics_source_ttf(&self, char_style_id: u32, lang: usize) -> bool {
+        self.char_styles
+            .get(char_style_id as usize)
+            .is_some_and(|style| {
+                style.source_ttf_for_lang(lang)
+                    || ((!self.inferred_ttf_requires_selection
+                        || style
+                            .font_families_natural_program_metrics
+                            .get(lang)
+                            .copied()
+                            .unwrap_or(false)
+                        || style
+                            .font_families_primary_program
+                            .get(lang)
+                            .is_some_and(Option::is_some))
+                        && self.requests_original_truetype(char_style_id, lang))
+            })
+    }
+
+    /// 파일의 글꼴 종류 비트와 실제 TrueType 프로그램 요청을 구분한다.
+    /// HWP5의 미분류 face도 원본 메트릭이 없으면 같은 이름의 실제 TTF를
+    /// 요청할 수 있다. 공급·프로그램 검증 전에는 기존 전진을 바꾸지 않는다.
+    pub(crate) fn requests_original_truetype(&self, char_style_id: u32, lang: usize) -> bool {
+        let Some(style) = self.char_styles.get(char_style_id as usize) else {
+            return false;
+        };
+        let primary = style
+            .font_family_for_lang(lang)
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        style.source_ttf_for_lang(lang)
+            || (!style.source_hft_for_lang(lang)
+                && self
+                    .unsubstituted_font_slots
+                    .get(char_style_id as usize)
+                    .and_then(|slots| slots.get(lang))
+                    .copied()
+                    .unwrap_or(false)
+                && !primary.is_empty()
+                && super::super::font_metrics_data::find_metric(primary, false, style.italic)
+                    .is_none())
+    }
+
     pub(crate) fn literal_figure_space_em(
         &self,
         char_style_id: u32,
@@ -575,10 +721,11 @@ impl ResolvedStyleSet {
             })
             .or_else(|| {
                 let style = self.char_styles.get(char_style_id as usize)?;
-                self.native_pua_fonts.literal_space_em(
+                self.native_pua_fonts.literal_space_em_for_source(
                     style.font_family_for_lang(lang_index),
                     style.bold,
                     style.italic,
+                    style.source_ttf_for_lang(lang_index),
                 )
             })
     }
@@ -601,3 +748,27 @@ impl ResolvedStyleSet {
             .map_or(raw, |(min, max)| raw.clamp(min, max))
     }
 }
+
+/// 문서 내부의 중첩 호출과 오류 반환에서도 원래 구역 context를 복구한다.
+/// 외부에 setter를 노출하지 않으며 서로 다른 문서의 styles는 owner를 공유하지 않는다.
+pub(crate) struct SectionTabScope {
+    bits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    previous: u64,
+}
+
+impl Drop for SectionTabScope {
+    fn drop(&mut self) {
+        self.bits
+            .store(self.previous, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+crate::storage::clone_fields!(ResolvedCharStyle, {text_paint, font_family, font_families, font_families_metric_trusted, font_families_glyph_fallback_advance_explicit, font_families_hft_hangul, font_families_source_hft, font_families_source_ttf, font_families_primary_program, font_families_verified_hft_bold_tracking, font_families_hft_print_frame, font_families_preserve_glyph_ink, font_families_natural_program_metrics, font_families_hft_fullwidth_dot, ascii_punct_latin_slot, explicit_latin_slot, font_families_metric_face, font_families_original_glyph_metric_face, font_space_em, font_size, font_sizes, font_positions, bold, italic, text_color, underline, underline_color, strike_color, strikethrough, letter_spacing, letter_spacings, ratio, ratios, border_fill_id, outline_type, shadow_type, shadow_color, shadow_offset_x, shadow_offset_y, emboss, engrave, superscript, subscript, emphasis_dot, underline_shape, strike_shape, kerning, shade_color});
+
+crate::storage::clone_fields!(ResolvedParaStyle, {alignment, vertical_alignment, line_spacing, line_spacing_type, margin_left, margin_right, indent, spacing_before, spacing_after, head_type, para_level, numbering_id, border_fill_id, border_spacing, border_connect, border_ignore_margin, default_tab_width, tab_stops, auto_tab_left, auto_tab_right, condense_min_space, english_break_unit, korean_break_unit, widow_orphan, keep_with_next, keep_lines, page_break_before});
+
+crate::storage::clone_fields!(ResolvedBorderStyle, {borders, fill_color, pattern, gradient, image_fill, diagonal_attr, break_cell_separate_line, diagonal, center_line});
+
+crate::storage::clone_fields!(ResolvedStyleSet, {section_tab_width_bits, script_metrics, source_hwp3_native, source_program_projection_slots, native_pua_fonts, display_only_otf_slots, inferred_ttf_requires_selection, unsubstituted_font_slots, char_overlap_size_bounds, source_char_shapes, resolved_dpi, isolated_jamo_font, page_number_char_style_id, page_number_font_is_hft, supplemental_metrics, style_char_shapes, char_styles, para_styles, border_styles, numberings, bullets, hwp3_variant, hft_ascii_halfwidth, kerning_measurement_context, horizontal_shaping_context});
+
+crate::storage::clone_fields!(ResolvedImageFill, {bin_data_id, fill_mode, brightness, contrast, effect});

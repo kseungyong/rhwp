@@ -12,20 +12,49 @@ pub(super) fn refresh_equation_rows(
     refresh_rows(composed, para, styles, false);
 }
 
+pub(super) fn try_refresh_equation_rows<S: crate::storage::Storage>(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+    styles: &ResolvedStyleSet,
+    storage: &S,
+) -> Result<(), S::Error> {
+    try_refresh_rows(composed, para, styles, false, storage)
+}
+
 fn refresh_rows(
     composed: &mut ComposedParagraph,
     para: &Paragraph,
     styles: &ResolvedStyleSet,
     regenerated: bool,
 ) {
-    refresh_single_tac_host_row(composed, para, styles);
-    let positions = para.control_text_positions();
+    match try_refresh_rows(
+        composed,
+        para,
+        styles,
+        regenerated,
+        &crate::storage::Unbounded,
+    ) {
+        Ok(()) => (),
+        Err(never) => match never {},
+    }
+}
+
+fn try_refresh_rows<S: crate::storage::Storage>(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+    styles: &ResolvedStyleSet,
+    regenerated: bool,
+    storage: &S,
+) -> Result<(), S::Error> {
+    try_refresh_single_tac_host_row(composed, para, styles, storage)?;
+    let positions = para.try_control_text_positions(storage)?;
     let dpi = styles.resolved_dpi.unwrap_or(DEFAULT_DPI);
-    let tac_offsets_px: Vec<_> = composed
-        .tac_controls
-        .iter()
-        .map(|(position, width, control)| (*position, hwpunit_to_px(*width, dpi), *control))
-        .collect();
+    let tac_offsets_px: Vec<_> = storage.collect(
+        composed
+            .tac_controls
+            .iter()
+            .map(|(position, width, control)| (*position, hwpunit_to_px(*width, dpi), *control)),
+    )?;
     // 글자 없는 수식 줄은 컨트롤 순번이 text 길이를 넘을 수 있다.
     // 표시 경로의 실제 줄 소속을 소비하며 text 범위로 다시 추측하지 않는다.
     let equation_owners =
@@ -62,6 +91,7 @@ fn refresh_rows(
         let mut changed = false;
         let mut has_equation = false;
         let mut has_form = false;
+        let mut all_current_simple_frames = true;
         let mut supported = true;
         for (control_index, (control, position)) in para.controls.iter().zip(&positions).enumerate()
         {
@@ -78,6 +108,13 @@ fn refresh_rows(
                 Control::Equation(equation) if equation.common.treat_as_char => {
                     has_equation = true;
                     let old_height = equation.common.height as i32;
+                    all_current_simple_frames &=
+                        para.line_segs.get(line_index).is_some_and(|source| {
+                            source.line_height > old_height
+                                && crate::renderer::equation::has_current_simple_math_frame(
+                                    equation,
+                                )
+                        });
                     let old_baseline =
                         old_height.saturating_mul(i32::from(equation.baseline)) / 100;
                     let (_, height, baseline) =
@@ -160,7 +197,6 @@ fn refresh_rows(
             continue;
         }
         // 실제 텍스트가 있는 줄은 텍스트의 어센트·하강부도 같은 합집합에 포함한다.
-        // 빈 run의 존재만으로 보이지 않는 텍스트 strut를 새로 추가하지 않는다.
         let text_height = line
             .runs
             .iter()
@@ -169,6 +205,29 @@ fn refresh_rows(
             .map(|style| px_to_hwpunit(style.font_size, dpi))
             .max()
             .unwrap_or(0);
+        // 글리프가 없어도 저장 TH·기준선과 원본 글자 크기가 같은 줄 상자는
+        // 수식과 별도로 점유를 소유한다. 빈 run의 존재만으로 상자를 만들거나
+        // 과거 수식 높이를 복원하지 않고, 온전한 저장 줄의 글자 소유를 확인한다.
+        let stored_text_strut_height = para
+            .line_segs
+            .get(line_index)
+            .filter(|source| {
+                !para.stored_text_partition_is_dirty()
+                    && line_count == para.line_segs.len()
+                    && source.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                        == 0
+                    && source.text_height > 0
+                    && source.baseline_distance
+                        == (f64::from(source.text_height) * 0.85).round() as i32
+                    && para
+                        .char_shape_id_at(line.char_start)
+                        .and_then(|id| styles.char_styles.get(id as usize))
+                        .is_some_and(|style| {
+                            px_to_hwpunit(style.font_size, dpi) == source.text_height
+                        })
+            })
+            .map_or(0, |source| source.text_height);
+        let text_height = text_height.max(stored_text_strut_height);
         let text_ascent = (f64::from(text_height) * 0.85).round() as i32;
         let text_descent = text_height - text_ascent;
         if !has_equation && !has_form && text_height == 0 {
@@ -179,6 +238,7 @@ fn refresh_rows(
         new_logical_height = new_logical_height.max(text_height);
         new_ascent = new_ascent.max(text_ascent);
         new_descent = new_descent.max(text_descent);
+        let current_simple_row = has_equation && !has_form && all_current_simple_frames;
         // 같은 저장 예약 구간의 뒤 인라인 개체가 큰 높이를 실제 소유해야 한다.
         // 일반 텍스트 줄이나 저장 컷 앞 줄도 뒤 개체의 점유를 중복하지 않는다.
         let following_inline_box_was_reserved = stored_pair.is_some_and(|(source, next)| {
@@ -187,14 +247,17 @@ fn refresh_rows(
                 && line_count == para.line_segs.len()
                 && source.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
                 && next.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
-                && source.text_height == old_logical_height
+                && ((source.text_height == old_logical_height
+                    && (source.baseline_distance - old_ascent).abs() <= 1)
+                    // 개체만 현재 프레임으로 재저장돼도 뒤 개체의 실제 소유와
+                    // 저장 사다리가 이전 예약 구간을 증명하면 같은 줄을 재발행한다.
+                    || (current_simple_row && source.text_height > old_logical_height))
                 && source.line_height > old_logical_height
                 && following_box_height == Some(source.line_height)
-                && (source.baseline_distance - old_ascent).abs() <= 1
                 && source.vertical_pos >= 0
                 && (source
                     .vertical_pos
-                    .checked_add(old_logical_height)
+                    .checked_add(source.text_height)
                     .and_then(|end| end.checked_add(source.line_spacing))
                     == Some(next.vertical_pos)
                     || next.vertical_pos < source.vertical_pos)
@@ -206,6 +269,18 @@ fn refresh_rows(
         // 소비한다. 본문 유무로 수식·양식의 점유·기준선을 제외하지 않는다.
         let owned_inline_row = (has_equation || has_form)
             && (generated_row || regenerated || para.line_segs.is_empty());
+        // 재저장으로 개체 상자만 현재 논리 프레임이 된 경우에도 호스트 줄이
+        // 과거 상자의 높이를 따로 소유하지 않는다. 모든 수식이 같은 현재
+        // 프레임 계약을 따르고, 그 밖의 텍스트/개체가 예약 높이를 소유하지
+        // 않는 온전한 저장 줄에서만 실제 기준선 합집합을 재발행한다.
+        let stale_current_math_row = current_simple_row
+            && !para.stored_text_partition_is_dirty()
+            && line_count == para.line_segs.len()
+            && para.line_segs.get(line_index).is_some_and(|source| {
+                source.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
+                    && source.line_height == source.text_height
+                    && source.line_height > old_logical_height
+            });
         // 저장 줄이 이 개체 합집합에서 나온 경우만 메트릭을 다시 발행한다.
         // 별도 줄 높이·수직 정렬 계약을 실제 상자의 대용으로 덮어쓰지 않는다.
         if (changed
@@ -213,6 +288,7 @@ fn refresh_rows(
             && (line.baseline_distance - old_ascent).abs() <= 1)
             || following_inline_box_was_reserved
             || owned_inline_row
+            || stale_current_math_row
         {
             let occupied_height = new_ascent + new_descent;
             let leading = if owned_inline_row {
@@ -257,6 +333,7 @@ fn refresh_rows(
             debug_assert!(hwpunit_to_px(line.line_height, DEFAULT_DPI) > 0.0);
         }
     }
+    Ok(())
 }
 
 /// 같은 높이를 공유하는 저장 예약 구간의 끝을 실제 후속 개체의 소유로 확인한다.
@@ -338,15 +415,16 @@ fn source_inline_box_height(
 ///
 /// rhwp가 합성한 줄은 HWPX에 저장하지 않으므로, 양식 개체만 든 문단을 저장했다가 다시 열면
 /// 줄이 하나도 없어 개체가 그려지지 않았다. 양식 개체 줄은 재조판처럼 개체 높이를 줄 높이로 쓴다.
-fn refresh_single_tac_host_row(
+fn try_refresh_single_tac_host_row<S: crate::storage::Storage>(
     composed: &mut ComposedParagraph,
     para: &Paragraph,
     styles: &ResolvedStyleSet,
-) {
+    storage: &S,
+) -> Result<(), S::Error> {
     let form_height = match para.controls.as_slice() {
         [Control::Equation(e)] if e.common.treat_as_char => 0,
         [Control::Form(f)] if f.common.treat_as_char => f.height as i32,
-        _ => return,
+        _ => return Ok(()),
     };
     // 직접 IR 편집 뒤 남은 합성 수식 줄은 정상 한컴 저장 줄의 근거가 아니다.
     // 단일 양식의 실제 높이와 같은 결과로 다시 잰다. 정상 저장 LineSeg는 보존한다.
@@ -361,7 +439,7 @@ fn refresh_single_tac_host_row(
             .chars()
             .any(|c| !c.is_whitespace() && !c.is_control() && c != '\u{fffc}')
     {
-        return;
+        return Ok(());
     }
     let fs = para
         .char_shapes
@@ -387,23 +465,33 @@ fn refresh_single_tac_host_row(
         line.line_height = line_height;
         line.baseline_distance = baseline;
         line.line_spacing = metrics.line_spacing;
-        return;
+        return Ok(());
     }
-    composed.lines.push(ComposedLine {
-        runs: Vec::new(),
-        line_height,
-        baseline_distance: baseline,
-        segment_width: 0,
-        column_start: 0,
-        line_spacing: metrics.line_spacing,
-        has_line_break: false,
-        char_start: 0,
-    });
+    storage.push(
+        &mut composed.lines,
+        ComposedLine {
+            runs: Vec::new(),
+            line_height,
+            baseline_distance: baseline,
+            segment_width: 0,
+            column_start: 0,
+            line_spacing: metrics.line_spacing,
+            has_line_break: false,
+            char_start: 0,
+        },
+    )?;
+    Ok(())
 }
 
-/// 실제 재조판 뒤 텍스트와 수식 줄을 composition과 같은 메트릭으로 저장한다.
-/// 단일/여러 수식의 실제 줄 소속은 기존 composition이 결정한다.
+/// 실제 재조판 뒤 텍스트와 수식 줄을 composition과 같은 메트릭으로 저장하고,
+/// 마지막으로 문단 세로 정렬점의 저장 기준선을 발행한다.
 pub(super) fn publish_regenerated_rows(para: &mut Paragraph, styles: &ResolvedStyleSet) {
+    publish_equation_rows(para, styles);
+    super::line_breaking::publish_vertical_alignment_baselines(para, styles);
+}
+
+/// 단일/여러 수식의 실제 줄 소속은 기존 composition이 결정한다.
+fn publish_equation_rows(para: &mut Paragraph, styles: &ResolvedStyleSet) {
     let mut has_inline_equation = false;
     let supported = para.controls.iter().all(|control| match control {
         Control::Equation(equation) if equation.common.treat_as_char => {

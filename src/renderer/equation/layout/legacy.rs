@@ -1,32 +1,36 @@
 //! 버전 문자열이 빈 옛 수식의 한글·숫자 줄과 단순 분수 프레임.
 //!
 //! 독립 빈 문서의 2024 저장/Print: 두 face·다섯 크기와 버전 대조를 따른다.
-//! 원본 Type3 프로그램은 호출자가 공급한 `RHWP Legacy Equation`에서 읽는다.
+//! 원본 Type3 프로그램은 준비 도구가 공급한 `RHWP Hancom Legacy Equation`에서 읽는다.
+//! 이전 로컬 가족과 현대 대체 이름은 결측 시의 후보로 보존한다.
 //! 영문·그리스 문자와 첨자 등 미확인 구조는 기존 경로를 유지한다.
 
 use super::{EqLayout, EqNode, FontGlyphPaint, FontStyleKind, LayoutBox, LayoutKind};
 use crate::model::control::Equation;
 
-const FAMILY: &str = "RHWP Legacy Equation, HyhwpEQ, serif";
+const FAMILY: &str = "RHWP Hancom Legacy Equation, RHWP Legacy Equation, HyhwpEQ, serif";
 
 pub(super) fn matches_version(equation: &Equation) -> bool {
+    if equation.script.trim().is_empty()
+        || !equation.version_info.is_empty()
+        || equation.attr & 1 != 0
+        || equation.font_size == 0
+        || !(equation.font_name.eq_ignore_ascii_case("HYhwpEQ")
+            || equation.font_name.eq_ignore_ascii_case("HancomEQN"))
+    {
+        return false;
+    }
     // 옛 엔진의 한쪽에만 붙은 일반 공백은 연산자 간격을 바꾼다.
     // 해당 미확인 조합은 공백을 버린 AST만으로 새 간격을 추정하지 않는다.
+    // 토큰화는 값 조건을 통과한 수식에만 한다.
     let tokens = super::super::document_script::tokenize(&equation.script);
-    let asymmetric_operator_space = tokens.windows(2).enumerate().any(|(index, pair)| {
+    !tokens.windows(2).enumerate().any(|(index, pair)| {
         index > 0
             && pair[0].ty == super::super::tokenizer::TokenType::Symbol
             && matches!(pair[0].value.as_str(), "+" | "-" | "=" | "<" | ">")
             && !pair[0].space_before
             && pair[1].space_before
-    });
-    !asymmetric_operator_space
-        && !equation.script.trim().is_empty()
-        && equation.version_info.is_empty()
-        && equation.attr & 1 == 0
-        && equation.font_size > 0
-        && (equation.font_name.eq_ignore_ascii_case("HYhwpEQ")
-            || equation.font_name.eq_ignore_ascii_case("HancomEQN"))
+    })
 }
 
 fn glyph_width(character: char) -> Option<f64> {
@@ -197,7 +201,12 @@ pub(super) fn row_children(layout: &EqLayout, nodes: &[EqNode], fs: f64) -> Vec<
             };
             let (left, right) = match op {
                 "+" | "-" | "−" => (
-                    if index > 0 { fs / 9.0 } else { 0.0 },
+                    if index > 0 && !layout.implicit_legacy_font {
+                        fs / 9.0
+                    } else {
+                        // 생략 필드 세대의 합 기호는 앞 첨자 자체의 꼬리 여백을 쓴다.
+                        0.0
+                    },
                     if index + 1 < nodes.len()
                         && !matches!(nodes[index + 1].ungrouped(), EqNode::Paren { .. })
                     {

@@ -87,12 +87,20 @@ pub struct LayerRenderDiagnostics {
     pub backend: Option<VariantSelectionBackend>,
     pub render_profile: Option<String>,
     pub variant_selections: Vec<TextVariantSelectionReport>,
+    /// Native-only actual preparation failures, limited to 256 reports per replay.
+    #[cfg(all(feature = "native-skia", not(target_arch = "wasm32")))]
+    pub native_glyph_rejections: Vec<crate::renderer::skia::NativeGlyphReplayRejectReport>,
+    #[cfg(all(feature = "native-skia", not(target_arch = "wasm32")))]
+    pub native_glyph_rejections_dropped: usize,
     pub shaped_measurements: Vec<ShapedMeasurementRunReport>,
     pub shaped_measurement_lines: Vec<ShapedMeasurementLineReport>,
     pub line_break_shadows: Vec<LineBreakShadowReport>,
     pub shaped_measurement_paragraphs: Vec<ShapedMeasurementParagraphSummary>,
     pub shaped_measurement_pages: Vec<ShapedMeasurementPageSummary>,
     pub layer_nodes_replayed: usize,
+    /// Proven simple-shape subtrees skipped outside the raster clip. Each
+    /// skipped root counts once; descendants are not visited or counted.
+    pub layer_nodes_culled: usize,
     pub paint_ops_replayed: usize,
     pub tile_fallback_cap_hits: usize,
     pub image_effect_preprocess_failures: usize,
@@ -299,6 +307,9 @@ impl VariantRejectReason {
 pub struct TextVariantSelectionOptions {
     pub backend: VariantSelectionBackend,
     pub prefer_strict_outline: bool,
+    /// Explicit Canvas2D producer-contract admission. The renderer must still
+    /// prepare every part before suppressing the TextRun fallback.
+    pub allow_canvas2d_glyph_outline: bool,
     pub allow_position_adjusted: bool,
     pub max_position_adjusted_residual_px: f64,
     pub max_canvas_glyph_id: u32,
@@ -322,6 +333,7 @@ impl TextVariantSelectionOptions {
         Self {
             backend: VariantSelectionBackend::CanvasKit,
             prefer_strict_outline: false,
+            allow_canvas2d_glyph_outline: false,
             allow_position_adjusted: true,
             max_position_adjusted_residual_px: 0.25,
             max_canvas_glyph_id: u16::MAX as u32,
@@ -335,6 +347,19 @@ impl TextVariantSelectionOptions {
     pub fn canvaskit_strict_outline() -> Self {
         Self {
             prefer_strict_outline: true,
+            ..Self::canvaskit()
+        }
+    }
+
+    pub fn canvas2d_strict_outline() -> Self {
+        Self {
+            backend: VariantSelectionBackend::Canvas2D,
+            prefer_strict_outline: true,
+            allow_canvas2d_glyph_outline: true,
+            allow_colrv0_color_layers: true,
+            allow_colrv1_stage1_color_graph: true,
+            allow_bitmap_glyph: true,
+            allow_svg_glyph: true,
             ..Self::canvaskit()
         }
     }
@@ -535,7 +560,8 @@ impl TextVariantCandidate {
                 let q3_variable_outline = self.glyph_outlines.iter().any(|(_, outline)| {
                     outline.diagnostics.reason.as_deref() == Some("q3VariableOutlineProjectionV1")
                 });
-                if matches!(options.backend, VariantSelectionBackend::Canvas2D)
+                if (matches!(options.backend, VariantSelectionBackend::Canvas2D)
+                    && !options.allow_canvas2d_glyph_outline)
                     || (q3_variable_outline
                         && !matches!(
                             options.backend,
@@ -651,9 +677,9 @@ fn collect_glyph_run_reject_reasons(
 ) {
     let bounded_vertical_declared =
         run.diagnostics.reason.as_deref() == Some(BOUNDED_VERTICAL_HWP5_TABLE_CELL_REASON);
-    let bounded_vertical_canvaskit =
-        is_bounded_vertical_hwp5_canvaskit_candidate(run, options.backend);
-    if bounded_vertical_declared && !bounded_vertical_canvaskit {
+    let bounded_vertical_supported =
+        is_bounded_vertical_hwp5_replay_candidate(run, options.backend);
+    if bounded_vertical_declared && !bounded_vertical_supported {
         // Bounded provenance is an all-field capability claim. A malformed claim must not
         // fall through to the generic horizontal GlyphRun lane after changing only its mode.
         reasons.insert(VariantRejectReason::WritingModeAuthorityPending);
@@ -712,7 +738,7 @@ fn collect_glyph_run_reject_reasons(
     }
     if (!matches!(run.writing_mode, WritingMode::HorizontalTb)
         || !matches!(run.shape_key.writing_mode, WritingMode::HorizontalTb))
-        && !bounded_vertical_canvaskit
+        && !bounded_vertical_supported
     {
         reasons.insert(VariantRejectReason::WritingModeAuthorityPending);
     }
@@ -724,7 +750,7 @@ fn collect_glyph_run_reject_reasons(
         GlyphRunOrientation::MixedPerGlyph => {
             reasons.insert(VariantRejectReason::MixedPerGlyphAuthorityPending);
         }
-        GlyphRunOrientation::VerticalUpright if bounded_vertical_canvaskit => {}
+        GlyphRunOrientation::VerticalUpright if bounded_vertical_supported => {}
         GlyphRunOrientation::VerticalUpright | GlyphRunOrientation::VerticalSideways => {
             reasons.insert(VariantRejectReason::VerticalGlyphOrientationAuthorityPending);
         }
@@ -778,13 +804,15 @@ fn collect_glyph_run_reject_reasons(
     }
 }
 
-fn is_bounded_vertical_hwp5_canvaskit_candidate(
+pub(crate) fn is_bounded_vertical_hwp5_replay_candidate(
     run: &LayerGlyphRunPaint,
     backend: VariantSelectionBackend,
 ) -> bool {
     matches!(
         backend,
-        VariantSelectionBackend::CanvasKit | VariantSelectionBackend::CanvasKitBrowser
+        VariantSelectionBackend::CanvasKit
+            | VariantSelectionBackend::CanvasKitBrowser
+            | VariantSelectionBackend::NativeSkia
     ) && run.diagnostics.reason.as_deref() == Some(BOUNDED_VERTICAL_HWP5_TABLE_CELL_REASON)
         && run.variant.variant_id == BOUNDED_VERTICAL_GLYPH_VARIANT_ID
         && run.variant.variant_kind == TextVariantKind::GlyphRun

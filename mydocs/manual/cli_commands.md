@@ -2,7 +2,7 @@
 kind: canonical
 status: active
 canonical: mydocs/manual/cli_commands.md
-last_verified: 2026-10-22
+last_verified: 2026-11-01
 ---
 
 # rhwp CLI 명령어 매뉴얼
@@ -96,22 +96,26 @@ Sixel과 Kitty 모두 **렌더링 호스트에 글꼴이 필요**하다. SSH이�
 `--font-path /실제/글꼴/디렉터리` 또는 개별 글꼴 파일을 지정한다. 여러 경로는 옵션을 반복한다.
 표·그림이 보이는데 한글만 비면 로컬 터미널 글꼴 설정부터 바꾸지 말고 이 경로를 확인한다.
 글꼴 공급 뒤 `.six`·`.kitty` 저장 파일도 다시 생성한다.
+수식은 본문과 별도의 face를 사용할 수 있다. 문서가 `HYhwpEQ` 또는 `HancomEQN`을
+사용하면 해당 `HYHWPEQ.TTF`·`HancomEQN.ttf`도 같은 방법으로 공급한다.
 실행 예시는 [Sixel 글꼴 설정](export_sixel_command.md#한글이나-일부-글자가-보이지-않을-때)과
 [Kitty 글꼴 설정](export_kitty_command.md#ssh와-실제-터미널-확인)을 따른다.
 
 ## PDF 가져오기 (기본 포함)
 
-`rhwp capabilities`의 `pdfImportSupport`에서 현재 바이너리의 `enabled`·`jbig2`·`jpeg2000`을
-확인합니다. JBIG2·JPEG 2000은 각각 `pdf-jbig2`·`pdf-jpeg2000`을 빌드 시 선택하며 기본값은
-비활성입니다. 필요한 코덱 식별·선택 설치·실패 진단은 [PDF 이미지 코덱 가이드](pdf_image_codecs.md)를
-따릅니다. 성공한 가져오기의 `diagnostics.pdfImportSupport`도 같은 정보를 제공합니다.
+`rhwp capabilities`의 `pdfImportSupport`에서 현재 바이너리의 `enabled`·`jbig2`·`jpeg2000`·
+`icc`·`boundedXrefRecovery`를 확인합니다. 0.9.0 준비 소스는 JBIG2·JPEG 2000·
+ICC를 기본 포함하고 예산 있는 xref 복구를 제공합니다. 실제 배포 산출물은 지원 조회로 확인합니다.
+설치·개발용 제외 빌드·실패 진단은 [PDF 이미지 코덱 가이드](pdf_image_codecs.md)를 따릅니다.
+성공한 가져오기의 `diagnostics.pdfImportSupport`도 같은 정보를 제공합니다.
 
 기본 빌드에 포함된 `pdf-import`로 PDF를 공통 Document IR로 가져와 HWPX 또는 HWP로 저장한다.
 devel에서 함께 구현하는 기능이며, parser 전체 할당 경계는 아직 미입증이다.
 기본 요청 정책은 입력 64 MiB, 가져올 쪽 최대 1,024개다. 원본 쪽 인덱스는 선택 쪽수와
 분리하며, page tree의 유한한 참조 방문 예산 안에서 검증한다. 128쪽 이후를 선택할 수도 있다.
 선택하지 않으면 전체 쪽을 가져오므로 1,024쪽을 초과하는 원본에는 선택 범위를 지정한다.
-실제 operator·decoded·그림·자원 ID 등 다른 요청 한도도 적용하며 암호화 PDF는 지원하지 않는다.
+실제 operator·decoded·그림·자원 ID 등 다른 요청 한도도 적용한다. Standard Security R2–R6
+암호화 PDF는 열기 암호로 인증한 뒤 가져온다. 빈 열기 암호로 인증되는 문서는 입력 없이 열린다.
 JBIG2·JPEG 2000·ICC CMM과 손상 파일 복구의 제한은
 [보안 제한과 기능 사용 범위](security_feature_limits.md)에 정리했다.
 
@@ -122,15 +126,33 @@ cargo build --locked --profile release-test --bin rhwp \
 # 전체 쪽
 rhwp import-pdf input.pdf output.hwpx --json
 
+# 열기 암호가 있는 PDF: stdin 첫 줄로 암호 전달
+rhwp import-pdf protected.pdf output.hwpx --password-stdin < password.txt
+
 # 원본 1·7·8쪽을 순서대로 가져오기: 0-based, 범위 양 끝 포함
 rhwp import-pdf input.pdf selected.hwp --source-pages 0,6-7 --json
 
 # 원본 문자·클립·표 후보를 포함한 로컬 상세 진단
 rhwp import-pdf input.pdf review.hwpx --json --table-inference
+
+# 본문 문단을 구역 본문 흐름(다단·단/쪽 나누기)으로 가져오기
+rhwp import-pdf input.pdf editable.hwpx --layout editable --json
+
+# 작은 자원 환경과 프로필 이내의 명시적 한도
+rhwp import-pdf input.pdf selected.hwpx --resource-profile constrained --json
+rhwp import-pdf input.pdf result.hwpx --resource-limits limits.json --json
 ```
 
+- 입력 암호는 기존 `--password` 또는 `--password-stdin`을 사용한다. 암호 미입력은
+  `PDF_PASSWORD_REQUIRED`, 오입력은 `PDF_PASSWORD_INVALID`다. 실패 시 기존 출력 파일을 유지한다.
+  인증된 사용자·소유자 암호 모두 허용하며 PDF의 복사·편집 권한 플래그로 추가 차단하지 않는다.
+  결과는 새 편집 문서이며 PDF 암호를 결과 파일의 저장 암호로 자동 설정하지 않는다.
+  공개키 방식과 혼합/Identity crypt filter 조합 등 미지원 방식은 `PDF_ENCRYPTION_UNSUPPORTED`다.
 - 입력·출력 위치 인자 두 개가 필수이며 출력 확장자는 `.hwpx` 또는 `.hwp`다.
   `--source-pages`·`--json`은 위치 인자 앞뒤에 둘 수 있다.
+- `--resource-profile standard|constrained`와 `--resource-limits <JSON 파일>`로 요청·실행 한도를
+  지정한다. 생략하면 standard다. 설정·유효값·Linux 감독과 다른 host의 경계는
+  [PDF 자원 정책](pdf_resource_policies.md)을 따른다. 별도 작업자의 성공 뒤에 출력 파일을 교체한다.
 - 쪽 선택 생략은 전체 쪽이다. 목록은 엄격히 증가해야 하며 중복·역순·빈 항목·범위 초과와
   미지/중복 옵션은 exit 2다. `--page`는 렌더 출력 옵션이므로 이 명령에서 사용하지 않는다.
 - 읽기·PDF 처리·저장 실패는 exit 1, 성공은 exit 0이다. 실패하면 stdout은 비어 있고
@@ -138,7 +160,8 @@ rhwp import-pdf input.pdf review.hwpx --json --table-inference
 - 원본과 같은 파일(심볼릭 링크, Unix hard link 포함)은 거부한다. 모든 선택 쪽을 처리·직렬화한
   후 같은 폴더의 임시 파일을 원자적으로 교체한다. 처리/교체 실패 시 기존 출력 파일을 보존한다.
 - `--json` 성공 봉투는 `schemaVersion`, `source`, `output`, `format`, `bytes`, `pageCount`,
-  `diagnostics`와 출처 표지를 포함한다. `diagnostics.pages`의 `sourcePage` → `outputSection`은
+  `diagnostics`, `resourceProfile`, `execution`과 출처 표지를 포함한다.
+  `diagnostics.pages`의 `sourcePage` → `outputSection`은
   원본 쪽과 가져온 구역의 0-based 대응이며 `pageCount`는 Core가 조판한 쪽수다. 이 둘을 동일한
   값으로 가정하지 않는다. `paragraphPolicy`, `warnings`, `parserAllocationBoundsProven=false`도
   진단에 남긴다. 원본 좌표를 담는 `diagnostics.pages`는 비신뢰 문서 파생 필드로 표시한다.
@@ -147,7 +170,18 @@ rhwp import-pdf input.pdf review.hwpx --json --table-inference
   후보별 지역 축의 상세 근거를 추가한다. 작성 당시 셀 구조의 정답을 의미하지 않는다.
   원본 문자가 포함되므로 로컬 검토용이며 자료 공개 여부는 별도로 판단한다.
   WASM `HwpDocument.importPdf(bytes, { includeTableInference: true })`도 같은 진단을 반환한다.
-- 암호 옵션은 이 명령에서 거부한다. 출력 암호가 필요하면 생성된 파일에 `convert` 또는
+- `--layout`은 인식한 본문 문단의 배치를 고른다. 생략하면 `fidelity`다.
+  - `fidelity`: 인식한 본문 영역마다 위치 고정 글상자 하나를 둔다. 쪽 모양은 원본 좌표를
+    따르지만, 문단은 영역 경계에서 끝난다.
+  - `editable`: 본문 문단을 구역의 본문 흐름으로 옮긴다. 쪽 여백과 단 정의는 관측한 글자
+    범위에서 정하고, 원본 쪽마다 쪽 나누기, 단마다 단 나누기를 둔다. 단·쪽 경계에서 끊긴
+    문단은 하나로 잇는다. 여러 단에 걸친 띠, 쪽마다 같은 높이에 반복되는 짧은 머리·꼬리
+    글자, 단 밖의 글자, 표·그림·선은 쪽에 고정된 개체로 남는다.
+  - `diagnostics.layout`에 선택한 배치를 기록한다. `editable`이면 `diagnostics.editableLayout`에
+    구역별 단 수·여백·이어 붙인 문단 수를 함께 남긴다.
+  - WASM `HwpDocument.importPdf(bytes, { layout: "editable" })`와 MCP `hwp_import_pdf`의 `layout`도
+    같은 값을 받는다.
+- 출력 암호 설정 옵션은 이 명령에서 거부한다. 입력 열기 암호는 위와 같이 지원한다. 출력 암호가 필요하면 생성된 파일에 `convert` 또는
   `export-hwpx`의 암호 옵션을 사용한다.
 - `--no-default-features --features wasm-api`로 PDF만 제외한 CLI 빌드에도 도움말·capabilities는 보이며 `available=false`, 실행은
   `PDF_IMPORT_DISABLED`(exit 1)다. `capabilities.formats.read`에는 feature-on일 때만 PDF를 넣는다.
@@ -156,7 +190,8 @@ feature-on에서는 기존 `info input.pdf --json`, `export-svg input.pdf`,
 `export-hwpx input.pdf output.hwpx`, `convert input.pdf output.hwp`도 **전체 쪽** 공통 로더를 쓴다.
 선택 쪽은 `import-pdf`로 저장한 뒤 기존 조회·렌더 명령을 사용한다.
 MCP `hwp_import_pdf`도 같은 CLI를 사용한다. 필수 인자는 `path`·`output`이며 선택 문자열
-`sourcePages`의 문법은 `--source-pages`와 같다. 별도 파싱·변환 구현은 두지 않는다.
+`sourcePages`의 문법은 `--source-pages`와 같다. 선택 문자열 `resourceProfile`·`resourceLimits`는
+각각 `--resource-profile`·`--resource-limits`에 전달한다. 별도 파싱·변환 구현은 두지 않는다.
 
 ## 비밀번호 보호 HWP
 
@@ -174,6 +209,8 @@ HWP5 FileHeader의 `encrypted` 플래그와 `EncryptVersion=4`가 설정된 문�
 | 암호화되지 않은 HWPX | 지원 | 기존 HWPX 파서 사용, 비밀번호 옵션 불필요 |
 | 암호화 HWPX(ODF `encryption-data`, AES-256-CBC/PBKDF2) | 읽기 지원 | `--password` 또는 `--password-stdin` 필요 |
 | 암호화 HWPX(그 외 ODF 암호화 계약) | 미지원 | 지원하지 않는 암호화 방식으로 종료 코드 1 |
+| PDF Standard Security R2–R6 | 읽기·가져오기 지원 | 빈 열기 암호는 자동 인증, 그 외에는 `--password` 또는 `--password-stdin` |
+| PDF 공개키 암호화·혼합/Identity crypt filter 조합 | 미지원 | `PDF_ENCRYPTION_UNSUPPORTED`로 종료 코드 1 |
 | DRM(Fasoo/SoftCamp 등) | 미지원 | 비밀번호 암호화와 다른 보호 방식 |
 
 ```bash
@@ -227,6 +264,12 @@ rhwp --password '문서비밀번호' export-text protected.hwp -o output/
 
 ## 1. 내보내기 (Export)
 
+쪽별 산출 파일 이름은 `<원본 stem>_<NNN>.<확장자>`(한 쪽이면 `<원본 stem>.<확장자>`)다.
+`export-svg`·`export-png`·`export-text`·`export-markdown`(이미지 폴더 `_assets` 포함)·
+`export-kitty`·`export-sixel`·`thumbnail`·`export-pdf` 기본 이름은 접미사·확장자를 보존한 채
+전체가 255바이트(ext4·APFS 이름 한도) 안에 들도록 stem 을 UTF-8 문자 경계에서 줄인다(#9010).
+같은 입력이면 같은 이름이다.
+
 ### `export-svg <파일> [옵션]`
 HWP/HWPX → SVG.
 - `--json` (#3287): 산출물 **매니페스트**를 stdout 에 JSON 으로 출력한다(렌더 동작 무변경).
@@ -269,6 +312,9 @@ HWP/HWPX → SVG.
 ### `export-png <파일> [옵션]` *(native-skia feature 필요)*
 HWP/HWPX → PNG(Skia raster, AI 파이프라인/VLM 연동). 상세: [export_png_command.md](export_png_command.md)
 - `-o`, `-p`, `--font-path` (공통/폰트). `-p`는 0부터 시작하며 여러 번 지정할 수 있다.
+  - Native는 `--font-path`·`RHWP_FONT_PATH`의 `ttf`·`otf`·`ttc`를 경로 순서대로 최대 256개,
+    파일 하나 32 MiB까지 싣는다. 파일은 복사하지 않고 매핑해 공유하므로 전체 바이트 합계 제한은
+    없다(#8597). 한도를 넘어 싣지 않은 파일은 stderr에 `WARN: Native 글꼴 ...`과 이유를 남긴다.
 - `--json` — 전체 쪽수와 실제 PNG 경로·bytes·출력 backend/profile의 JSON manifest만 stdout에 출력.
 - `--metadata-only` — PNG를 만들지 않고 전체 쪽수 JSON만 출력.
 - `--render-tree-output <폴더>` — 같은 문서·글꼴 환경의 선택 쪽 render tree를 함께 저장.
@@ -298,10 +344,21 @@ HWP/HWPX → PDF (svg2pdf + pdf-writer).
     `--font-path` 를 붙이는 대신 한 번만 설정하면 된다.
   - 조달 순서: `--font-path` → `RHWP_FONT_PATH` → 시스템 설치 폰트 →
     저장소 번들 `ttfs/opensource`(최후 폴백, 한국어 드롭 방지).
-  - **폰트를 지정하지 않으면 산출물이 달라진다.** 문서가 쓰는 폰트(한컴 바탕/돋움,
-    Windows 폰트 등)가 시스템에 없으면 번들 대체 폰트(Noto Sans/Serif KR)로 떨어져
-    글꼴이 바뀐다. 서버·컨테이너에서 대량 변환할 때는 **필요한 폰트를 설치하고
-    `--font-path` 또는 `RHWP_FONT_PATH` 로 명시**해야 정본과 같은 결과를 얻는다.
+  - 명시적인 `--font-environment`가 없으면 Native `export-png`·`export-svg`·`export-pdf`는
+    설치된 글꼴과 지정 경로를 먼저 확인하고, 없는 글꼴 중 공급 원장에 등록된 공개 웹폰트를
+    사용자 캐시에 준비한다. 원장이 없는 글꼴에 설치된 문서 선언 대체도 없으면 로컬 Noto를
+    우선하고, 그것도 없으면 공개 Noto Sans KR을 공급한다. 일반 대체를 쓴 원본 이름은
+    `nativeFontSupply.genericFallbacks`에 기록한다. 미확보 원본 글꼴과 다운로드 실패는 stderr와
+    JSON의 `nativeFontSupply.unavailable`에 기록하며, 모든 글꼴의 동일 출력을 보장하지 않는다.
+    수동 공급이 필요한 글꼴은 설치하거나 `--font-path`로 지정한다.
+  - 웹폰트 캐시는 `RHWP_WEBFONT_CACHE`로 지정할 수 있다. 미지정이면 `XDG_CACHE_HOME`,
+    `LOCALAPPDATA`, `~/.cache` 순으로 선택한 경로 아래 `rhwp/webfonts`를 사용한다.
+    `RHWP_WEBFONT_OFFLINE=1`은 해시를 확인한 기존 캐시만 사용하며 네트워크 요청을 하지 않는다.
+    JSON `nativeFontSupply.resources`는 공급 URL·원본 SHA-256·Native 변환본 SHA-256·크기를
+    구분한다. 이는 공급 준비 기록이며 개별 글리프의 최종 선택 증거는 아니다.
+  - SVG의 비임베딩·style 출력은 준비한 웹폰트의 `local()` 우선 CSS 참조를 함께 기록한다.
+    외부에서 SVG를 열 때는 해당 호스트의 글꼴이나 CDN 접근이 필요하다. subset·full 임베딩은
+    기존 임베딩 정책을 유지한다. 캐시의 글꼴 파일을 시스템에 설치하거나 출력에 자동 첨부하지 않는다.
 - `--backend <svg|direct>` — PDF backend(기본값: svg). `svg`는 기존 SVG-derived 경로,
   `direct`는 `PageLayerTree → PDF` direct/vector 경로. `direct`는 `native-skia` feature로
   빌드한 native CLI가 필요하며, 해당 feature 없이 빌드된 CLI에서 `--backend direct`를 쓰면
@@ -807,8 +864,8 @@ rhwp 를 **실제 MCP 서버**로 실행한다. 전송은 MCP 표준 stdio(줄 �
 - 의존성 추가 없음 — 프로토콜 표면이 좁아 serde_json 만으로 구현했고, WASM 대상에는
   포함되지 않는다.
 
-### `info <파일> [--json]`
-HWP 파일 정보 표시(버전/구역 수/암호화 등).
+### `info <파일> [--json|--font-plan]`
+HWP/HWPX/HML 파일 정보 표시(버전/구역 수/암호화 등).
 - `--json` (#3237): stdout 에 순수 JSON 하나 —
   `{"schemaVersion":"1.0","source","format":"hwp5|hwpx|hwp3|hml","sizeBytes","version","sections","pageCount","paraCount","fonts","title","lastSavedWith","warnings"}`.
   `version` 은 HML 이면 null. `lastSavedWith`는 HWP5 `HwpSummaryInformation.revisionNumber` 또는
@@ -818,6 +875,17 @@ HWP 파일 정보 표시(버전/구역 수/암호화 등).
   HWP3, 메타데이터 없음·손상은 `lastSavedWith:null`이다. 원 작성 제품의 증명이 아니며,
   재저장·삭제·변조될 수 있다. 스키마 계약은
   `export-text --json` 항목과 동일 규칙.
+- `--font-plan`: 문서에 선언된 글꼴 선택 후보를 stdout에 JSON으로 출력한다.
+  `requests`는 원본 이름(`source`)과 주 글꼴(`primary`), 문서 지정 대체 글꼴
+  (`substitute`) 후보이며, `scopedRequests`는 같은 후보에 언어 슬롯(`languageSlot`)과
+  글꼴 레코드 번호(`fontId`)를 함께 기록한다. `embeddedFamilies`는 문서 내장 글꼴
+  이름, `environmentId`는 명시한 글꼴 환경의 식별자 또는 null이다.
+  후보 목록은 실제 설치·다운로드·렌더링에 선택된 글꼴을 보증하지 않는다.
+  `--json`과 함께 지정하면 `--font-plan` 출력이 우선한다.
+
+```bash
+rhwp info input.hwpx --font-plan | jq '.scopedRequests'
+```
 
 ### `word-count <파일> [--json]` (#4999)
 IR 본문에서 구역·문단·글자·어절·쪽 수를 센다. 새 파서는 없다.
@@ -940,9 +1008,13 @@ rhwp explore 편람.hwp --json | jq -r '.menu[0] | "\(.command)  # \(.why)"'
 평문을 뽑아 외부에서 찾으면 주소가 소멸해 근거 제시가 불가능한데, rhwp 는 조판 엔진이
 있어 "몇 쪽"에 답할 수 있다. 파서/렌더 무변경 읽기 질의.
 - `--json` 봉투: `{"schemaVersion":"1.0","source","query","caseSensitive","matchCount","totalMatchCount","truncated","omittedCount","matches":[…]}`
-- 매치: `{section,paragraph,page?,charOffset,length,text,context,cell?}`
+- 매치: `{section,paragraph,page?,charOffset,length,text,context,cell?,textbox?,nestedDepth?,cellPath?}`
   - `page` 는 0부터 시작하는 글로벌 페이지. 조판에 배치되지 않은 문단이면 생략된다.
-  - `cell` 은 표 셀 안의 매치일 때 `{control,cell,paragraph}` 좌표
+  - `cell` 은 표 셀 안의 매치일 때 `{control,cell,paragraph}` 좌표. 표 안의 표 매치면
+    **최외곽 칸 문단**이다(`nestedDepth` ≥ 1 로 표시)
+  - `cellPath` 는 표 안의 표·글상자 안 표 매치의 정확한 칸 경로(#8989). 바깥 → 안쪽 순서의
+    `[{kind:"tableCell"|"textBox",control,cell?,paragraph}]` 로, `fields` 의 `location.nested`
+    와 같은 꼴이다. 마지막 단계가 매치가 든 칸과 그 칸 문단이다. 본문 표 한 단계 매치에는 없다
   - `context` 는 매치 앞뒤 발췌(각 40자)
 - 검색 범위는 본문 + 표 셀 + 글상자 (`search_query::search_all` 과 동일)
 - **매치 0건은 오류가 아니다** — `matchCount:0`, 종료 코드 0 (1은 런타임 실패 전용)
@@ -976,7 +1048,7 @@ rhwp export-png 편람.hwp -p "$(rhwp search 편람.hwp "위임전결" --json | 
 `search` 가 검색어에 대해 한 일을 데이터 값에 대해 한다 — 평문을 뽑아 밖에서 정규식을
 돌리면 값은 얻어도 주소가 소멸해 근거 제시가 불가능하다. 파서/렌더 무변경 읽기 질의.
 - `--json` 봉투: `{"schemaVersion":"1.0","source","kind","itemCount","totalItemCount","truncated","counts","items":[…]}`
-- 항목: `{kind,raw,normalized,currency?,unit?,section,paragraph,page?,charOffset,length,cell?,textbox?}`
+- 항목: `{kind,raw,normalized,currency?,unit?,section,paragraph,page?,charOffset,length,cell?,textbox?,nestedDepth?,cellPath?}`
   - `raw` 는 문서에 적힌 그대로, `normalized` 는 기계용 값이다
   - `counts` 는 **요청한 종류의 문서 전체 건수**(`--limit` 절단 전). 요청하지 않은
     종류의 키는 넣지 않는다 — `"amount":0` 은 "금액이 없다"로 오독되기 때문이다
@@ -996,8 +1068,9 @@ rhwp export-png 편람.hwp -p "$(rhwp search 편람.hwp "위임전결" --json | 
     (`'26.8.2`)는 세기를 추정하지 않고, 한글 수사 금액(`일금 백이십삼만원`)은 v1 범위 밖이다
   - 금액은 정수 연산으로만 배수를 반영한다(`1.5억원` → `150000000`). 정수로 떨어지지
     않으면 추정하지 않고 `null` 이다
-- 추출 범위는 본문 + 표 셀 + 글상자. 표 셀·글상자 값에는 `cell`/`textbox` 좌표가 붙고,
-  분할 표는 그 행이 실제로 렌더되는 쪽을 쓴다(#3403). 페이지 인덱스는 `search` 와 같은
+- 추출 범위는 본문 + 표 셀(표 안의 표 포함) + 글상자(글상자 안 표 포함). 표 셀·글상자 값에는
+  `cell`/`textbox` 좌표가 붙는다. 중첩 칸 값은 `search` 와 같이 `cell` 이 최외곽 칸이고
+  `nestedDepth`·`cellPath`(#8989)로 정확한 칸을 준다. 분할 표는 그 행이 실제로 렌더되는 쪽을 쓴다(#3403). 페이지 인덱스는 `search` 와 같은
   `build_paragraph_page_index` 를 재사용한다
 - **0건은 오류가 아니다** — `itemCount:0`, 종료 코드 0 (1은 런타임 실패 전용)
 - `--limit N` 은 컨텍스트 상한이다. 절단돼도 `totalItemCount`·`truncated:true` 로 총량이 보인다
@@ -1419,6 +1492,9 @@ MCP `hwp_insert_table`은 `atField`, `widths`, `alignments`, `repeatHeader`로 �
 
 ### `edit apply-char-format <파일> --props <JSON> [--section N] [--para N] [--offset N] [--count N] [-o <출력>] [--dry-run] [--verify] [--json]`
 본문 문단 글자 범위에 글자 서식을 적용한다. 코어 `apply_char_format_native`. `--props` 필수(예: `{"bold":true}`). `--count` 생략 시 문단 끝까지.
+글꼴은 ID(`fontId`·`fontIds`) 대신 이름 `fontName`(예: `{"fontName":"HY헤드라인M"}`)으로도 줄 수 있다. 문서 글꼴 목록에
+없으면 언어 슬롯마다 새로 등록하고 일곱 슬롯 모두 그 이름을 가리킨다. `fontId`·`fontIds` 와 함께 주면 거부한다.
+`apply-char-format-in-cell`·머리말/꼬리말 글자 서식도 같은 키를 받는다.
 
 ### `edit apply-para-format <파일> --props <JSON> [--section N] [--para N] [-o <출력>] [--dry-run] [--verify] [--json]`
 본문 문단에 문단 서식을 적용한다. 코어 `apply_para_format_native`. `--props` 필수(예: `{"alignment":"center"}`).
@@ -1735,15 +1811,56 @@ ingest JSON(시험문제 등) → HWPX 생성. (rhwp-exam-ingest 파이프라인
   `ingest.json` 중간 표현을 rhwp HWPX 문서로 조립한다.
 - `-o`, `--output <out.hwpx>` 는 필수다.
 - `--media-dir <dir>` 는 `ingest.json` 의 `media[].id` 와 이미지 `stem_blocks[].ref` 를
-  해석할 기준 디렉터리다. 이미지가 없으면 생략한다.
+  해석할 기준 디렉터리다. 생략하면 JSON 파일이 있는 디렉터리를 사용한다.
+  참조는 기준 디렉터리 안의 상대 파일 경로여야 한다. 절대 경로·`..`·외부로 향하는
+  심볼릭 링크·누락된 파일은 `INGEST_IMAGE_PATH` 오류로 거부한다.
+  PNG·JPEG·GIF·BMP·TIFF를 실제 디코딩해 검증하고 Picture/BinData로 저장한다.
+  GIF·TIFF는 첫 프레임/페이지를 사용한다. SVG·WebP 등은 PNG로 변환해 공급한다.
 - 최소 입력 필드: `version`, `page_size`, `default_font`, `questions[]`.
   각 문제는 `number`, `stem`, `passage_ref`, `stem_blocks`, `choices`, `media`, `auto_number` 를 사용할 수 있다.
   top-level optional 필드로 `passages`, `header_text`, `footer_text`, `form_label` 을 사용할 수 있다.
-  `stem_blocks` 는 `text`, `image`, `boxed` 블록을 지원한다.
+  `stem_blocks` 는 `text`, `image`, `boxed`, `paragraph` 블록을 지원한다.
   자세한 스키마 모델은 `src/parser/ingest/schema.rs`, 예시는
   `tools/rhwp-ingest/schema/sample_minimal.json` 과
   `tools/rhwp-ingest/schema/sample_structured.json` 을 기준으로 확인한다.
 - 시험지 e2e 검증은 생성만으로 끝내지 않고, 산출 HWPX를 다시 CLI로 확인한다.
+
+이미지 블록의 `placement`가 `media[].placement`보다 우선한다. `above`는 발문 앞,
+`between`은 발문과 선택지 사이, `below`는 선택지 뒤에 놓는다. `inline` 이미지 블록은
+같은 컨테이너의 앞 문단 끝에 붙고, 앞 문단이 없으면 자체 문단을 사용한다.
+보기 뒤 이미지를 보기 내부에 붙이지 않는다. 공유 지문은 한 번만 출력하며, 그 안의
+`between`·`below`는 그 지문의 마지막에 놓는다. 참조되지 않은 `media[]`는 문항의
+해당 배치에 한 번 삽입하고, 블록에서 이미 참조한 이미지는 다시 자동 삽입하지 않는다.
+
+문장 중간의 정확한 위치는 순서 있는 `paragraph.runs`로 지정한다.
+
+```json
+{"type":"paragraph","runs":[
+  {"type":"text","text":"다음 그림 "},
+  {"type":"image","ref":"img/q1.png"},
+  {"type":"text","text":"을 보고 답하시오."}
+]}
+```
+
+`media[].natural_w`·`natural_h`는 실제 픽셀 치수와 일치해야 한다.
+`target_w_mm`는 양의 출력 폭이며 종횡비를 유지한다. 생략하면 본문 폭의 70%를 쓴다.
+본문 폭이나 한 쪽의 본문 높이를 넘는 요청은 `INGEST_IMAGE_SIZE`로 거부한다. 같은 바이트의 이미지는
+하나의 BinData를 재사용하며 배치마다 독립 Picture를 만든다.
+
+| 한도 옵션 | 기본값 | 단위 |
+| --- | --- | --- |
+| `--max-image-bytes` | 33554432 | 이미지 하나의 인코딩 바이트 |
+| `--max-total-image-bytes` | 268435456 | 읽는 고유 파일의 인코딩 바이트 합 |
+| `--max-image-pixels` | 64000000 | 이미지 하나의 가로×세로 |
+| `--max-total-image-pixels` | 256000000 | 읽는 고유 파일의 픽셀 합 |
+| `--max-image-instances` | 16384 | 출력 Picture 개수 |
+
+모든 옵션은 양의 정수다. 한도 초과는 `INGEST_IMAGE_LIMIT`, 손상 이미지는
+`INGEST_IMAGE_DECODE`, 미지원 형식은 `INGEST_IMAGE_FORMAT`, 참조 오류는
+`INGEST_IMAGE_REFERENCE`로 실패하며 placeholder로 대체하지 않는다. 코어의
+이미지당 256 MiB 저장 상한은 옵션으로 넘을 수 없다. Rust 라이브러리는 파일을 읽지 않는
+`IngestImage::from_bytes`와 `build_exam_paper_with_images`를 사용한다.
+기존 `build_exam_paper`는 호환성을 위해 텍스트/placeholder projection을 유지한다.
 
 ```bash
 rhwp build-from-ingest tools/rhwp-ingest/schema/sample_minimal.json \
@@ -1784,6 +1901,7 @@ rhwp export-svg output/poc/ingest/sample_minimal.hwpx \
 | `title` |  | 있으면 본문 최상단 가운데 정렬 제목 문단 |
 | `font` |  | 기본 글꼴 이름 (기본값 `함초롬바탕`) |
 | `page_size` |  | `{"width_mm":210,"height_mm":297}` (기본 A4) |
+| `outline_numbering` |  | 개요 번호 모양 — 수준 1 부터 1~7개의 `{"text","num_format"}`. 생략하면 번호 정의 없이 종전과 같다 |
 | `blocks` |  | `heading`(level 1~7) · `paragraph` · `table` 블록의 나열 |
 
 `table` 블록:
@@ -1810,9 +1928,31 @@ rhwp scaffold spec.json -o out.hwpx --json
 ]}
 ```
 
+`outline_numbering` 항목:
+
+| 필드 | 필수 | 설명 |
+| --- | --- | --- |
+| `text` | ✓ | 한/글 문단 번호 형식 문자열. `^1`~`^7` 이 그 수준의 번호가 된다(예: `"^1."`, `"(^5)"`). 자기 수준보다 깊은 `^N` 은 거부 |
+| `num_format` |  | `digit`(기본) · `circled_digit` · `roman_capital` · `roman_small` · `latin_capital` · `latin_small` · `hangul_syllable` |
+
+지정하면 문단 번호 정의 하나를 만들고 구역 개요 번호(`secPr@outlineShapeIDRef`)가 그것을 가리킨다.
+지정하지 않은 뒤쪽 수준은 한/글 새 문서의 개요 기본값(`1.` `가.` `1)` `가)` `(1)` `(가)` `①`)으로 채운다.
+
+```json
+{"version":"1","title":"추진 계획","outline_numbering":[
+  {"text":"^1.","num_format":"roman_capital"},
+  {"text":"^2."},
+  {"text":"^3.","num_format":"hangul_syllable"}],
+ "blocks":[{"type":"heading","level":1,"text":"추진 배경"},
+           {"type":"heading","level":2,"text":"현황"},
+           {"type":"heading","level":3,"text":"세부 내용"}]}
+```
+
+위 명세의 제목은 `I. 추진 배경` · `1. 현황` · `가. 세부 내용` 으로 번호가 붙는다(로마 대문자 글자 모양은 조판기에 따라 `I` 또는 `Ⅰ`).
+
 - `--json` 봉투: `schemaVersion`·`source`·`output`·`format`·`bytes`·`blockCount`·
   `paragraphCount`·`tableCount`.
-- 지원 요소는 왕복 검증을 통과한 것만 노출한다 — 제목, 개요 수준 제목, 본문 문단, 단순 표.
+- 지원 요소는 왕복 검증을 통과한 것만 노출한다 — 제목, 개요 수준 제목, 개요 번호 모양, 본문 문단, 단순 표.
 
 ### `hwpx-roundtrip <파일.hwpx | --batch 폴더> [-o <출력폴더>] [--lineseg-report]`
 HWPX → IR → HWPX roundtrip 검증(**구조 보존 게이트**, #1315 baseline). 재조립 `.rt.hwpx` 와

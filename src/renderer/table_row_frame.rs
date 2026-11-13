@@ -9,8 +9,129 @@ use crate::model::{
 use crate::renderer::float_placement::ParagraphFloatPlacement;
 use crate::renderer::hwpunit_to_px;
 
+/// 첫 조각과 종료 쪽의 저장 원점이 전체 원본 행 본체를 정확히 나눈다.
+/// 다음 원점에 남은 본체를 독립 빈 간격으로 다시 더하지 않기 위한 정수 단위 근거다.
+/// 문단 지역 원점·편집 여부와 실제 조각 종료 여부는 각 호출자가 확인한다.
+pub(crate) fn stored_rows_close_at_successor(
+    rows: &[crate::model::HwpUnit],
+    cell_spacing: i16,
+    first_fragment: u32,
+    successor_top: i32,
+) -> bool {
+    rows.len() >= 2
+        && first_fragment > 0
+        && first_fragment <= i32::MAX as u32
+        && successor_top > 0
+        && rows
+            .iter()
+            .all(|&height| height > 0 && height <= i32::MAX as u32)
+        && rows.iter().map(|&height| i64::from(height)).sum::<i64>()
+            + i64::from(cell_spacing) * (rows.len() - 1) as i64
+            == i64::from(first_fragment) + i64::from(successor_top)
+}
+
+/// 저장 rowspan의 쪽 되감김으로 입증한 첫 물리 프레임을 행 원장에 투영한다.
+///
+/// 표의 선언 높이는 이 경우 전체 행 합이 아니라 첫 조각의 끝이다. 끝 행의
+/// 저장 여유만 첫 프레임에 맞추고, 걸침 셀의 남은 높이는 실제 종료 행에서
+/// 이어받는다. 내용 하한과 전체 걸침 높이는 줄이지 않는다.
+/// HWPX 문단 지역 vpos를 쪽 되감김으로 읽지 않도록 호출자가 HWP5 출처를 확인한다.
+pub(crate) fn project_first_rowspan_frame(
+    table: &Table,
+    rows: &mut [f64],
+    content_floors: &[f64],
+    span_content_floors: &[(usize, f64)],
+    dpi: f64,
+) -> bool {
+    if table.common.treat_as_char
+        || table.page_break != crate::model::table::TablePageBreak::RowBreak
+        || table.common.height == 0
+        || table.common.height > i32::MAX as u32
+        || rows.len() < 2
+        || rows.len() != usize::from(table.row_count)
+        || rows.len() != content_floors.len()
+        || !dpi.is_finite()
+        || dpi <= 0.0
+        || !table.cells.iter().any(|cell| cell.row_span > 1)
+    {
+        return false;
+    }
+    let declared = hwpunit_to_px(table.common.height as i32, dpi);
+    let spacing = hwpunit_to_px(i32::from(table.cell_spacing), dpi);
+    let mut origin = spacing;
+    let Some((closing_row, remaining)) = rows.iter().enumerate().find_map(|(row, &height)| {
+        let end = origin + height + spacing;
+        let result =
+            (origin < declared && declared < end).then_some((row, declared - origin - spacing));
+        origin = end;
+        result
+    }) else {
+        return false;
+    };
+    if remaining < content_floors[closing_row] || remaining <= 0.0 || remaining >= rows[closing_row]
+    {
+        return false;
+    }
+    let mut witnessed_rewind = false;
+    let mut carry_row = rows.len();
+    for cell in &table.cells {
+        let start = usize::from(cell.row);
+        let end = start + usize::from(cell.row_span);
+        if start > closing_row || end <= closing_row + 1 || end > rows.len() {
+            continue;
+        }
+        // 같은 물리 행이 여러 rowspan을 지지해도 높이는 한 번만 예약한다.
+        carry_row = carry_row.min(end - 1);
+        let mut previous = None;
+        for segment in cell
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| &paragraph.line_segs)
+        {
+            if segment.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+                || segment.vertical_pos < 0
+                || segment.line_height <= 0
+            {
+                return false;
+            }
+            witnessed_rewind |= previous.is_some_and(|position| segment.vertical_pos < position);
+            previous = Some(segment.vertical_pos);
+        }
+    }
+    if !witnessed_rewind || carry_row >= rows.len() {
+        return false;
+    }
+    let carried = rows[closing_row] - remaining;
+    // 이 경계에서 끝나는 다른 병합 셀의 실제 내용도 같은 높이 제약이다.
+    // 이어받지 않는 셀은 뒤 행의 보충 높이를 사용할 수 없다.
+    if span_content_floors.iter().any(|&(index, floor)| {
+        let Some(cell) = table.cells.get(index) else {
+            return true;
+        };
+        let start = usize::from(cell.row);
+        let end = start + usize::from(cell.row_span);
+        start <= closing_row
+            && end == closing_row + 1
+            && rows[start..end].iter().sum::<f64>() - carried < floor
+    }) || table.cells.iter().any(|cell| {
+        cell.dirty_flag
+            || cell.paragraphs.iter().any(|paragraph| {
+                paragraph.stored_text_partition_is_dirty() || paragraph.cell_format_vpos_dirty
+            })
+    }) {
+        return false;
+    }
+    rows[closing_row] = remaining;
+    rows[carry_row] += carried;
+    true
+}
+
 /// 모든 저장 행이 실제 측정 결과와 같으면 더 큰 개체 캐시로 다시 늘리지 않는다.
-/// 보호 크기, 병합 행, 실제 행 성장 및 저장 줄 없는 재조판은 기존 계약을 유지한다.
+/// 보호 크기, 병합 행, 실제 행 성장과 편집으로 무효가 된 칸은 기존 계약을 유지한다.
+///
+/// 칸 문단에 저장 줄이 없어(HWPX `linesegarray` 생략) rhwp 가 줄을 계산했더라도, 판정의
+/// 근거는 측정 행과 칸 선언의 일치다([#8968]). 계산한 줄이 칸 선언을 넘으면 행이 자라
+/// 아래 비교에서 빠지고, 선언 안에 들면 행은 선언 높이 그대로다.
 pub(crate) fn stored_rows_own_body(table: &Table, rows: &[f64], dpi: f64) -> bool {
     if !dpi.is_finite()
         || dpi <= 0.0
@@ -26,23 +147,22 @@ pub(crate) fn stored_rows_own_body(table: &Table, rows: &[f64], dpi: f64) -> boo
                 || cell.dirty_flag
                 || cell.paragraphs.is_empty()
                 || cell.paragraphs.iter().any(|para| {
-                    para.stored_text_partition_is_dirty()
-                        || para.cell_format_vpos_dirty
-                        || crate::renderer::para_has_no_stored_line_segs(para)
+                    para.stored_text_partition_is_dirty() || para.cell_format_vpos_dirty
                 })
         })
     {
         return false;
     }
     let unit = dpi / 7200.0;
-    rows.iter().enumerate().all(|(index, measured)| {
-        let declared = table
-            .cells
-            .iter()
-            .filter(|cell| usize::from(cell.row) == index)
-            .map(|cell| cell.height)
-            .max()
-            .map(|height| hwpunit_to_px(height as i32, dpi));
+    // 행마다 표 전체를 훑지 않고 행별 선언 높이 최댓값을 한 번에 모은다.
+    let mut declared_rows: Vec<Option<u32>> = vec![None; rows.len()];
+    for cell in &table.cells {
+        if let Some(declared) = declared_rows.get_mut(usize::from(cell.row)) {
+            *declared = Some(declared.map_or(cell.height, |height| height.max(cell.height)));
+        }
+    }
+    rows.iter().zip(&declared_rows).all(|(measured, declared)| {
+        let declared = declared.map(|height| hwpunit_to_px(height as i32, dpi));
         declared.is_some_and(|height| {
             measured.is_finite()
                 && (measured - height).abs()

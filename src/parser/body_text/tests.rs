@@ -39,8 +39,27 @@ fn hancom_single_odd_master_flag_is_not_parsed_as_both() {
         master_page_apply_to(0x8008_0000, 1, 0),
         Some(HeaderFooterApply::Odd)
     );
-    assert_eq!(master_page_apply_to(0x2008_0000, 1, 0), None);
-    assert_eq!(master_page_apply_to(0xc008_0000, 2, 0), None);
+    // 한컴 12.30 저장본: bit 29·30·31이 양 쪽·짝수 쪽·홀수 쪽이고 목록은 그 차례다
+    // (짝수 쪽+홀수 쪽 0xc0000000은 짝수 쪽 목록이 먼저, 셋 0xe0000000은 양 쪽·짝수 쪽·홀수 쪽).
+    assert_eq!(
+        master_page_apply_to(0x2008_0000, 1, 0),
+        Some(HeaderFooterApply::Both)
+    );
+    assert_eq!(
+        master_page_apply_to(0xc008_0000, 2, 0),
+        Some(HeaderFooterApply::Even)
+    );
+    assert_eq!(
+        master_page_apply_to(0xc008_0000, 2, 1),
+        Some(HeaderFooterApply::Odd)
+    );
+    assert_eq!(
+        master_page_apply_to(0xe008_0000, 3, 1),
+        Some(HeaderFooterApply::Even)
+    );
+    // 비트 수와 목록 수가 다르면 목록 차례로 정한다.
+    assert_eq!(master_page_apply_to(0x2008_0000, 2, 0), None);
+    assert_eq!(master_page_apply_to(0x0008_0000, 1, 0), None);
 }
 
 #[test]
@@ -1011,6 +1030,7 @@ fn orphan_field_end_links_to_the_open_field_id() {
             begin_id_ref: 0,
             field_id: 0,
             begin_ctrl_id: 0,
+            memo_index: 0,
         }],
         ..Default::default()
     };
@@ -1050,6 +1070,7 @@ fn field_closed_in_its_own_paragraph_is_not_left_open() {
             begin_id_ref: 0,
             field_id: 0,
             begin_ctrl_id: 0,
+            memo_index: 0,
         }],
         ..Default::default()
     };
@@ -1083,6 +1104,7 @@ fn parse_para_text_reference(data: &[u8]) -> ParaTextParts {
     let mut orphan_field_ends: Vec<OrphanFieldEnd> = Vec::new();
     let mut nb_space_control = false;
     let mut literal_figure_spaces = Vec::new();
+    let mut nb_space_control_indices = Vec::new();
     let mut pos = 0;
     // 확장 컨트롤(extended) 카운터 → controls[] 인덱스와 1:1 대응
     let mut ctrl_idx: usize = 0;
@@ -1165,6 +1187,7 @@ fn parse_para_text_reference(data: &[u8]) -> ParaTextParts {
                         begin_id_ref: 0,
                         field_id: 0,
                         begin_ctrl_id: 0,
+                        memo_index: 0,
                     });
                 }
             } else if is_extended_only_ctrl_char(ch) {
@@ -1225,6 +1248,7 @@ fn parse_para_text_reference(data: &[u8]) -> ParaTextParts {
                 }
                 0x001E => {
                     char_offsets.push(code_unit_pos);
+                    nb_space_control_indices.push(char_count);
                     text.push('\u{00A0}'); // 묶음 빈칸 (HWP 5.0 표 7: 코드 30, NO-BREAK SPACE)
                     char_count += 1;
                     // [#5174] 제품 경로와 같이 표기 출처를 남긴다.
@@ -1276,6 +1300,7 @@ fn parse_para_text_reference(data: &[u8]) -> ParaTextParts {
         title_marks,
         orphan_field_ends,
         nb_space_control,
+        nb_space_control_indices,
     }
 }
 
@@ -1315,6 +1340,11 @@ fn assert_decode_identical(data: &[u8]) {
     assert_eq!(
         new.char_offsets, reference.char_offsets,
         "offsets 불일치: {:02x?}",
+        data
+    );
+    assert_eq!(
+        new.nb_space_control_indices, reference.nb_space_control_indices,
+        "묶음 빈칸 출처 불일치: {:02x?}",
         data
     );
     let fr_new: Vec<_> = new.field_ranges.iter().map(field_range_key).collect();

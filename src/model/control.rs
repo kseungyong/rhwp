@@ -81,6 +81,26 @@ pub enum Control {
 }
 
 impl Control {
+    /// 머리말·꼬리말의 문단 목록. 셀 경로는 이 컨트롤을 글상자처럼 셀 0 하나로 지나간다.
+    pub fn header_footer_paragraphs(&self) -> Option<&Vec<crate::model::paragraph::Paragraph>> {
+        match self {
+            Control::Header(header) => Some(&header.paragraphs),
+            Control::Footer(footer) => Some(&footer.paragraphs),
+            _ => None,
+        }
+    }
+
+    /// [`Control::header_footer_paragraphs`]의 가변 짝.
+    pub fn header_footer_paragraphs_mut(
+        &mut self,
+    ) -> Option<&mut Vec<crate::model::paragraph::Paragraph>> {
+        match self {
+            Control::Header(header) => Some(&mut header.paragraphs),
+            Control::Footer(footer) => Some(&mut footer.paragraphs),
+            _ => None,
+        }
+    }
+
     /// 개체가 글자처럼 취급(treat_as_char)되는가.
     ///
     /// 텍스트 흐름 안에서 한 글자 폭을 차지하는 개체 판정의 기반이다.
@@ -97,13 +117,17 @@ impl Control {
 
     /// 편집/커서 이동에서 논리적으로 한 글자 폭을 차지하는 컨트롤인가.
     ///
-    /// `treat_as_char` 개체에 각주·미주·글자겹침을 더한 것. `SectionDef`/`ColumnDef` 같은
-    /// 구조 컨트롤은 흐름에서 자리를 차지하지 않으므로 제외된다.
+    /// `treat_as_char` 개체에 각주·미주·글자겹침·덧말을 더한 것. `SectionDef`/`ColumnDef` 같은
+    /// 구조 컨트롤은 흐름에서 자리를 차지하지 않으므로 제외된다. 한컴처럼 덧말은 본말과
+    /// 덧말을 합쳐 캐럿 한 칸이다.
     pub fn is_logical_inline(&self) -> bool {
         self.is_treat_as_char_object()
             || matches!(
                 self,
-                Control::Footnote(_) | Control::Endnote(_) | Control::CharOverlap(_)
+                Control::Footnote(_)
+                    | Control::Endnote(_)
+                    | Control::CharOverlap(_)
+                    | Control::Ruby(_)
             )
     }
 
@@ -192,6 +216,7 @@ pub struct PageNumberPos {
     /// 대시 문자 (WCHAR, 항상 '-')
     pub dash_char: char,
 }
+crate::storage::clone_fields!(PageNumberPos, {format, position, user_symbol, prefix_char, suffix_char, dash_char});
 
 /// 책갈피 ('bokm' 컨트롤)
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -302,7 +327,8 @@ pub struct Ruby {
     pub ruby_text: String,
     /// 위치 (`posType`): 0=TOP, 1=BOTTOM. (#1587)
     pub pos_type: u8,
-    /// 정렬 (`align`): 0=LEFT, 1=RIGHT, 2=CENTER. (#1587)
+    /// 정렬 (`align`): HWP 문단 정렬 번호 0=양쪽, 1=왼쪽, 2=오른쪽, 3=가운데, 4=배분, 5=나눔.
+    /// 한컴 12.30은 가운데(3)만 저장한다. HWPX는 같은 값을 이름으로 쓴다.
     pub align: u8,
     /// 덧말 크기 비율 (`szRatio`, %). (#1587)
     pub sz_ratio: u8,
@@ -317,7 +343,8 @@ pub struct Ruby {
 pub struct CharOverlap {
     /// 겹칠 글자 목록 (최대 9글자)
     pub chars: Vec<char>,
-    /// 테두리 타입 (0=없음/글자끼리, 1=원, 2=반전원, 3=사각형, 4=반전사각형)
+    /// 테두리 타입 (0=없음/글자끼리, 1=원, 2=반전원, 3=사각형, 4=반전사각형, 5=삼각형,
+    /// 6=반전삼각형, 7=해, 8=마름모, 9=반전마름모, 10=둥근 사각형, 11~13=빈·얇은·굵은 순환 삼각형)
     pub border_type: u8,
     /// 내부 글자 크기의 부호 있는 10% 단계 (0=원래 크기)
     pub inner_char_size: i8,
@@ -325,6 +352,37 @@ pub struct CharOverlap {
     pub expansion: u8,
     /// 글자 속성(charshape) ID 배열
     pub char_shape_ids: Vec<u32>,
+    /// HWP 바이너리 레코드의 문자 배열 여부. 원문 배열은 그대로 보존한다.
+    #[serde(skip)]
+    pub hwp_wire_chars: bool,
+}
+
+impl CharOverlap {
+    /// 한컴이 테두리로 찍는 글자. 한컴 HWP 저장본은 원문 배열 맨 앞에 이 글자를 둔다.
+    pub fn border_glyph(border_type: u8) -> Option<char> {
+        match border_type {
+            1 => Some('◯'),
+            2 => Some('●'),
+            3 => Some('□'),
+            4 => Some('■'),
+            5 => Some('△'),
+            6 => Some('▲'),
+            7 => Some('☼'),
+            8 => Some('◇'),
+            9 => Some('◆'),
+            10 => Some('▢'),
+            11 => Some('♲'),
+            12 => Some('♺'),
+            13 => Some('♻'),
+            _ => None,
+        }
+    }
+
+    /// HWP 원문 배열이 겹칠 글자 앞에 두는 표지. 글자끼리 펼친 겹침은 전각 공백이고,
+    /// 글자끼리 포갠 겹침은 표지가 없다 (한컴 12.30 저장본).
+    pub fn hwp_prefix(&self) -> Option<char> {
+        Self::border_glyph(self.border_type).or_else(|| (self.expansion == 0).then_some('\u{3000}'))
+    }
 }
 
 /// 감추기 ('pghd' 컨트롤)
@@ -343,6 +401,7 @@ pub struct PageHide {
     /// 쪽 번호 감추기
     pub hide_page_num: bool,
 }
+crate::storage::clone_fields!(PageHide, {hide_header, hide_footer, hide_master_page, hide_border, hide_fill, hide_page_num});
 
 /// 숨은 설명 ('tcmt' 컨트롤)
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -780,11 +839,34 @@ impl Field {
     /// 누름틀(ClickHere) command에서 안내문(Direction) 텍스트를 추출한다.
     ///
     /// command 형식: "Clickhere:set:{len}:Direction:wstring:{n}:{text} HelpState:..."
+    ///
+    /// 한컴 HWPX 에는 `Clickhere:` 꼴이 아닌 평문 command 도 있다 — `<hp:stringParam
+    /// name="Command">본문내용을 입력하세요;</hp:stringParam>` 처럼 `;` 로 끝나는 항목을
+    /// 늘어놓고 첫 항목이 안내문이다(`0000.00.00.;0000.00.00.\;charshape=b;`). 한컴 Print 는
+    /// 미기입(dirty="0") 누름틀의 내용이 이 첫 항목과 같으면 안내문으로 보고 인쇄하지 않는다
+    /// (`mydocs/tech/hwp_spec_errata.md` §39).
     pub fn guide_text(&self) -> Option<&str> {
         if self.field_type != FieldType::ClickHere {
             return None;
         }
-        self.extract_wstring_value("Direction:")
+        if let Some(guide) = self.extract_wstring_value("Direction:") {
+            return Some(guide);
+        }
+        if self.command.starts_with("Clickhere:") {
+            return None;
+        }
+        self.plain_command_guide()
+    }
+
+    /// 평문 command 의 첫 `;` 항목(`guide_text` 설명). 빈 항목과 `\;` 이스케이프가 걸친
+    /// 항목은 원문 조각으로 돌려줄 수 없어 `None` 이다.
+    fn plain_command_guide(&self) -> Option<&str> {
+        let end = self.command.find(';')?;
+        let guide = &self.command[..end];
+        if guide.is_empty() || guide.ends_with('\\') {
+            return None;
+        }
+        Some(guide)
     }
 
     /// 누름틀(ClickHere) 필드 이름을 반환한다.

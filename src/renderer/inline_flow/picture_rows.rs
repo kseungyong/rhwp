@@ -47,7 +47,8 @@ pub(super) fn empty_host_text_box(
 }
 
 pub(crate) fn supports_picture_rows(para: &Paragraph) -> bool {
-    para.line_segs.is_empty()
+    crate::renderer::para_has_no_stored_line_segs(para)
+        && !para.text.contains('\t')
         && para.controls.iter().any(|c| {
             matches!(c,
             Control::Picture(p) if p.common.treat_as_char)
@@ -55,6 +56,7 @@ pub(crate) fn supports_picture_rows(para: &Paragraph) -> bool {
         && para.controls.iter().all(|c| match c {
             // 캡션의 줄 구성과 배치는 기존 캡션 소유자에 남긴다.
             Control::Picture(p) => p.common.treat_as_char && p.caption.is_none(),
+            Control::Shape(_) => super::floating_shapes::supported(c),
             Control::SectionDef(_)
             | Control::ColumnDef(_)
             | Control::PageNumberPos(_)

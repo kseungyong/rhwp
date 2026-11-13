@@ -15,13 +15,19 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | 파일 | 분류 | 상태 | 용도 | 샘플 | 배선 | 비고 |
 |------|------|------|------|------|------|------|
 | `ai-panel.test.mjs` | 상시 | active | AI 대화·문서 도구·명령 확인·스트리밍 및 오류 복구 | 합성 문서 | npm e2e:ai-panel | Anthropic 응답 가로채기, 실제 키·외부 API 미사용 |
+| `ai-providers.test.mjs` | 상시 | active | OpenAI·Gemini 연결·모델·전송 동의·도구 왕복·오류·문서 바이트 보존 | 합성 문서 | npm e2e:ai-providers | SSE 응답 가로채기, 실제 키·외부 API 미사용 |
 | `ai-settings.test.mjs` | 상시 | active | AI 모델·키 설정·동의·암호화 저장·잠금·삭제 | 빈 문서 | npm e2e:ai-settings | Anthropic 응답 가로채기, 실제 키·외부 API 미사용 |
 | `side-panel.test.mjs` | 상시 | active | AI 도우미 패널 열기·닫기·폭·눈금자·선택문 보존 | 합성 문서 | npm e2e:side-panel | 실제 Studio DOM·키 입력 |
 | `canvaskit-periodic-borders-issue7998.test.mjs` | 상시 | active | #7998 주기 괘선의 CanvasKit dash 소비와 투명 프레임 무출력 | issue7998/periodic-borders/native-dot-widths.hwpx | 수동 | 실제 software CanvasKit·독립 Print 주기 대조 |
+| `continuous-highlighter.test.mjs` | 상시 | active | 연속 형광펜 모드: 블록 없이 색 선택 시 진입·드래그마다 칠·undo 단계·Esc/버튼 재클릭 종료·블록 있으면 즉시 적용 | 새 문서 | npm e2e:continuous-highlighter | dev server 필요 — run-with-vite.mjs 경유 |
+| `web-font-deadline.test.mjs` | 상시 | active | #8614 정상·실패·무응답 초기화와 문서 열기·늦은 완료·후속 편집 | 합성 문서·번들 테스트 글꼴·네트워크 응답 주입 | npm e2e:web-font-deadline | 자체 Vite·Chrome, output 아래 프로필 |
 | `command-error-contract.test.mjs` | 상시 | active | #8104 오류 복구·호스트 전달 계약 | 빈 문서·실패 주입 | 수동 | 내용·선택·history·dirty·후속 편집·MessagePort·세션 교체 |
 | `cell-target-issue8102.test.mjs` | 상시 | active | #8102 생성·클릭·키보드·undo 진입 선택 삭제, 다중 문단·중첩·인접 셀·invalid target | 편집 API 합성 | npm e2e:issue-8102 | fresh WASM·Studio 실제 입력 |
 | `automation-commands.test.mjs` | 상시 | active | studio 자동화 표면 — 커맨드 질의·실행·메뉴 모델·드리프트 가드·다이얼로그 정책·`insert:field` 매개변수 삽입 | — | npm e2e:automation |  |
 | `enter-caret-reveal-issue7486.test.mjs` | 상시 | active | #7486 본문 Enter 새 쪽의 DOM 캐럿·viewport 및 Undo/Redo, 100%/66% 배율·160/200/300% 줄간격 | 편집 API 합성 | npm e2e:enter-caret | 추가 입력 없이 layout 완료 경계 검사 |
+| `issue8174-modal-focus.test.mjs` | 상시 | active | #8174 암호 모달·중첩 모달의 입력 소유 보존 | 빈 문서 | 수동 | 늦은 편집기 focus가 암호 입력을 빼앗지 않음 |
+| `selection-layout-issue8103.test.mjs` | 상시 | active | #8103 Canvas2D/auto의 400문단 Undo/Redo 선택·focus 원점, smooth zoom·scroll·배치·지연 중 새 선택·문서 교체 보존 | plain-text paste 합성 | npm e2e:selection-layout | 첫/중간/마지막 쪽 관계 검사, 명시 CanvasKit·원본 font cache 옵션 |
+| `canvaskit-periodic-borders-issue7998.test.mjs` | 상시 | active | 기존 CanvasKit 주기 테두리의 실제 dash 소비와 잉크 검사 | pdf/issue7998/periodic-borders/native-dot-widths.hwpx | 수동 | 기준 devel의 목록 누락 보완, 테스트 구현 변경 없음 |
 | `autosave-recovery.test.mjs` | 상시 | active | Task #1448 — 미저장 문서 자동 백업 복구 E2E | — | 수동 |  |
 | `blogform.test.mjs` | 상시 | active | BlogForm_BookReview.hwp 누름틀 안내문 | BlogForm_BookReview.hwp | 수동 |  |
 | `body-outside-click-fallback.test.mjs` | 진단 | hold | 보류 ② 본문 외곽 클릭 fallback 결함 — 가설 (b) master page 글상자 hit 확정 e2e | hwpctl_Action_Table__v1.1.hwp | 수동 | legacy-name · 보류② 이슈 종속 |
@@ -36,10 +42,12 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `pattern-image-replay-api.mjs` | 유틸 | active | 반복 이미지 shader의 생성·소유·해제 계약용 API 모형 | 합성 pattern image | 수동 | `renderer-contract.test.mjs`에서 간접 import |
 | `middle-dot-canvas-paint.test.mjs` | 상시 | active | 가운뎃점의 실제 Canvas 원형 경로와 앞뒤 내용 소유 | k-water-rfp.hwp | npm e2e:middle-dot-canvas-paint | 원본 공개 WASM·Canvas paint 소비 검사 |
 | `canvaskit-cropped-contain.test.mjs` | 상시 | active | #7235 crop 이후 이미지 비율과 letterbox의 실제 CanvasKit replay 검사 | 합성 이미지 | 수동 | run-with-vite.mjs 경유 |
+| `char-overlap-monochrome-fallback.test.mjs` | 상시 | active | #8616 겹침 모양 단색·덧말 원색과 공개 글꼴 후보 소비 | char_overlap/hancom-mac-shapes.hwpx, dutmal/hancom-mac-dutmal.hwpx | 수동 | run-with-vite.mjs 경유, 최소 글꼴·좌표 독립 관계 검사 |
 | `glyph-outline-portable-geometry.test.mjs` | 상시 | active | #536 strict outline의 유효 좌표 replay와 f32 범위 초과 시 전체 TextRun fallback 픽셀 보존 | 합성 outline·TextRun | npm e2e:glyph-outline-portable-geometry | Chromium software CanvasKit, run-with-vite.mjs 경유 |
 | `issue-7442-nested-table-pointer.test.mjs` | 상시 | active | #7442 F5 선택 후 드래그·일반 hover/resize·Undo·블록 선택·외곽선 클릭 | basic/issue1994_behindtext_table_20200830.hwp | 수동 | fresh WASM 필수 |
 | `issue-6806-zero-shape-resize-undo.test.mjs` | 상시 | active | #6806 저장 높이 0 도형의 실제 WASM 리사이즈·Studio undo/redo | issue6023/30269_reform_recommendation.hwp | 수동 | 기존 누락 항목 등록 |
 | `issue-7333-line-selection.test.mjs` | 상시 | active | #7333 넓은 도형 위 화살표 실클릭 선택과 z-order·undo 무변경 검사 | issue7333/aaaaaa.hwp | npm e2e:issue-7333-line |  |
+| `number-shape-selection-issue7375.test.mjs` | 상시 | active | #7375 표 셀 번호 도형의 독립 선택·셀 경로·이동·삭제·Ctrl+Z/Command+Z | issue7333/aaaaaa.hwp | 수동 | `run-with-vite.mjs`로 실행; 공통 소유 경로 관계 검사는 기존 unit glob에서 실행 |
 | `probe-flow-input-latency-issue3794.mjs` | 진단 | active | #3794 flow 입력 budget·scheduler·restart 지연 측정 | issue1949_giant_cell_nested_tables_perf.hwp/.hwpx | 수동 | 시간 수치는 비-CI 진단 |
 | `probe-host-font-visual-issue7403.mjs` | 진단 | active | #7403 실제 HCRBatang host face의 CanvasKit/Canvas2D 출력과 해제 후 원복 시각 증거 | re-01-hangul-only-hancom.hwp | 수동 | RHWP_HOST_FONT_PATH로 검증한 글꼴 공급, run-with-vite.mjs 경유 |
 | `chart-data-structure-issue6053.test.mjs` | 상시 | active | #6053 차트 행·열·라벨 구조 편집 UI — 우클릭 행 추가·저장본 반영·Ctrl+Z 원복·무편집 무흔적·ESC 는 메뉴만 닫음·종류별 사전 판정(원형 안내/주식형 캔들 양끝 비활성) | chart/세로막대형/묶은세로막대형.hwp, chart/원형/2차원원형.hwp, chart/기타/시가고가저가종가.hwp | npm e2e:issue-6053 | dev server 필요 — run-with-vite.mjs 경유 |
@@ -82,7 +90,7 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `hml-open.check.mjs` | 상시 | active | Standalone HML browser regression. | — | 수동 | legacy-name |
 | `hwpctl-basic.test.mjs` | 상시 | active | hwpctl 호환 레이어 기본 동작 | — | 수동 |  |
 | `hwp-password-open.test.mjs` | 상시 | active | #3474/#3481/#5986 HWP3·HWPX 암호 문서: 대화상자·오답·취소·Enter·저장소 비보존·저장 보호 상태 수명주기, HWP3 A4 144dpi Canvas 경계 | HWP3-password-123456.hwp, HWP5-password-123456.hwpx, HWP5-nopassword-123456.hwpx | npm e2e:hwp-password-open | 실제 암호 fixture; 비밀번호와 로컬 E2E 보고서는 비커밋 |
-| `issue_8160_password_open.test.mjs` | 상시 | active | #8160 sample16 HWP5 EncryptVersion 4 암호 대화상자·오답·취소·Enter·저장 보호 상태 | hwp3-sample16-hwp5-2024-password-123456.hwp | 기존 e2e:hwp-password-open에서 순차 실행 | 새 이름의 전용 검사, 직접 실행도 가능 |
+| `issue_8160_password_open.test.mjs` | 상시 | active | #8160 sample16 HWP5 EncryptVersion 4 암호 대화상자·오답·취소·Enter·저장 보호 상태 | hwp3-sample16-hwp5-2024-password-123456.hwp | 수동 | 직접 npm 진입점은 없음. hwp-password-open.test.mjs가 import하여 npm e2e:hwp-password-open에서 순차 호출하며 직접 실행도 가능 |
 | `crlf-insert-history.test.mjs` | 상시 | active | CRLF 입력의 커서·Undo/Redo·HWP 저장 보존 | 합성 본문·셀·중첩 셀 | 수동 | #8001, run-with-vite·fresh WASM 실동작 |
 | `hwpctrl-nested-caret.test.mjs` | 상시 | active | SDK 캐럿 동기화→CreateField의 중첩 셀 부모 문단 소유·Undo | issue1949_giant_cell_nested_tables_perf.hwp | 수동 | 조판 좌표 고정 없음 |
 | `hwpctrl-plugin.test.mjs` | 상시 | active | hwpctrl 플러그인 — studio 문서 공유·배치 편집·좌표 변환·사용자 캐럿 동기화·unload 생존 | — | npm e2e:hwpctrl-plugin |  |
@@ -101,7 +109,9 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `issue-4030-footnote-goto-transition.test.mjs` | 상시 | active | #4030 실제 대형 HWP 각주에서 Option+G 200쪽 이동 시 본문 모드·상태 표시·viewport 전환 | 정책연구용역사업 중간진도보고서(살아있는 간장 기증자의 의학적 선별기준 연구).hwp | 수동 | |
 | `issue-4158-char-overlap-boxed-pua-canvas2d.test.mjs` | 상시 | active | #4158 실제 CharOverlap의 사각 안 숫자 PUA를 Canvas2D가 숫자와 사각형으로 합성 | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-4158 | 17쪽·물리 10쪽 raw IR 보존 계약 포함 |
 | `issue-4159-terminal-nested-bottom-border-canvas2d.test.mjs` | 상시 | active | #4159 실제 HWP 물리 3쪽 종료 재귀 중첩 표 bottom 선의 Canvas2D clip 포섭 | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-4159 | #4069 17쪽 pagination 계약 포함 |
+| `issue-8125-hairline-canvas2d.test.mjs` | 상시 | active | #8125 장치 한 칸보다 가는 표 괘선을 Canvas2D 가 한 칸 굵기로 그림(Native `subpixel_stroke_hairline` 과 같은 판정) | basic/calendar_year.hwp | npm e2e:issue-8125-canvas2d | run-with-vite.mjs 경유, 수정 전 182곳 미달 |
 | `issue-4252-nested-partial-table-object-selection.test.mjs` | 상시 | active | #4252 재귀 분할 중첩 표의 실제 IR cellPath·bbox 조회·Esc 객체 선택과 브라우저 성능 증적 | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-4252 | 물리 5쪽 외부→래퍼→자식 표 경로와 `output/4252/perf-*.json` |
+| `issue-8578-group-text-editing.test.mjs` | 상시 | active | #8578 묶음 자식 글상자·목차 본문의 실제 클릭, 입력·드래그·undo/redo·Esc 소유 보존 | 2025 행정업무운영 편람(최종).hwpx | 수동 | `run-with-vite.mjs`로 실행; core 관계 검사와 Esc 단위 검사는 기존 자동 suite에서 실행 |
 | `issue-4694-chart-data-edit.test.mjs` | 상시 | active | #4694 차트 데이터 편집 — 메뉴 노출·더블클릭 진입·값 수정 반영·Ctrl+Z 원복·무편집 무흔적 | chart/세로막대형/묶은세로막대형.hwp | 수동 | |
 | `issue-4969-shaping-replay.test.mjs` | 상시 | active | #4969 common GlyphRun의 strict CanvasKit 선택·Source Han exact face·affine advance와 √ratio ink 계약 | RHWPOldHangul-Regular.otf | npm e2e:issue-4969 | software CanvasKit pixel 대조 |
 | `issue-4272-page11-nested-cell-copy.test.mjs` | 상시 | active | #4272 물리 11쪽 자식 표 셀 문단 22의 실제 드래그·Ctrl+C 최내곽 문단 축 검증 | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-4272-page11 | `output/4272/page11-child-cell-copy.{json,png}` |
@@ -109,7 +119,11 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `issue-4272-nested-cell-text-selection.test.mjs` | 상시 | active | #4272 중첩 표 안쪽 셀의 전체 cellPath 선택 rect, 실제 마우스 드래그와 Ctrl+C/V | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-4272 | 물리 5쪽 `23,504`, `output/4272/nested-cell-*.{json,png}` |
 | `issue-536-boxed-pua-canvas2d.test.mjs` | 상시 | active | #536 실제 HWP의 사각 안 숫자 PUA를 기본 Canvas2D가 결정적으로 합성 | basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-536 | #4122 17쪽 pagination stack 계약 포함 |
 | `layer-export-issue536.test.mjs` | 상시 | active | #536 JSON/value·v2 compat/strict export, font/image byte 생략 4조합, content-key 재조회·입력 변이 격리·편집 후 자원 계약 | test-image.hwpx, render-p35-font-native-bitmap.hwpx, para-001.hwp | npm e2e:layer-export-issue536 | fresh WASM 필수, Chromium·임시 Vite 자체 기동, 비시각 API 검사 |
+| `local-font-count-issue8371.test.mjs` | 상시 | active | 로컬 글꼴 재감지와 설정 재열기의 face 수 보존 | 합성 글꼴 목록 | 수동 | #8397 기존 파일의 원장 누락 보완 |
+| `local-font-list-issue8371.test.mjs` | 상시 | active | 로컬 글꼴 목록의 별칭 표시와 검색 | 합성 글꼴 목록 | 수동 | #8397 기존 파일의 원장 누락 보완 |
 | `local-font-partial-enumeration-issue4741.test.mjs` | 상시 | active | #4741 Local Font Access 부분 열거를 강제해 raw probe·exact Canvas2D face·폭·cache 계약 검증 | 합성 Canvas2D 글꼴 표본 | npm e2e:issue-4741 | KoPub바탕체 Light 설치 호스트 Chrome 전용 |
+| `local-font-prompt-issue8371.test.mjs` | 상시 | active | 빈 문서 입력과 문서 열기의 로컬 글꼴 선택 | samples/eq-002.hwp | 수동 | #8397 기존 파일의 원장 누락 보완 |
+| `local-font-refresh-issue8371.test.mjs` | 상시 | active | 문서에서 사용하는 글꼴이 변경될 때만 재조판 | samples/eq-002.hwp | 수동 | #8397 기존 파일의 원장 누락 보완 |
 | `middle-dot-canvas-paint.test.mjs` | 상시 | active | 실제 Canvas 가운뎃점 원형 경로와 앞뒤 본문 소유 보존 | k-water-rfp.hwp | npm e2e:middle-dot-canvas-paint | 독립 Print 근거와 기존 시각 증적은 테스트 주석 참조 |
 | `issue-595.test.mjs` | 진단 | hold | 시험지 회귀 실행 제거·파일 보존 | exam_math.hwp | — | legacy-name · 사용자 지시로 실행 진입점 제거 |
 | `issue-6099-probe.mjs` | 진단 | active | #6099 90° 회전 그림 DOM frame/img 실측과 스크린샷 생성 프로브 | samples 하위 지정 파일 | 수동 | legacy-name · 일회성 실측 프로브 |
@@ -126,6 +140,10 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `page-break-caret-reveal.test.mjs` | 상시 | active | Cmd+Enter 쪽 나누기 뒤 새 쪽 캐럿 DOM 재배치와 편집 영역 viewport 자동 스크롤 | — | npm e2e:page-break-caret | dev server 필요 — run-with-vite.mjs 경유 |
 | `page-key-scroll.test.mjs` | 상시 | active | PgUp/PgDn 쪽 단위 스크롤 — 건너뜀 없음·쪽 머리 착지·캐럿 추종·포커스 밖 동작 | biz_plan.hwp | npm e2e:page-key-scroll |  |
 | `page-setup-orientation-icon.test.mjs` | 상시 | active | 편집 용지 대화창의 용지 방향 아이콘 식별성 | — | 수동 |  |
+| `pdf-import-busy-issue8398.test.mjs` | 상시 | active | #8398 PDF 선택·재시도 커서, 파일/바이트/드롭 열기, Worker 취소와 기존 문서 보존 | pdf/pr8224/lseg-tab-insert-2020.pdf, para-001.hwp | 수동 | 실제 최적화 WASM, 조판 수치 검사가 아닌 UI 상태 계약 |
+| `pdf-import-dialog-issue8411.test.mjs` | 상시 | active | #8411 PDF 가져오기 화면·키보드·한도·시간 초과·재시도 | pdf/issue8403/image-patterns.pdf | 수동 | 실제 최적화 WASM·Worker, 두 테마와 작은 화면의 UI 계약 |
+| `pdf-page-progress-issue8413.test.mjs` | 상시 | active | #8413 실제 PDF 쪽 진행률·취소·기존 문서 보존 | pdf/issue8413/resource-policy/resource-8k.pdf | 수동 | RHWP_PDF_PROGRESS_INPUT/PAGES로 37쪽 실물 검증도 수행 |
+| `pdf-password-issue8415.test.mjs` | 상시 | active | #8415 암호 입력·재시도·취소 | pdf/issue8415/authentication/password-r6.pdf | 수동 | 실제 Worker 인증·기존 문서 보존 |
 | `pdf-render-diff-report.mjs` | 상시 | active | Report-only visual diff between browser Canvas output and SVG-deri | — | npm+CI | legacy-name |
 | `plugin-lifecycle.test.mjs` | 상시 | active | 플러그인 호스트 — allowlist·트랜잭션 1스냅샷·롤백·unload 회수 | — | npm e2e:plugin-lifecycle |  |
 | `print-pdf-issue3126.test.mjs` | 상시 | active | #3126 same-origin iframe 인쇄/PDF UX, 상태 불변, #2524/#2525 browser PDF 회귀 | render-p35-font-native-bitmap.hwpx, hwpx/hwpx-02.hwpx | 수동 | native dialog는 Chrome/Edge 수동 절차 병행 |
@@ -185,9 +203,13 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `zoom-dialog-transaction.test.mjs` | 상시 | active | #6109 사용자 배율 오류·ARIA·Enter/Escape/취소와 배치+이동+배율 단일 transaction — 최종 상태 `recalcLayout()` 1회 | — | npm e2e:zoom-dialog-transaction | dev server 필요 — run-with-vite.mjs 경유 |
 
 | `hyperlink-ui-issue6963.test.mjs` | 상시 | active | #6963 한컴형 링크 UI·우클릭·방문 색·undo/redo·드래그 선택 | 새 문서 | 수동 | 실제 WASM 필요 |
+| `memo-delete-undo.test.mjs` | 상시 | active | #8017 메모 기준 글자 Backspace·Delete 삭제와 Ctrl+Z·Ctrl+Y의 메모·범위 복원, 떨어진 삭제 병합 유지 | 새 문서 | npm e2e:memo-delete-undo | 실제 Studio 키 입력·fresh WASM |
 
 | `host-font-provider-issue7403.test.mjs` | 상시 | active | #7403 호스트 face 선택·동명 교체·실패 복구·저장 이름/dirty 보존 | 새 문서·합성 TTC·번들 Noto·basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-7403 / e2e:issue-7403-canvas2d | 명시적 CanvasKit/Canvas2D, 측정·paint·SVG 경계 포함 |
 
 | `issue-7593-dyad-display.test.mjs` | 상시 | active | dyad와 복합 수식의 실제 표시·CanvasKit 누락 방지 | `samples/issue7593/` 2개 | 수동 | `VITE_URL=… node e2e/issue-7593-dyad-display.test.mjs --mode=headless`; Native/fresh WASM 전쪽90% 선행 확인; 실제 WASM 바이트·내용·replay 진단 |
 
 | `ruler-resize-support.mjs` | 유틸 | active | 시험지 실행을 제외한 ruler 상태 조회 보조 함수 | — | — | 회귀 실행 진입점 없음 |
+| `supplementary-private-glyph-replay.test.mjs` | 상시 | active | #8389 보충 사설 문자 공급 글꼴의 실제 glyph replay | tests/fixtures/fonts/RHWPHostFixture-Regular.ttf | 수동 | 기존 c417310cab 도입 파일의 목록 누락 보완, 검사 내용 변경 없음 |
+
+| `char-outline-canvaskit.test.mjs` | 상시 | active | #8369 투명한 글자 외곽선·공통 점선 실제 CanvasKit 소비 | tests/fixtures/char_outline_types/outline.hwp | 수동 | software surface, 번들 Noto 효과 대조 |

@@ -1,3 +1,11 @@
+//! 검사 유형: 고정형.
+//! 2026-10-28 측정 raw(96dpi, PDFium): 한글문서파일형식_5.0_revision1.3.hwp 21쪽 Native 99.59026% / fresh WASM 99.54796%; 전71쪽 최저 95.31577% / 95.19516%.
+//! wide.hwpx 1쪽 Native 98.78322% / fresh WASM 98.78261%; 전1쪽 최저 98.78322% / 98.78261%.
+//! narrow.hwpx 1쪽 Native·fresh WASM 각 100.00000%; 전1쪽 최저 각 100.00000%.
+//! 근거: mydocs/working/assets/review_integration_20261026/validation/post-rebase-8328/original-floatfix-native-comparison.json,
+//! mydocs/working/assets/review_integration_20261026/validation/post-rebase-8328/original-floatfix-wasm-comparison.json,
+//! mydocs/working/assets/review_integration_20261026/validation/post-rebase-8328/print-alpha-visual-evidence.json.
+//!
 //! 연속 알파 그림의 원본 줄 소유와 독립 한컴 Print 운반체를 함께 보호한다.
 //! Native/fresh WASM 양쪽 98% 이상과 직접 판독을 마친 두 입력만 사용한다.
 //! 증거: mydocs/pr/assets/pr_8032_print_alpha/README.md
@@ -60,6 +68,72 @@ fn png(node: roxmltree::Node<'_, '_>) -> image::RgbaImage {
         .decode(data)
         .unwrap();
     image::load_from_memory(&bytes).unwrap().to_rgba8()
+}
+
+#[test]
+fn grouped_transparent_images_keep_their_source_bottom_border() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = root.join("output/test-runs").join(format!(
+        "print-alpha-group-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&output).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_rhwp"))
+        .current_dir(root)
+        .arg("export-svg")
+        .arg("samples/한글문서파일형식_5.0_revision1.3.hwp")
+        .args(["--profile", "print", "--compat", "2022", "-p", "20", "-o"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "인쇄 SVG 출력 실패: {result:?}");
+    let svg_path = fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "svg"))
+        .expect("21쪽 SVG");
+    let svg = fs::read_to_string(svg_path).unwrap();
+    let doc = roxmltree::Document::parse(&svg).unwrap();
+    let borders = doc
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "image")
+        .filter_map(|node| {
+            let x: f64 = node.attribute("x")?.parse().ok()?;
+            let y: f64 = node.attribute("y")?.parse().ok()?;
+            let width: f64 = node.attribute("width")?.parse().ok()?;
+            let height: f64 = node.attribute("height")?.parse().ok()?;
+            if !((235.0..=238.0).contains(&x) || (411.0..=414.0).contains(&x))
+                || !(396.0..=399.0).contains(&y)
+                || width < 160.0
+            {
+                return None;
+            }
+            let href = node
+                .attributes()
+                .find(|attribute| attribute.name() == "href")?
+                .value();
+            let data = href.strip_prefix("data:image/png;base64,")?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            let pixels = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let opaque = (0..pixels.width())
+                .filter(|x| pixels.get_pixel(*x, pixels.height() - 1)[3] >= 128)
+                .count();
+            // 한컴 Print에서 두 그림의 하단선은 96dpi 기준 약 440px이다.
+            ((y + height - 440.0).abs() <= 1.5 && opaque * 10 >= pixels.width() as usize * 9)
+                .then_some(())
+        })
+        .count();
+    assert_eq!(
+        borders, 2,
+        "원본 PNG 두 개의 마지막 선을 인쇄 경로에서 보존"
+    );
+    fs::remove_dir_all(output).unwrap();
 }
 
 #[test]

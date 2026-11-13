@@ -8,8 +8,16 @@ pub mod clipboard;
 pub mod commands;
 pub mod editor;
 pub mod fonts;
+#[cfg(all(feature = "native-skia-d3d", target_os = "windows"))]
+pub mod gpu_d3d;
+#[cfg(all(feature = "native-skia-gl", target_os = "linux"))]
+pub mod gpu_gl;
+#[cfg(all(feature = "native-skia-metal", target_os = "macos"))]
+pub mod gpu_metal;
+pub mod presentation;
 #[cfg(feature = "native-skia")]
 pub mod region_cache;
+pub mod render_snapshot;
 pub mod runtime;
 pub mod save;
 pub mod view;
@@ -113,6 +121,9 @@ pub struct NativeDocumentSession {
     revision: u64,
     font_generation: u64,
     fonts: fonts::NativeFontState,
+    // Explicit immutable inputs, independent of the renderer's native copies.
+    // Snapshots share these bytes without reopening the caller's font paths.
+    font_data: std::sync::Arc<[Vec<u8>]>,
     saved_revision: Option<u64>,
     pending_save: Option<save::PendingSaveCheckpoint>,
     #[cfg(feature = "native-skia")]
@@ -126,15 +137,25 @@ pub struct NativeDocumentSession {
 impl NativeDocumentSession {
     pub fn from_core(core: DocumentCore) -> Self {
         let fonts = fonts::NativeFontState::from_environment(core.font_environment().cloned());
+        #[cfg(feature = "native-skia")]
+        let (core, renderer) = {
+            let mut core = core;
+            let renderer = crate::renderer::skia::SkiaLayerRenderer::new()
+                .with_cache_limits(MAX_RENDER_CACHE_ENTRIES, MAX_RENDER_CACHE_BYTES);
+            // 공급을 확인하지 못하면 원본 HFT 메트릭을 유지한다.
+            let _ = renderer.prepare_native_otf_fonts(&mut core);
+            (core, std::cell::OnceCell::from(renderer))
+        };
         Self {
             core,
             revision: 0,
             font_generation: 0,
             fonts,
+            font_data: std::sync::Arc::from(Vec::<Vec<u8>>::new()),
             saved_revision: None,
             pending_save: None,
             #[cfg(feature = "native-skia")]
-            renderer: std::cell::OnceCell::new(),
+            renderer,
             #[cfg(feature = "native-skia")]
             region_cache: std::cell::RefCell::new(region_cache::NativeRegionCache::default()),
             _thread_affinity: PhantomData,
@@ -156,12 +177,18 @@ impl NativeDocumentSession {
                 "document or password exceeds limit".into(),
             ));
         }
-        let core = match password {
-            Some(password) => DocumentCore::from_bytes_with_password(bytes, password)?,
-            None => DocumentCore::from_bytes(bytes)?,
-        };
+        let mut core = DocumentCore::new_empty();
+        core.load_bytes(bytes, password)?;
         let mut session = Self::from_core(core);
         session.saved_revision = Some(0);
+        Ok(session)
+    }
+
+    /// Open an explicitly chosen recovery payload as an unsaved document.
+    /// The recovery artifact is not a user save checkpoint or a source path.
+    pub fn open_recovery_bytes(bytes: &[u8]) -> Result<Self, NativeHostError> {
+        let mut session = Self::open_bytes(bytes, None)?;
+        session.saved_revision = None;
         Ok(session)
     }
 
@@ -278,6 +305,27 @@ impl NativeDocumentSession {
         #[cfg(feature = "native-skia")]
         {
             self.render_region_cached(page, region, scale)
+        }
+        #[cfg(not(feature = "native-skia"))]
+        {
+            let _ = region;
+            Err(NativeHostError::FeatureDisabled)
+        }
+    }
+
+    /// Opt-in fixed-grid rendering for large pages and high scales.
+    /// The full-page exact-crop API remains available through `render_region`.
+    pub fn render_tiled_region(
+        &self,
+        page: u32,
+        region: crate::renderer::raster_pixels::RasterRegion,
+        scale: f64,
+    ) -> Result<NativeFrame, NativeHostError> {
+        self.check_page(page)?;
+        Self::check_scale(scale)?;
+        #[cfg(feature = "native-skia")]
+        {
+            self.render_tiled_region_cached(page, region, scale)
         }
         #[cfg(not(feature = "native-skia"))]
         {

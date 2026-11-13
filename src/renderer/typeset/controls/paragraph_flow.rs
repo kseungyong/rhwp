@@ -19,37 +19,43 @@ pub(in crate::renderer::typeset) struct TableParagraphInput<'a> {
     pub composed_all: &'a [ComposedParagraph],
 }
 
-fn try_place_reflowed_table_rows(
+fn try_place_reflowed_table_rows_with_storage<S: crate::storage::Storage>(
     engine: &TypesetEngine,
     st: &mut TypesetState,
     para_idx: usize,
     para: &Paragraph,
     styles: &ResolvedStyleSet,
     measured_tables: &[MeasuredTable],
-) -> bool {
-    if !crate::renderer::inline_flow::supports_table_text_rows(para) {
-        return false;
+    storage: &S,
+) -> Result<bool, S::Error> {
+    if !crate::renderer::inline_flow::supports_table_text_rows_with_storage(para, storage)?
+        && !crate::renderer::inline_flow::supports_page_square_table_rows(para)
+    {
+        return Ok(false);
     }
     let build = |st: &TypesetState, start: f64, preceding: bool| {
-        crate::renderer::typeset::inline_flow::plan::build_plan(
+        crate::renderer::typeset::inline_flow::plan::build_plan_with_storage(
             st.inline_flow_input(start, preceding),
             para,
             para_idx,
             styles,
             measured_tables,
             engine.dpi,
+            storage,
         )
     };
-    let Some(mut plan) = build(st, st.current_height, true) else {
-        return false;
+    let Some(mut plan) = build(st, st.current_height, true)? else {
+        return Ok(false);
     };
     // Fragmented tables and footnote reservation retain their existing owner.
     // A fitting prefix must stay in this column, even if later rows need a cut.
     if plan.occupied_end() > st.available_height() {
         // 단독 행 나눔 표도 전체가 들어가면 공백과 같은 물리 줄을 공유한다.
         // 들어가지 않는 조각은 상태를 바꾸기 전에 기존 분할 소유자에게 돌려준다.
-        if crate::renderer::inline_flow::standalone_table_fragment_owner(para) {
-            return false;
+        if crate::renderer::inline_flow::standalone_table_fragment_owner_with_storage(
+            para, storage,
+        )? {
+            return Ok(false);
         }
         if st.current_items.is_empty()
             || plan
@@ -57,25 +63,32 @@ fn try_place_reflowed_table_rows(
                 .first()
                 .is_none_or(|row| row.y + row.height <= st.available_height())
         {
-            return false;
+            return Ok(false);
         }
-        let Some(candidate) = build(st, 0.0, false) else {
-            return false;
+        let Some(candidate) = build(st, 0.0, false)? else {
+            return Ok(false);
         };
         if candidate.occupied_end() > st.base_available_height() {
-            return false;
+            return Ok(false);
         }
-        st.advance_column_or_new_page();
-        let Some(candidate) = build(st, st.current_height, true) else {
-            return false;
+        st.advance_column_or_new_page_with_storage(storage)?;
+        let Some(candidate) = build(st, st.current_height, true)? else {
+            return Ok(false);
         };
         if candidate.occupied_end() > st.available_height() {
-            return false;
+            return Ok(false);
         }
         plan = candidate;
     }
-    st.commit_inline_flow(para_idx, plan);
-    true
+    st.commit_inline_flow_with_storage(para_idx, plan, storage)?;
+    for (control, item) in para.controls.iter().enumerate() {
+        if let Control::Table(table) = item {
+            st.register_page_anchored_square_table_with_storage(
+                para_idx, control, para, table, storage,
+            )?;
+        }
+    }
+    Ok(true)
 }
 
 pub(in crate::renderer::typeset) fn place(
@@ -83,6 +96,18 @@ pub(in crate::renderer::typeset) fn place(
     st: &mut TypesetState,
     input: TableParagraphInput<'_>,
 ) {
+    match place_with_storage(engine, st, input, &crate::storage::Unbounded) {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+pub(in crate::renderer::typeset) fn place_with_storage<S: crate::storage::Storage>(
+    engine: &TypesetEngine,
+    st: &mut TypesetState,
+    input: TableParagraphInput<'_>,
+    storage: &S,
+) -> Result<(), S::Error> {
     let TableParagraphInput {
         para_idx,
         para,
@@ -98,14 +123,40 @@ pub(in crate::renderer::typeset) fn place(
     // 소비한다 — 종전에는 텍스트 경로(typeset_paragraph)만 소비해, 후속 표
     // 문단의 블록 표 fit 이 존 위에 겹쳐 배치됐다 (19439117: 870px 서식 표
     // 존 [31..902] 위에 866px 표가 y≈36 에 통배치 → 1쪽, 한글 2쪽).
-    let host_col_w = st.prepare_table_paragraph_column();
+    // 글자처럼 취급한 표 줄도 글줄이다. 앞 표 위 틈에 다 들어가지 않으면 그 표 아래로 간다.
+    let tac_line_probe = para
+        .controls
+        .iter()
+        .any(|control| matches!(control, Control::Table(table) if table.common.treat_as_char))
+        .then(|| para.line_segs.first())
+        .flatten()
+        .map_or(0.0, |line| {
+            crate::renderer::hwpunit_to_px(line.line_height.max(0), engine.dpi)
+        });
+    let host_col_w = st.prepare_table_paragraph_column(tac_line_probe, para_idx);
     if st.place_mixed_host_line(para_idx, para, styles, measured_tables, engine.dpi) {
-        return;
+        return Ok(());
     }
-    if try_place_reflowed_table_rows(engine, st, para_idx, para, styles, measured_tables) {
-        return;
+    if try_place_reflowed_table_rows_with_storage(
+        engine,
+        st,
+        para_idx,
+        para,
+        styles,
+        measured_tables,
+        storage,
+    )? {
+        return Ok(());
     }
-    let mut fmt = engine.format_paragraph(para, composed, styles, Some(host_col_w));
+    let mut fmt = engine.format_paragraph_for_flow_with_storage(
+        para,
+        composed,
+        styles,
+        Some(host_col_w),
+        styles.hwp3_variant,
+        false,
+        storage,
+    )?;
     // 문서의 다른 개체를 편집해도 이 호스트의 저장 줄과 현재 표 프레임은 유효할 수 있다.
     // 계획이 현재 측정 높이와 앞뒤 저장 원점을 검증하므로 문서 전체 편집 플래그로 거절하지 않는다.
     let stored_body_wide_host = st
@@ -158,7 +209,7 @@ pub(in crate::renderer::typeset) fn place(
         styles,
         composed,
     ) {
-        return;
+        return Ok(());
     }
     let controls::tac_fit::TacFitPlan {
         tac_count,
@@ -174,7 +225,7 @@ pub(in crate::renderer::typeset) fn place(
         engine.tac_flow_query(),
     );
 
-    st.ensure_page();
+    st.ensure_page_with_storage(storage)?;
     // 저장 줄 없는 글앞/글뒤 표 host(서식 머리의 제목과 작은 표)는 자기 줄과 거기 앵커된
     // 표가 함께 남은 자리에 들어가야 한다. 데코 경로는 표·host 줄을 fit 없이 방출하므로
     // 쪽 끝에서 host 만 남으면 표가 꼬리 글자와 겹치거나 작은 표의 행이 쪽 경계에서
@@ -208,8 +259,20 @@ pub(in crate::renderer::typeset) fn place(
         if st.decoration_table_flow_height() + need > st.available_height()
             && need <= st.base_available_height()
         {
-            st.advance_column_or_new_page();
+            st.advance_column_or_new_page_with_storage(storage)?;
         }
+    }
+    // 저장 줄 없는 글앞/글뒤 표 host 가 제목 글자를 가지면, 데코 경로가 나중에 그 글줄을
+    // fit 없이 방출한다. 한/글은 글줄이 남은 자리에 들어가지 않으면 문단을 통째로 다음 쪽
+    // 맨 위에 두고, 글앞 표는 그 문단을 따라간다. 글줄만 들어가면 표가 쪽 아래로 넘쳐도 같은
+    // 쪽에 둔다(표 높이는 묶지 않는다). 용지·쪽 기준 그림처럼 host 줄과 무관하게 놓이는
+    // 개체가 함께 있어도 같다.
+    if controls::decoration_host::unstored_overlay_title_host(para)
+        && st.table_control_page().has_items
+        && st.decoration_table_flow_height() + fmt.height_for_fit > st.available_height() + 0.5
+        && fmt.height_for_fit <= st.base_available_height()
+    {
+        st.advance_column_or_new_page_with_storage(storage)?;
     }
     // 같은 서식 머리의 자리차지 작은 표(host 줄 바로 아래에서 시작)도 host 줄과
     // 한 블록이다. 쪽 끝에서 블록이 안 들어가면 표만 다음 쪽으로 넘어가 host 줄(제목)이
@@ -228,14 +291,11 @@ pub(in crate::renderer::typeset) fn place(
         && st.table_control_page().has_items
     {
         let px = |hu: i32| crate::renderer::hwpunit_to_px(hu, engine.dpi);
-        let block_tables: Vec<_> = para
-            .controls
-            .iter()
-            .filter_map(|c| match c {
+        let block_tables: Vec<_> =
+            storage.collect(para.controls.iter().filter_map(|c| match c {
                 Control::Table(t) => Some(t),
                 _ => None,
-            })
-            .collect();
+            }))?;
         let header_block_need = if block_tables.is_empty() {
             None
         } else {
@@ -262,15 +322,23 @@ pub(in crate::renderer::typeset) fn place(
             if st.decoration_table_flow_height() + need > st.available_height()
                 && need <= st.base_available_height()
             {
-                st.advance_column_or_new_page();
+                st.advance_column_or_new_page_with_storage(storage)?;
             }
         }
     }
 
     // A candidate rejected in the previous column does not describe the new
     // column. Recompose at its origin so fit and paint still consume one plan.
-    if try_place_reflowed_table_rows(engine, st, para_idx, para, styles, measured_tables) {
-        return;
+    if try_place_reflowed_table_rows_with_storage(
+        engine,
+        st,
+        para_idx,
+        para,
+        styles,
+        measured_tables,
+        storage,
+    )? {
+        return Ok(());
     }
 
     // pre-fit가 단을 넘겼으면 그 단의 원점·예산으로 확정 줄 배치를 다시 계산한다.
@@ -287,23 +355,38 @@ pub(in crate::renderer::typeset) fn place(
         styles,
         composed,
     ) {
-        return;
+        return Ok(());
     }
 
-    let (height_before, page_count_before) = st.table_paragraph_flow_position();
+    let (mut height_before, page_count_before) = st.table_paragraph_flow_position();
+    // 같은 문단의 글 위아래(비-TAC) 표가 실제로 전진시킨 흐름 끝. TAC 줄 높이 상한은
+    // TAC 줄의 과전진만 되돌린다 — 측정 높이로 자란 블록 표가 이미 차지한 공간은 회수하지 않는다.
+    let mut block_table_flow_bottom: Option<f64> = None;
     let para_start_height = height_before;
+    // 머리 표 아래에 저장된 host 줄의 글자처럼 취급한 표는 표 상자 뒤에서 시작한다. 줄 높이 상한도
+    // 문단 시작이 아니라 그 줄 위끝에서 잰다.
+    let mut inline_line_top_below_float = st
+        .current_items
+        .is_empty()
+        .then(|| {
+            crate::renderer::float_placement::stored_inline_host_line_top_below_float(
+                para, next_para,
+            )
+        })
+        .flatten();
     let mut para_float_lanes = FloatLaneSet::new();
 
     let controls::order::ControlPlacementOrder {
         ctrl_order,
         first_placed_table,
         last_placed_table,
-    } = controls::order::for_paragraph(
+    } = controls::order::for_paragraph_with_storage(
         para,
         &fmt,
         engine.tac_flow_query(),
         st.base_available_height(),
-    );
+        storage,
+    )?;
 
     // [#703 잔여] 데코레이션(글앞/글뒤) 표 단축은 표만 방출하고 흐름을 0
     // 소비했다. host 문단에 제목 등 가시 텍스트가 있으면 그 텍스트가
@@ -316,7 +399,17 @@ pub(in crate::renderer::typeset) fn place(
         let ctrl = &para.controls[ctrl_idx];
         match ctrl {
             Control::Table(table) => {
-                if controls::prepare_table_control(
+                if table.common.treat_as_char {
+                    if let Some(top) = inline_line_top_below_float.take() {
+                        let line_top = st.tac_height_page().vpos_col_anchor
+                            + crate::renderer::hwpunit_to_px(top, engine.dpi);
+                        if line_top > st.current_height {
+                            st.align_flow_to(line_top);
+                        }
+                        height_before = st.current_height;
+                    }
+                }
+                if controls::prepare_table_control_with_storage(
                     st,
                     para,
                     table,
@@ -329,8 +422,9 @@ pub(in crate::renderer::typeset) fn place(
                     host_col_w,
                     engine.dpi,
                     || !engine.profile.get().hwp5_stored_pagination_layout(),
-                ) {
-                    controls::place_decoration_table(
+                    storage,
+                )? {
+                    controls::place_decoration_table_with_storage(
                         st,
                         para_idx,
                         ctrl_idx,
@@ -341,7 +435,7 @@ pub(in crate::renderer::typeset) fn place(
                         engine.dpi,
                         None,
                         |is_column_top| {
-                            engine.format_table(
+                            engine.format_table_with_storage(
                                 para,
                                 para_idx,
                                 ctrl_idx,
@@ -351,11 +445,13 @@ pub(in crate::renderer::typeset) fn place(
                                 composed,
                                 next_para,
                                 is_column_top,
+                                storage,
                             )
                         },
                         engine,
                         styles,
-                    );
+                        storage,
+                    )?;
                     // [#703 잔여] host 문단의 가시 텍스트(제목 등)를 흐름 문단으로
                     // 방출한다. 종전에는 표만 방출하고 `continue` 해서 이 텍스트를
                     // 위한 PageItem 이 어디에서도 발행되지 않아 렌더에서 통째로
@@ -377,6 +473,7 @@ pub(in crate::renderer::typeset) fn place(
                 // 일반/TAC 경로는 지연 방출과 배치 폴백까지 호스트 글줄을 소유한다.
                 // 혼합 컨트롤에 전체 PartialParagraph를 다시 추가하지 않는다.
                 flow_table_owns_host_text = true;
+                let flow_before_table = st.current_height;
                 let break_after_current_table = controls::flow_table::place(
                     engine,
                     st,
@@ -401,6 +498,16 @@ pub(in crate::renderer::typeset) fn place(
                     },
                     &mut para_float_lanes,
                 );
+                if !table.common.treat_as_char
+                    && st.flow_table_page_count() == page_count_before
+                    && st.current_height > flow_before_table
+                    && !stored_ladder_routes_around_block_table(paragraphs_all, para_idx, table)
+                {
+                    block_table_flow_bottom = Some(
+                        block_table_flow_bottom
+                            .map_or(st.current_height, |b| b.max(st.current_height)),
+                    );
+                }
 
                 notes::register_unqueued_table_cells(
                     st,
@@ -422,7 +529,7 @@ pub(in crate::renderer::typeset) fn place(
                 }
             }
             Control::Shape(_) | Control::Picture(_) | Control::Equation(_) => {
-                controls::place_table_host_shape(
+                controls::place_table_host_shape_with_storage(
                     st,
                     para_idx,
                     ctrl_idx,
@@ -431,14 +538,15 @@ pub(in crate::renderer::typeset) fn place(
                     para_start_height,
                     styles,
                     engine.dpi,
-                );
+                    storage,
+                )?;
             }
             _ => {}
         }
     }
 
     // 모든 컨트롤 원점이 정해진 뒤, TAC 높이 조정 전에 호스트 글줄을 한 번 방출한다.
-    controls::place_decoration_host_text(
+    controls::place_decoration_host_text_with_storage(
         st,
         para_idx,
         para,
@@ -452,11 +560,14 @@ pub(in crate::renderer::typeset) fn place(
             engine.profile.get().hwp5_stored_pagination_layout()
                 || engine.profile.get().hwpx_stored_layout()
         },
-    );
+        storage,
+    )?;
+
+    super::composed_tail::place_with_storage(st, para_idx, para, &fmt, engine.dpi, storage)?;
 
     if let Some(plan) = stored_body_wide_host {
         // 최초 host의 모든 글줄이 같은 단에 실제 수용됐을 때만 원점과 끝을 확정한다.
-        st.commit_stored_body_wide_host(para_idx, para, plan);
+        st.commit_stored_body_wide_host_with_storage(para_idx, para, plan, storage)?;
     }
 
     // TAC 표 높이 보정 (Paginator engine.rs:123-179 동일)
@@ -483,5 +594,66 @@ pub(in crate::renderer::typeset) fn place(
             measured_tac_floor,
             engine.tac_flow_query(),
         );
+        if let Some(bottom) = block_table_flow_bottom {
+            st.restore_block_table_flow_bottom(bottom);
+        }
     }
+
+    Ok(())
+}
+
+/// 저장 사다리가 이 블록 표(글 위아래, 문단 기준)를 돌아 흐르는가 — 뒤 문단의 저장 줄이
+/// 표의 저장 띠 안쪽에 있다가 같은 저장 쪽 안에서 띠 아래로 건너뛰면, 그 사다리는 표를
+/// 비켜 가는 줄 위치를 담고 있으므로 그대로 따른다(36374873: 뒤 문단 첫 줄 vpos 13575 가
+/// 표 띠 안, 둘째 줄 67877 이 표 아래). 뒤 문단이 띠 아래에서 시작하거나(36481164: 선언 높이로
+/// 계상한 사다리) 띠 안에만 머무르는(표를 계상하지 않은 사다리) 경우는 측정 높이로 자란 표의
+/// 흐름 끝이 뒤 흐름의 하한이다.
+fn stored_ladder_routes_around_block_table(
+    paragraphs: &[Paragraph],
+    host_index: usize,
+    table: &crate::model::table::Table,
+) -> bool {
+    use crate::renderer::float_placement::signed_hwpunit;
+    if !matches!(
+        table.common.vert_rel_to,
+        crate::model::shape::VertRelTo::Para
+    ) || !matches!(
+        table.common.text_wrap,
+        crate::model::shape::TextWrap::TopAndBottom
+    ) {
+        return true;
+    }
+    let Some(host_top) = paragraphs
+        .get(host_index)
+        .and_then(|host| host.line_segs.first())
+        .filter(|line| !crate::renderer::typeset::is_synthetic_line_seg(line))
+        .map(|line| i64::from(line.vertical_pos))
+    else {
+        return true;
+    };
+    let band_top = host_top + i64::from(signed_hwpunit(table.common.vertical_offset));
+    let band_bottom = band_top
+        + i64::from(table.outer_margin_top)
+        + i64::from(table.common.height)
+        + i64::from(table.outer_margin_bottom);
+    let mut inside_band = false;
+    let mut previous = host_top;
+    for paragraph in &paragraphs[host_index + 1..] {
+        for line in &paragraph.line_segs {
+            if crate::renderer::typeset::is_synthetic_line_seg(line) {
+                return true;
+            }
+            let top = i64::from(line.vertical_pos);
+            if top < previous {
+                // 다음 저장 쪽으로 넘어갔다 — 이 쪽 안에서 띠 아래로 건너뛴 줄이 없었다.
+                return false;
+            }
+            previous = top;
+            if top >= band_bottom {
+                return inside_band;
+            }
+            inside_band = true;
+        }
+    }
+    false
 }

@@ -31,14 +31,14 @@ impl TypesetState {
                 .host_compositions
                 .insert(owner, composition.clone());
         }
-        let content_height = fmt.line_content_height(range.clone(), 0.0);
-        let advance = fmt.line_advances_sum(range.clone());
+        let (content_height, advance) = fmt.host_text_bounds(para, range.clone(), dpi);
         let stored_frame = self.host_fragment_stored_frame(range.clone(), para, fmt, dpi);
+        let current_height = self.data.current_height;
         self.data.paragraph_fragment_content_bottoms.insert(
             (owner, range.end),
             ParagraphFragmentBounds {
-                content_bottom: self.data.current_height + content_height,
-                flow_end: self.data.current_height + advance,
+                content_bottom: current_height + content_height,
+                flow_end: current_height + advance,
                 last_line_spacing: fmt.line_tail_spacing(range.end),
                 stored_frame,
             },
@@ -87,19 +87,24 @@ impl TypesetState {
             return None;
         }
         let rows = &para.line_segs[range.clone()];
+        let owns_float_gaps =
+            crate::renderer::float_placement::stored_float_row_span_hu(para, range.clone(), dpi)
+                .is_some();
         if rows.iter().enumerate().any(|(offset, row)| {
             let index = range.start + offset;
             row.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
                 || row.line_height <= 0
                 || fmt.line_heights[index] != hwpunit_to_px(row.line_height, dpi)
                 || fmt.line_spacings[index] != hwpunit_to_px(row.line_spacing, dpi)
-        }) || rows.windows(2).any(|pair| {
-            pair[0]
-                .vertical_pos
-                .checked_add(pair[0].line_height)
-                .and_then(|end| end.checked_add(pair[0].line_spacing))
-                != Some(pair[1].vertical_pos)
-        }) {
+        }) || (!owns_float_gaps
+            && rows.windows(2).any(|pair| {
+                pair[0]
+                    .vertical_pos
+                    .checked_add(pair[0].line_height)
+                    .and_then(|end| end.checked_add(pair[0].line_spacing))
+                    != Some(pair[1].vertical_pos)
+            }))
+        {
             return None;
         }
         let anchor = self.data.vpos_col_anchor;

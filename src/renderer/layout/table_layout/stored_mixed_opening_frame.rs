@@ -66,7 +66,7 @@ impl LayoutEngine {
                 || paragraph.cell_format_vpos_dirty
                 || paragraph.line_segs.is_empty()
                 || (index < host_index
-                    && !crate::renderer::cell_paragraph_has_only_single_column_metadata(paragraph))
+                    && !crate::renderer::cell_paragraph_has_only_text_metadata(paragraph))
             {
                 return None;
             }
@@ -121,9 +121,7 @@ impl LayoutEngine {
                     .is_none_or(|paragraph| {
                         paragraph.stored_text_partition_is_dirty()
                             || paragraph.cell_format_vpos_dirty
-                            || !crate::renderer::cell_paragraph_has_only_single_column_metadata(
-                                paragraph,
-                            )
+                            || !crate::renderer::cell_paragraph_has_only_text_metadata(paragraph)
                             || paragraph
                                 .line_segs
                                 .get(unit.vis_start..unit.vis_end)
@@ -317,7 +315,7 @@ impl LayoutEngine {
                 .borrow()
                 .table_text_reflowed(table)
             || table.common.treat_as_char
-            || table.page_break != TablePageBreak::RowBreak
+            || table.layout_page_break() != TablePageBreak::RowBreak
             || cell.dirty_flag
             || cell.row_span != 1
             || cell.text_direction != 0
@@ -391,7 +389,7 @@ impl LayoutEngine {
             || child.caption.is_some()
             || child.row_count != 1
             || child.col_count != 1
-            || child.page_break != TablePageBreak::RowBreak
+            || child.layout_page_break() != TablePageBreak::RowBreak
             || self
                 .render_normalization
                 .borrow()

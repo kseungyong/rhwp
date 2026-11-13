@@ -67,6 +67,9 @@ pub(in crate::renderer::typeset) struct StateView {
     /// [#5699 H1] 이 쪽에서 사다리-미계상 표 밴드 교정으로 확보한 흐름 바닥(px).
     /// 후속 문단의 저장 vpos 후방 스냅이 교정분을 되돌리지 못한다. 쪽 단위 리셋.
     pub(in crate::renderer::typeset) ladder_band_floor: f64,
+    /// [#8948] 같은 문단 블록 표가 측정 높이로 자라 흐름 끝을 TAC 상한보다 실제로 밀어 올린
+    /// 쪽(`pages.len()` 기준). 그 쪽 다음 쪽에서만 옛 저장 쪽 경계를 넘침으로 건넌 것으로 본다.
+    pub(in crate::renderer::typeset) block_table_growth_page: Option<usize>,
     /// [#5699 H1] 이번 단에서 교정 판별이 발동한 표 (para, ctrl) — 단 flush 시
     /// 소속 페이지의 `ladder_band_tables` 로 이관해 렌더러와 판정을 공유한다.
     pub(in crate::renderer::typeset) current_ladder_band_tables: Vec<(usize, usize)>,
@@ -85,10 +88,22 @@ pub(in crate::renderer::typeset) struct StateView {
     /// Square 배제 밴드의 흐름 기준 상단. 옆 문단의 저장 좌표를 현재 흐름 좌표계로
     /// 옮겨 밴드 바닥을 확장할 때만 사용한다.
     pub(in crate::renderer::typeset) square_band_top: Option<f64>,
+    /// Square 배제 밴드 옆에 흡수한 저장 문단의 끝(흐름 좌표). 저장 줄 없는 다음 문단은
+    /// 이 펜에서 차선을 이어 흐른다.
+    pub(in crate::renderer::typeset) square_band_source_pen: Option<f64>,
     pub(in crate::renderer::typeset) current_footnote_height: f64,
+    pub(in crate::renderer::typeset) footnote_placement: crate::model::footnote::FootnotePlacement,
+    pub(in crate::renderer::typeset) footnote_frames:
+        Vec<crate::renderer::footnote_frames::Reservation>,
     /// 저장 각주 reset 뒤 조각과 그 뒤 번호는 다음 물리 쪽을 소유한다.
     /// 현재 본문을 먼저 이월하지 않고 실제 쪽 전환 때 같은 순서로 예약한다.
     pub(in crate::renderer::typeset) deferred_body_footnotes: Vec<(FootnoteRef, f64)>,
+    /// 지금 배치 중인 문단의 본문 각주와 그 참조가 든 줄. 분할 판정이 앞 줄의
+    /// 각주 높이를 뒤 줄보다 먼저 예약하고, 조각 확정 때 그 쪽에 등록한다.
+    pub(in crate::renderer::typeset) own_line_notes: Vec<crate::renderer::typeset::OwnLineNote>,
+    /// 분할 조각 확정 때 이미 등록한 (문단, 컨트롤) 각주. 컨트롤 순회는 건너뛴다.
+    pub(in crate::renderer::typeset) line_registered_notes:
+        std::collections::HashSet<(usize, usize)>,
     /// 현재 큐 예약은 실제 배치와 같은 본문 하단 앵커를 사용한다.
     pub(in crate::renderer::typeset) current_footnote_body_bottom_reserved: bool,
     /// 현재 쪽은 그림 표시가 있는 앞쪽에서 이월된 HWPX 각주 본문을 소유한다.
@@ -122,11 +137,6 @@ pub(in crate::renderer::typeset) struct StateView {
     pub(in crate::renderer::typeset) footnote_separator_overhead: f64,
     /// 각주 사이 간격
     pub(in crate::renderer::typeset) footnote_between_notes_margin: f64,
-    /// 각주 안전 여백
-    pub(in crate::renderer::typeset) footnote_safety_margin: f64,
-    /// [#2559] 현재 구역에 꼬리말 정의가 없는가. 빈 꼬리말 밴드는 각주가 먼저
-    /// 사용하므로, 이 경우에만 각주 높이의 일부를 본문 가용 높이에서 회수한다.
-    pub(in crate::renderer::typeset) section_has_no_footer: bool,
     /// 존(zone) y 오프셋 (다단 나누기 시 누적)
     pub(in crate::renderer::typeset) current_zone_y_offset: f64,
     /// 현재 존의 레이아웃 오버라이드
@@ -143,9 +153,17 @@ pub(in crate::renderer::typeset) struct StateView {
     pub(in crate::renderer::typeset) page_anchored_bands: Vec<VisibleFloatExclusion>,
     /// [#7696] 쪽·종이 기준 밴드가 밀어 확정한 문단 시작(단 상대 px). 배치가 같은 값을 쓴다.
     pub(in crate::renderer::typeset) page_band_flow_starts: std::collections::HashMap<usize, f64>,
+    /// 저장 줄 없는 host 의 문단·단 기준 어울림 표 바깥 상자(쪽 번호, 단, 문단, x0, x1, 위, 아래 —
+    /// 단 흐름 px). 뒤 문단의 문단 기준 자리차지 표가 이 상자와 겹치면 표만 아래로 내린다.
+    pub(in crate::renderer::typeset) unstored_square_boxes:
+        Vec<(usize, u16, usize, f64, f64, f64, f64)>,
     /// 현재 쪽에 실제 배치된 그림의 점유 영역(용지 좌표). 다음 단에도 간섭할 수 있다.
     pub(in crate::renderer::typeset) side_wrap_exclusions:
         std::collections::BTreeMap<(usize, usize), crate::renderer::layout_frame::FrameExclusion>,
+    /// [#8282] 저장 줄 없는 host 의 배제 영역. 한/글이 그 개체 둘레로 뒤 문단을 조판한 적이
+    /// 없으므로 뒤 문단의 저장 줄은 이 개체를 증언하지 않는다.
+    pub(in crate::renderer::typeset) unwitnessed_side_wraps:
+        std::collections::BTreeSet<(usize, usize)>,
     pub(in crate::renderer::typeset) inline_placements: std::collections::HashMap<
         (usize, usize),
         crate::renderer::float_placement::InlineBoxPlacement,
@@ -189,6 +207,9 @@ pub(in crate::renderer::typeset) struct StateView {
     /// 단일 컬럼·caption 보유 picture 형상으로 한정한다.
     pub(in crate::renderer::typeset) deferred_next_page_square_pictures:
         Vec<DeferredSquarePictureControl>,
+    /// 이어지는 쪽에서 저장 reset 으로 끝낸 문단 조각 (문단, 시작 줄). 그 조각 안 표시의
+    /// 본문 각주는 조각 경계 판정이 이미 계상했으므로 표시가 놓인 쪽에 둔다.
+    pub(in crate::renderer::typeset) stored_reset_note_fragments: Vec<(usize, usize)>,
     /// 현재 호스트를 남기고 다음 쪽의 저장 상단 프레임만 이월한다.
     pub(in crate::renderer::typeset) deferred_next_page_stored_frames:
         Vec<crate::renderer::typeset::DeferredStoredFrameControl>,
@@ -206,6 +227,13 @@ pub(in crate::renderer::typeset) struct StateView {
     /// p1356 뒤 본문을 한 쪽 더 분할한다. layout 순서에는 앞에 있어야 하지만,
     /// typeset 흐름 항목으로는 보이면 안 된다.
     pub(in crate::renderer::typeset) page_start_square_pictures: Vec<DeferredSquarePictureControl>,
+    /// 겹침 허용 안 함 어울림 그림 무리에서 앵커 쪽에 들어가지 못한 그림 (문단, 개체).
+    /// 앞 그림과 겹칠 수 없으므로 새 쪽마다 하나씩 쪽 맨 위로 옮긴다. 흐름은 소비하지 않는다
+    /// — 뒤 문단은 저장 줄(그림 옆 cs/sw)대로 그 쪽을 채운다.
+    pub(in crate::renderer::typeset) cascaded_pile_pictures:
+        std::collections::VecDeque<(usize, usize)>,
+    /// 이 쪽 맨 위에 둘 무리 그림. 흐름 항목이 아니라 단 확정 때 앞에 붙인다.
+    pub(in crate::renderer::typeset) page_start_pile_pictures: Vec<(usize, usize)>,
     /// 표 조판 중 fragment별로 각주를 등록한 source 키. caller의 기존 표 완료 뒤
     /// 일괄 등록을 건너뛰어 중복을 막는다.
     pub(in crate::renderer::typeset) fragment_queued_table_footnotes:
@@ -223,6 +251,8 @@ pub(in crate::renderer::typeset) struct StateView {
     /// [Task #1755] 이월 전 쪽에 host 텍스트 줄을 PartialParagraph 로 pre-emit 한 문단 —
     /// layout 의 마지막 fragment 뒤 host 렌더 억제 신호(PaginationResult 로 전달).
     pub(in crate::renderer::typeset) pre_emitted_host_paras: std::collections::HashSet<usize>,
+    /// [#8652] 호스트 글줄을 거두고 다음 쪽으로 넘긴 뒤 새 쪽에서 다시 준비할 표 문단.
+    pub(in crate::renderer::typeset) restart_block_table_para: Option<usize>,
     /// [#2015] pre-emit 한 host 텍스트의 실제 높이(px). vert_offset(para_start 기준)를
     /// current_height(=para_start+host_h) 기준으로 환산할 때 감액분으로 쓴다. typeset 예산과
     /// layout(table_partial.rs) 배치가 동일 감액을 적용해 정합한다.
@@ -235,10 +265,6 @@ pub(in crate::renderer::typeset) struct StateView {
     /// [Task #359] 다음 pi 가 vpos-reset 가드를 발동할 예정 → 현재 pi 의 fit 안전마진 비활성화.
     /// 단독 항목 페이지 발생 차단용.
     pub(in crate::renderer::typeset) skip_safety_margin_once: bool,
-    /// [Task #1725] tail-before-vpos-reset 문단 1회 각주 안전마진(40px) 비활성화.
-    /// 각주 있는 페이지에서 한글 LINESEG 는 tail 문단을 본문에 배치(각주는 아래)하는데,
-    /// rhwp 각주 예약(+40px 버퍼)이 tail 을 수 px 초과로 밀어 near-empty 페이지 over-pagination.
-    pub(in crate::renderer::typeset) skip_footnote_margin_once: bool,
     /// 다음 저장 vpos-reset 직전 tail의 실제 저장 line bounds. 현재 flow와 저장 bottom의
     /// 차이만 다음 문단의 fit allowance로 쓴다.
     pub(in crate::renderer::typeset) tail_saved_bounds_once: Option<(f64, f64)>,
@@ -261,6 +287,8 @@ pub(in crate::renderer::typeset) struct StateView {
     pub(in crate::renderer::typeset) hide_empty_line: bool,
     /// [Task #362] 현재 페이지에서 감춘 빈 줄 수 (페이지마다 reset, 최대 2).
     pub(in crate::renderer::typeset) hidden_empty_lines: u32,
+    /// 숨긴 첫 줄로 달라진 물리 쪽 경계가 저장 경계와 다시 맞을 때까지 유지한다.
+    pub(in crate::renderer::typeset) hidden_line_reflow_active: bool,
     /// [Task #362] 감춘 빈 줄이 적용된 페이지 인덱스 (페이지 변경 감지용).
     pub(in crate::renderer::typeset) hidden_empty_page_idx: usize,
     /// [Task #362] hide_empty_line 으로 감춘 paragraph 인덱스 (PaginationResult 에 포함).
@@ -370,6 +398,7 @@ pub(in crate::renderer::typeset) struct StateView {
     /// (이전 zone 디자인 spacing /2) + (새 zone 디자인 spacing /2) 를 zone_y_offset 에
     /// 더한다. 다단(2+) ColumnDef 의 `간격`은 가로 간격이므로 0 으로 둔다.
     pub(in crate::renderer::typeset) current_zone_design_spacing_px: f64,
+    pub(in crate::renderer::typeset) current_zone_plain_text: bool,
     /// [Task #1027 Stage D] 컬럼 단위 vpos 스냅 상태 (렌더러 build_single_column 정합).
     /// current_height 상대공간(col_area_y=0)에서 HeightCursor 를 구동한다.
     pub(in crate::renderer::typeset) vpos_page_base: Option<i32>,
@@ -389,8 +418,19 @@ pub(in crate::renderer::typeset) struct StateView {
     /// 저장 vpos 스냅(VPOS_CORR)을 마친 문단 시작 커서 `(문단, y)`.
     /// 측정 누적의 sb·trailing_ls drift 가 걷힌 실제 앞 커서다.
     pub(in crate::renderer::typeset) vpos_snapped_flow_start: Option<(usize, f64)>,
+    /// [#8795] 위 스냅을 마친 쪽·단 `(pages.len(), 단)`. 문단이 스냅 뒤 다른 쪽으로
+    /// 넘어간 경우 앞 쪽 앵커 원점으로 쓰지 않는다.
+    pub(in crate::renderer::typeset) vpos_snapped_flow_page: Option<(usize, u16)>,
     /// 공통 vpos 질의가 현재 문단에서 거절한 저장 원점 `(문단, source HU)`.
     pub(in crate::renderer::typeset) rejected_stored_forward_origin: Option<(usize, i32)>,
+    /// 이 단에서 표 위 틈 판정으로 버린 저장 사다리 전방 이동의 합(HU). 저장 프레임에서
+    /// 표 원점을 잴 때 뒤 글줄과 같은 축을 쓰도록 뺀다.
+    pub(in crate::renderer::typeset) vpos_rejected_gap_hu: i32,
+    /// [#8843] 이 단에서 커서가 합성 줄 뒤 저장 앞 점프를 거절하고 옮긴 기준축 누적(HU).
+    pub(in crate::renderer::typeset) synthetic_forward_rejected_hu: i32,
+    /// [#8845] 이 단에서 저장 줄 없는 문단 뒤의 낡은 전방 원점을 거절해 기준을 옮겼다
+    /// (`HeightCursor::rebased_after_unstored_forward`). 단을 새로 열 때 지운다.
+    pub(in crate::renderer::typeset) vpos_rebased_after_unstored_forward: bool,
     pub(in crate::renderer::typeset) vpos_prev_layout_para: Option<usize>,
     pub(in crate::renderer::typeset) vpos_prev_partial_table: bool,
     /// 컬럼 시작 시점의 current_height (page_path anchor — 렌더러 col_anchor_y 대응).

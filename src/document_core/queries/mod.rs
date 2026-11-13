@@ -13,9 +13,12 @@ mod transformed_text;
 pub mod field_query;
 mod font_decision;
 mod font_metric_coverage;
+pub mod form_action;
 mod form_query;
 pub mod hwpctrl_sets;
 pub mod hyperlink_geometry;
+pub(crate) mod memo_query;
+mod memo_shape_query;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
 pub mod png_export;
 pub mod rendering;
@@ -49,4 +52,4 @@ pub mod chart_extract;
 pub mod table_csv;
 pub mod table_extract;
 
-pub(crate) mod equation_fonts;
+pub(crate) mod content_fonts;

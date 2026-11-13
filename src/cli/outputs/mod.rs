@@ -12,6 +12,21 @@ pub(crate) mod tabular;
 pub(crate) mod text;
 pub(crate) mod vector;
 
+/// 파일 시스템 한 이름의 바이트 한도(ext4·APFS 255바이트, NTFS 255 UTF-16 단위 이하).
+pub(crate) const MAX_OUTPUT_FILE_NAME_BYTES: usize = 255;
+
+/// 원본 이름에서 만든 산출 파일·폴더 이름. `suffix`(쪽 번호·확장자 등)를 보존하고,
+/// 전체가 [`MAX_OUTPUT_FILE_NAME_BYTES`] 를 넘으면 `stem` 을 UTF-8 문자 경계에서 줄인다.
+/// 같은 입력이면 같은 이름이다(#9010).
+pub(crate) fn output_file_name(stem: &str, suffix: &str) -> String {
+    let budget = MAX_OUTPUT_FILE_NAME_BYTES.saturating_sub(suffix.len());
+    let mut end = stem.len().min(budget);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &stem[..end], suffix)
+}
+
 pub(crate) fn allows_implicit_sibling_resources(format: rhwp::parser::FileFormat) -> bool {
     // HML sibling paths are untrusted input and require an explicit resolver policy.
     !matches!(format, rhwp::parser::FileFormat::Hml)
@@ -19,21 +34,56 @@ pub(crate) fn allows_implicit_sibling_resources(format: rhwp::parser::FileFormat
 
 /// 사용자 환경을 우선하며, 없으면 실제 Native 공급에서 문서의 명시 대체를 고른다.
 /// 쪽수·측정·paint를 읽기 전에 동일한 환경 세대를 확정한다.
+#[derive(Default)]
+pub(crate) struct OutputFontSupply {
+    pub svg_style: String,
+    pub report: Option<serde_json::Value>,
+}
+
 pub(crate) fn apply_font_environment(
     document: &mut rhwp::DocumentCore,
     environment: Option<rhwp::renderer::font_environment::FontEnvironment>,
-    font_paths: &[std::path::PathBuf],
-) -> Result<bool, rhwp::error::HwpError> {
+    font_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<OutputFontSupply, rhwp::error::HwpError> {
+    let mut output_supply = OutputFontSupply::default();
     let environment = match environment {
         Some(environment) => Some(environment),
         None => {
-            rhwp::renderer::font_environment::FontEnvironment::from_native_document_substitutions(
+            #[cfg(not(target_arch = "wasm32"))]
+            let supply =
+                rhwp::renderer::native_webfonts::prepare(&document.document().doc_info, font_paths)
+                    .map_err(rhwp::error::HwpError::RenderError)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                output_supply.svg_style = supply.svg_style();
+                output_supply.report = Some(
+                    serde_json::to_value(&supply)
+                        .map_err(|e| rhwp::error::HwpError::RenderError(e.to_string()))?,
+                );
+                font_paths.extend(supply.paths.iter().cloned());
+                if !supply.unavailable.is_empty() {
+                    eprintln!(
+                        "웹폰트를 준비하지 못한 글꼴: {}",
+                        supply.unavailable.join(", ")
+                    );
+                }
+            }
+            let native = rhwp::renderer::font_environment::FontEnvironment::from_native_document_substitutions(
                 &document.document().doc_info,
                 font_paths,
-            )?
+            )?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                supply.merge_into_environment(native)?
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                native
+            }
         }
     };
-    document.set_font_environment(environment)
+    document.set_font_environment(environment)?;
+    Ok(output_supply)
 }
 
 /// Remove and validate the optional environment before command-specific parsing.

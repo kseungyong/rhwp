@@ -437,6 +437,7 @@ pub(super) fn prepare_computed(
     // 보정 전 측정값으로 줄 소유를 거절하면 표 뒤 흐름만 legacy 상한으로 되돌아간다.
     let fitted = super::super::table::fit_measured_for_host(
         para,
+        next_para,
         table,
         Some(measured),
         dpi,
@@ -456,10 +457,15 @@ pub(super) fn prepare_computed(
     {
         return None;
     }
+    // 한/글은 문단 위 간격을 쪽 맨 위에서도 적용한다(#8474). 저장 줄이 없는 합성
+    // 줄은 그 간격을 증언할 저장 vpos 가 없으므로 문단 모양의 위 간격을 그대로 쓴다
+    // — 저장 줄 없는 글 문단의 단 첫머리와 같은 계약이다.
     let flow_origin = page.current_height
         + if page.current_height < 1.0 {
             if saved_column_top {
                 saved_top
+            } else if computed {
+                fmt.spacing_before
             } else {
                 0.0
             }
@@ -497,24 +503,48 @@ pub(super) fn prepare_computed(
     // 다음 줄의 시작이 이 줄의 끝과 정확히 이어지면 빈 글줄도
     // 후행 간격 전량 뒤에 놓인다. 글자 유무로 간격을 반감하면
     // 확정 계획 끝에서 역산한 기준축과 이후 본문 원점이 어긋난다.
+    // [#8502] 두 문단 사이의 문단 간격(이 문단 아래 + 다음 문단 위)도 저장 사다리에 들어 있다.
+    // 같은 닫힘 계약의 `composer::stored_tac_successor_delta_hu` 와 같게 등식에 넣는다.
+    let paragraph_spacing_hu =
+        crate::renderer::px_to_hwpunit(fmt.spacing_after + next_spacing_before, dpi);
+    // 명시적 쪽(구역)나눔 문단은 새 쪽 본문 위끝에서 시작하므로 그 표 줄의 프레임 원점은 0이다.
+    // 저장 줄이 없어 합성한 표 줄의 vpos 는 앞 쪽 누적값일 수 있어 원점 근거가 아니다. 다음 원본
+    // 줄이 그 영점에서 `lh + ls + 문단 간격` 뒤에 있으면 같은 닫힘 증거로 간격 전량을 남긴다
+    // ([#8925] 36415413 2쪽: 쪽나눔 제목 표 문단 lh 8574·ls 1360, 다음 상자 표 문단 vpos 9934).
+    let opens_page_frame = origin <= hwpunit_to_px(1, dpi)
+        && matches!(
+            para.column_type,
+            crate::model::paragraph::ColumnBreakType::Page
+                | crate::model::paragraph::ColumnBreakType::Section
+        );
     let full_trailing_spacing = next_para.is_some_and(|next| {
         next.line_segs.first().is_some_and(|next_seg| {
-            next_seg.vertical_pos > seg.vertical_pos
-                && seg
-                    .vertical_pos
-                    .saturating_add(seg.line_height)
-                    .saturating_add(seg.line_spacing)
-                    == next_seg.vertical_pos
+            let closing_advance = seg
+                .line_height
+                .saturating_add(seg.line_spacing)
+                .saturating_add(paragraph_spacing_hu);
+            (next_seg.vertical_pos > seg.vertical_pos
+                && seg.vertical_pos.saturating_add(closing_advance) == next_seg.vertical_pos)
+                || (opens_page_frame
+                    && closing_advance > 0
+                    && !next.stored_text_partition_is_dirty()
+                    && next_seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                        == 0
+                    && next_seg.vertical_pos == closing_advance)
         })
     });
     // 원본 저장 줄은 다음 줄 원점까지 후행 간격을 전량 소유한다.
     // 절반만 소비하고 저장 끝으로 기준축을 역산하면 이후 모든 줄이 위로 이동한다.
     // 저장 좌표가 없는 합성 줄에서만 기존 빈 문단 간격 분배를 적용한다.
-    let trailing_fraction = if saved_column_top || closed_stored_line || full_trailing_spacing {
-        1.0
-    } else {
-        0.5
-    };
+    // 다음 문단도 저장 줄이 없어 재조판되면 그 원점은 나머지 간격을 복원하지 않는다
+    // (`tac_host_trailing_spacing_at_boundary` 와 같은 계약). 반만 쓰면 뒤 본문이 위로 붙는다.
+    let successor_reflows = next_para.is_some_and(crate::renderer::para_has_no_stored_line_segs);
+    let trailing_fraction =
+        if saved_column_top || closed_stored_line || full_trailing_spacing || successor_reflows {
+            1.0
+        } else {
+            0.5
+        };
     // 현재 줄의 옛 누적 vpos와 다음 원본 줄의 새 로컬 축을 구분한다.
     // 실제 표 상자도 같은 줄 높이를 소비했을 때만 닫힌 전진 끝을 수용한다.
     // 이 계획의 end를 fit/축 연결과 paint가 그대로 공유한다.
@@ -559,7 +589,7 @@ pub(super) fn prepare_computed(
 }
 
 /// 각주·미주는 일반 컨트롤 경로에서 예약·등록해야 하므로 통배치 단축을 쓰지 않는다.
-pub(super) fn table_has_notes(table: &crate::model::table::Table) -> bool {
+pub(in crate::renderer::typeset) fn table_has_notes(table: &crate::model::table::Table) -> bool {
     table.cells.iter().any(|cell| {
         cell.paragraphs.iter().any(|para| {
             para.controls.iter().any(|control| match control {
@@ -590,6 +620,23 @@ pub(super) fn prepare(
     source_frame: Option<StoredColumnFrame>,
     dpi: f64,
 ) -> Option<StoredTacPlan> {
+    // 쪽으로 이월된 원본 개체 줄의 앞 띠는 뒤 원본 줄이 정확히 닫는 경우에만
+    // 남긴다. 일반 TAC 경로와 이 조기 수용 계획이 같은 원점·끝점을 소비한다.
+    let opening_before = (page.empty_column
+        && page.current_height == 0.0
+        && page.vpos_col_anchor == 0.0
+        && !page.profile.session_edited())
+    .then(|| {
+        crate::renderer::float_placement::restarted_tac::restarted_tac_opening_before(
+            para,
+            next_para?,
+            fmt.spacing_before,
+            fmt.spacing_after,
+            next_spacing_before,
+            dpi,
+        )
+    })
+    .flatten();
     // 커서가 이미 거절한 source 원점을 첫 저장 줄/개체의 영점 인증으로
     // 다시 수용하지 않는다. 일반 TAC 흐름도 같은 수용 원점에서 fit/paint한다.
     if page
@@ -605,10 +652,12 @@ pub(super) fn prepare(
         return None;
     }
     // 완전한 저장 줄 계약은 표별 높이를 합산하지 않고, 같은 pen/end를 배치에도 전달한다.
-    if !page.profile.session_edited()
-        && (page.profile.hwp5_container()
-            || page.profile.hwp5_stored_pagination_layout()
-            || page.profile.hwpx_stored_layout())
+    // 다른 문단의 편집은 이 줄의 소유·높이를 무효화하지 않는다. 아래의 원본 줄
+    // 유효성, 현재 측정 높이, 앞 내용의 끝과 가용 공간으로 재사용을 판단한다.
+    // 실제로 자란 표는 measured_fits에서 거절하여 일반 재조판 경로로 보낸다.
+    if (page.profile.hwp5_container()
+        || page.profile.hwp5_stored_pagination_layout()
+        || page.profile.hwpx_stored_layout())
         && page.side_wrap_empty
     {
         // 저장 단일 개체 줄은 캡션과 바깥 여백도 소유한다. 같은 줄의 공백은
@@ -664,15 +713,16 @@ pub(super) fn prepare(
             {
                 return None;
             }
-            let trailing = if crate::renderer::composer::tac_next_line_full_spacing(
-                para,
-                next_para,
-                fmt.spacing_after,
-                next_spacing_before,
-                seg,
-                page.profile,
-                dpi,
-            ) {
+            let trailing = if opening_before.is_some()
+                || crate::renderer::composer::tac_next_line_full_spacing(
+                    para,
+                    next_para,
+                    fmt.spacing_after,
+                    next_spacing_before,
+                    seg,
+                    page.profile,
+                    dpi,
+                ) {
                 hwpunit_to_px(seg.line_spacing, dpi)
             } else {
                 crate::renderer::composer::tac_host_trailing_spacing_at_boundary(
@@ -682,6 +732,7 @@ pub(super) fn prepare(
                     seg,
                     page.profile.hwpx_stored_layout(),
                     page.profile.hwp5_stored_pagination_layout(),
+                    !page.profile.hangul2024_layout(),
                     dpi,
                 )
             };
@@ -713,7 +764,7 @@ pub(super) fn prepare(
             let flow_origin = if single_saved_line {
                 // 저장 줄 원점은 앞 간격을 이미 소유한다. 현재 물리 흐름은 그 하한이며
                 // 앞 간격을 다시 더하지 않는다.
-                page.current_height
+                page.current_height + opening_before.unwrap_or(0.0)
             } else {
                 page.current_height
                     + if page.current_height < 1.0 {
@@ -755,29 +806,30 @@ pub(super) fn prepare(
                         dpi,
                     )
             };
-            let restarted_column_line = single_saved_line
-                && page.empty_column
-                && page.current_height == 0.0
-                && page.vpos_col_anchor == 0.0
-                && fmt.spacing_before == 0.0
-                && fmt.spacing_after == 0.0
-                && next_para.is_some_and(|next| {
-                    !next.stored_text_partition_is_dirty()
-                        && !next.cell_format_vpos_dirty
-                        && next.controls.is_empty()
-                        && next.column_type == crate::model::paragraph::ColumnBreakType::None
-                        && next.line_segs.first().is_some_and(|after| {
-                            !crate::renderer::typeset::is_synthetic_line_seg(after)
-                                && after.vertical_pos < para.line_segs[0].vertical_pos
-                                && i64::from(after.vertical_pos)
-                                    == i64::from(para.line_segs[0].line_height)
-                                        + i64::from(para.line_segs[0].line_spacing)
-                                        + i64::from(crate::renderer::px_to_hwpunit(
-                                            next_spacing_before,
-                                            dpi,
-                                        ))
-                        })
-                });
+            let restarted_column_line = opening_before.is_some()
+                || (single_saved_line
+                    && page.empty_column
+                    && page.current_height == 0.0
+                    && page.vpos_col_anchor == 0.0
+                    && fmt.spacing_before == 0.0
+                    && fmt.spacing_after == 0.0
+                    && next_para.is_some_and(|next| {
+                        !next.stored_text_partition_is_dirty()
+                            && !next.cell_format_vpos_dirty
+                            && next.controls.is_empty()
+                            && next.column_type == crate::model::paragraph::ColumnBreakType::None
+                            && next.line_segs.first().is_some_and(|after| {
+                                !crate::renderer::typeset::is_synthetic_line_seg(after)
+                                    && after.vertical_pos < para.line_segs[0].vertical_pos
+                                    && i64::from(after.vertical_pos)
+                                        == i64::from(para.line_segs[0].line_height)
+                                            + i64::from(para.line_segs[0].line_spacing)
+                                            + i64::from(crate::renderer::px_to_hwpunit(
+                                                next_spacing_before,
+                                                dpi,
+                                            ))
+                            })
+                    }));
             let continued_column_line = single_saved_line
                 && !explicit_page_break_before
                 && page.empty_column
@@ -813,10 +865,49 @@ pub(super) fn prepare(
                                 == Some(para.line_segs[0].vertical_pos)
                     })
                 });
-            if restarted_column_line || continued_column_line {
+            if restarted_column_line {
                 // 원본에 남은 옛 host vpos는 새 쪽 개체의 출력 원점이 아니다.
                 // 뒤 저장 줄이 새 개체 줄의 전체 전진과 일치하는 0축을 소유한다.
                 saved_origin = flow_origin;
+            }
+            if continued_column_line && opening_before.is_none() {
+                // 앞 쪽에서 완전히 소비한 줄과 이어지는 저장 사다리가 이 문단의
+                // 앞 간격을 인증한다. 새 단으로 넘길 때도 아직 소비하지 않은
+                // 간격을 fit과 실제 배치가 같은 원점에서 한 번만 사용한다.
+                saved_origin = flow_origin + (fmt.spacing_before - shared_spacing_before).max(0.0);
+            }
+            // 직전 쪽이 완전한 저장 문단을 소비하고 현재 저장 줄이 그보다
+            // 작은 양수로 되감겼으며 다음 문단이 명시적으로 새 쪽을 열면,
+            // 이 단독 표는 원본 쪽의 첫 줄이다. 그 줄의 양수 vpos는 새 단의
+            // 물리 원점에서 한 번 소비한다. 단순히 표가 새 쪽으로 밀린 경우는
+            // 이전 저장 사다리의 되감김과 후속 쪽 경계가 없어 여기에 해당하지 않는다.
+            let source_page_rewind = single_saved_line
+                && page.profile.hwp5_stored_pagination_layout()
+                && page.empty_column
+                && page.current_height == 0.0
+                && para.text.is_empty()
+                && matches!(para.controls.as_slice(), [Control::Table(_)])
+                && para.line_segs[0].vertical_pos > 0
+                && !para.stored_text_partition_is_dirty()
+                && !para.cell_format_vpos_dirty
+                && next_para.is_some_and(|next| {
+                    next.column_type == crate::model::paragraph::ColumnBreakType::Page
+                })
+                && previous_para.is_some_and(|previous| {
+                    !previous.stored_text_partition_is_dirty()
+                        && !previous.cell_format_vpos_dirty
+                        && page.previous_page_tail.is_some_and(|(owner, end)| {
+                            owner.checked_add(1) == Some(para_idx)
+                                && end == previous.line_segs.len()
+                        })
+                        && previous.line_segs.last().is_some_and(|last| {
+                            !crate::renderer::typeset::is_synthetic_line_seg(last)
+                                && last.vertical_pos > para.line_segs[0].vertical_pos
+                        })
+                });
+            if source_page_rewind {
+                saved_origin =
+                    page.vpos_col_anchor + hwpunit_to_px(para.line_segs[0].vertical_pos, dpi);
             }
             // A complete object height authenticates the local line, not the
             // page-relative origin. A single-line shortcut may only reuse a
@@ -828,6 +919,7 @@ pub(super) fn prepare(
                     page.current_height + fmt.spacing_before - shared_spacing_before;
                 let same_frame = (saved_origin - page.current_height).abs() <= dpi / 7200.0
                     || (saved_origin - unreserved_origin).abs() <= dpi / 7200.0
+                    || source_page_rewind
                     || (page.original_object_column_origin
                         && para.source_line_seg_vertical_pos.is_none())
                     // 단의 첫 원본 글줄이 영점을 이미 인증했고 활성 축도 그대로면,
@@ -841,6 +933,15 @@ pub(super) fn prepare(
                 // 앞 저장 글줄의 후행 간격은 표의 진입 밴드다. 수용 커서가
                 // 그 글줄의 내용 끝에 있으면 같은 좌표축에서 표 원점까지 연결한다.
                 let inherited_origin = previous_para.and_then(|previous| {
+                    // 빈 안내 줄에는 보호할 잉크 하단이 없다. 현재 물리 커서와
+                    // 저장 개체 원점이 이미 일치하면 안내 줄의 측정 간격으로
+                    // 같은 원점을 다시 밀지 않는다. 글이 있는 앞 줄의 점유는 유지한다.
+                    if previous.text.trim().is_empty()
+                        && previous.controls.is_empty()
+                        && (saved_origin - page.current_height).abs() <= dpi / 7200.0
+                    {
+                        return None;
+                    }
                     if previous.stored_text_partition_is_dirty() || previous.cell_format_vpos_dirty
                     {
                         return None;

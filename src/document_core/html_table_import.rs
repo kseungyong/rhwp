@@ -13,6 +13,7 @@ impl DocumentCore {
         paragraphs: &mut Vec<Paragraph>,
         table_html: &str,
         container_width: u32,
+        depth: u32,
     ) {
         use crate::model::control::Control;
         use crate::model::table::{Cell, Table, TablePageBreak};
@@ -36,6 +37,13 @@ impl DocumentCore {
         }
 
         let mut parsed_rows: Vec<Vec<ParsedCell>> = Vec::new();
+
+        // `<table border="1">` 은 CSS 없이도 칸마다 1px 실선을 그린다 (HTML 표 속성).
+        // 칸의 `border` CSS 가 있으면 그 값이 이긴다.
+        let attr_border_pt = match parse_html_attr_f64(table_html, "border") {
+            Some(width) if width > 0.0 => 0.75,
+            _ => 0.0,
+        };
 
         let mut pos = 0;
         while let Some(tr_start) = table_lower[pos..].find("<tr") {
@@ -88,7 +96,7 @@ impl DocumentCore {
                     let padding_pt = parse_css_padding_pt(&css_lower);
 
                     // 테두리 파싱 (left, right, top, bottom)
-                    let mut border_widths_pt = [0.0f64; 4];
+                    let mut border_widths_pt = [attr_border_pt; 4];
                     let mut border_colors = [0u32; 4]; // black
                     let mut border_styles = [1u8; 4]; // solid default
 
@@ -376,22 +384,19 @@ impl DocumentCore {
                 },
             };
 
-            // 셀 내용 파싱
-            // &nbsp; 등 HTML 엔티티를 디코딩한 후 공백만 남으면 빈 셀로 처리
-            // 그림만 있는 셀(로고 칸 등)은 평문이 비어 있어
-            // 종전에는 '빈 셀'로 처리돼 그림이 통째로 사라졌다.
-            let cell_has_image = pc.content_html.to_ascii_lowercase().contains("<img");
-            let cell_paragraphs = if !cell_has_image
-                && (pc.content_html.trim().is_empty()
-                    || html_to_plain_text(&pc.content_html).is_empty())
-            {
+            // 평문이 없어도 중첩 표·그림은 파싱 결과로 확인한다.
+            let cell_paragraphs = if pc.content_html.trim().is_empty() {
                 vec![Paragraph::new_empty()]
             } else {
                 // 셀 안 표는 이 셀 안쪽 폭에 맞춘다.
                 let inner_width = cell_width.saturating_sub(
                     table_padding.left.max(0) as u32 + table_padding.right.max(0) as u32,
                 );
-                let parsed = self.parse_html_to_paragraphs(&pc.content_html, inner_width);
+                let parsed = self.parse_html_to_paragraphs_at_depth(
+                    &pc.content_html,
+                    depth + 1,
+                    inner_width,
+                );
                 if parsed.is_empty()
                     || parsed
                         .iter()
@@ -645,6 +650,7 @@ impl DocumentCore {
             raw_ctrl_seal: None,
             raw_table_record_attr: tbl_rec_attr,
             raw_table_record_extra: vec![0u8; 2], // 표준 추가 2바이트
+            layout_page_break_cache: Default::default(),
         };
         table.rebuild_grid();
         // 재조판의 공통 행 측정을 저장 크기로 확정한다. 중첩 표의 직접 paint와
@@ -779,6 +785,7 @@ impl DocumentCore {
             center_line: CenterLine::None,
             fill,
             three_d: false,
+            break_cell_separate_line: false,
         };
 
         // 기존 BorderFill에서 동일한 항목 검색
@@ -840,6 +847,7 @@ impl DocumentCore {
                 center_line: CenterLine::None,
                 fill: Fill::default(),
                 three_d: false,
+                break_cell_separate_line: false,
             });
         bf.raw_data = None;
 
@@ -859,9 +867,15 @@ impl DocumentCore {
             .filter(|fill_type| !matches!(fill_type.as_str(), "gradient" | "image"))
         {
             bf.fill = if fill_type_str == "solid" {
-                let bg = json_color(json, "fillColor").unwrap_or(0xFFFFFF);
-                let pat_c = json_color(json, "patternColor").unwrap_or(0);
-                let pat_t = json_i32(json, "patternType").unwrap_or(0);
+                // 부분 편집은 기존 색상/무늬를 보존한다. 새 단색의 무늬 없음은 -1이며,
+                // HWP에서 읽은 가로 무늬 0을 무늬 없음으로 바꾸면 안 된다 (#8733).
+                let existing = bf.fill.solid;
+                let bg = json_color(json, "fillColor")
+                    .unwrap_or_else(|| existing.map_or(0xFFFFFF, |fill| fill.background_color));
+                let pat_c = json_color(json, "patternColor")
+                    .unwrap_or_else(|| existing.map_or(0, |fill| fill.pattern_color));
+                let pat_t = json_i32(json, "patternType")
+                    .unwrap_or_else(|| existing.map_or(-1, |fill| fill.pattern_type));
                 Fill {
                     fill_type: FillType::Solid,
                     solid: Some(SolidFill {
@@ -1062,31 +1076,10 @@ impl DocumentCore {
         pic.common.vert_rel_to = crate::model::shape::VertRelTo::Para;
         pic.common.horz_rel_to = crate::model::shape::HorzRelTo::Para;
         pic.common.flow_with_text = true;
-        pic.shape_attr = crate::model::shape::ShapeComponentAttr {
-            original_width: w_hu,
-            original_height: h_hu,
-            current_width: w_hu,
-            current_height: h_hu,
-            local_file_version: 1,
-            render_sx: 1.0,
-            render_sy: 1.0,
-            ..Default::default()
-        };
-        pic.border_x = [0i32, 0, w_hu as i32, 0];
-        pic.border_y = [w_hu as i32, h_hu as i32, 0, h_hu as i32];
-        // crop 은 **원본 픽셀 좌표계**(px × 75)다. 종전에는 표시 크기(HWPUNIT)를
-        // 넣어 큰 그림이 왼쪽 위 일부만 남고 잘렸다("그림이 반쪽" 신고). insert_picture_native 와 같은 규약.
         let (nat_w, nat_h) =
             image_pixel_size(&decoded).unwrap_or((width.max(1.0) as u32, height.max(1.0) as u32));
-        pic.crop = crate::model::image::CropInfo {
-            left: 0,
-            top: 0,
-            right: (nat_w * 75) as i32,
-            bottom: (nat_h * 75) as i32,
-        };
-        // img_dim 은 crop 과 같은 좌표계(px × 75)다 — 픽셀값을 그대로 넣으면 HWPX 직렬화기가
-        // imgClip 보다 작은 imgDim 을 보고 그림을 버린다(실측: <hp:pic> 자체가 사라졌다).
-        pic.img_dim = (nat_w * 75, nat_h * 75);
+        let pic =
+            crate::model::image::Picture::from_embedded_image(pic.common, new_bin_id, nat_w, nat_h);
         Some(pic)
     }
 }
@@ -1101,17 +1094,7 @@ pub(crate) fn html_img_src(img_tag: &str) -> Option<&str> {
 
 /// 태그에서 속성 문자열을 그대로 뽑는다(따옴표 양쪽 지원).
 pub(crate) fn extract_html_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    for quote in ['"', '\''] {
-        let needle = format!("{}={}", attr, quote);
-        if let Some(start) = lower.find(&needle) {
-            let after = &tag[start + needle.len()..];
-            if let Some(end) = after.find(quote) {
-                return Some(after[..end].to_string());
-            }
-        }
-    }
-    None
+    html_quoted_attribute(tag, attr).map(str::to_owned)
 }
 
 /// PNG·JPEG·BMP·GIF 헤더에서 원본 픽셀 크기를 읽는다.
@@ -1186,7 +1169,7 @@ mod nested_table_cell_boundary_tests {
         let html =
             r#"<table><tr><td>OUTER<table><tr><td>INNER</td></tr></table></td></tr></table>"#;
         let mut paragraphs: Vec<Paragraph> = Vec::new();
-        core.parse_table_html(&mut paragraphs, html, 42520);
+        core.parse_table_html(&mut paragraphs, html, 42520, 0);
 
         assert_eq!(paragraphs.len(), 1, "표 문단 1개가 나와야 함");
         let outer_table = match &paragraphs[0].controls.first() {

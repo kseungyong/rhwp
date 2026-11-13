@@ -24,7 +24,6 @@ pub(super) struct WholeFitInput {
 
 pub(super) struct WholeFit {
     pub(super) para_has_stored_line_seg: bool,
-    pub(super) single_row_object_height_advance: Option<f64>,
     pub(super) fits_after_overlay_shapes: bool,
     pub(super) stored_rewinding_rowbreak_uses_painted_row_footprint: bool,
     pub(super) whole_fit_table_total: f64,
@@ -46,7 +45,7 @@ impl TypesetEngine {
         if !self.profile.get().hwp5_stored_pagination_layout()
             || self.profile.get().session_edited()
             || table.common.treat_as_char
-            || table.page_break != crate::model::table::TablePageBreak::RowBreak
+            || table.layout_page_break() != crate::model::table::TablePageBreak::RowBreak
         {
             return false;
         }
@@ -84,7 +83,10 @@ impl TypesetEngine {
             || !is_para_topbottom_float(&table.common)
             || !table.common.flow_with_text
             || table.common.allow_overlap
-            || !matches!(table.page_break, crate::model::table::TablePageBreak::None)
+            || !matches!(
+                table.layout_page_break(),
+                crate::model::table::TablePageBreak::None
+            )
             || !matches!(table.common.vert_align, crate::model::shape::VertAlign::Top)
             || table.caption.is_some()
             || self.render_normalization.table_text_reflowed(table)
@@ -263,6 +265,7 @@ impl TypesetEngine {
         table: &crate::model::table::Table,
         effective_height: f64,
         host_spacing_before: f64,
+        styles: &crate::renderer::style_resolver::ResolvedStyleSet,
     ) -> Option<crate::renderer::float_placement::ParagraphFloatPlacement> {
         if st.col_count != 1
             || !(st.profile.hwpx_stored_layout() || st.profile.hwp5_stored_pagination_layout())
@@ -329,6 +332,10 @@ impl TypesetEngine {
                     next,
                     table,
                     effective_height,
+                    styles
+                        .para_styles
+                        .get(next.para_shape_id as usize)
+                        .map_or(0.0, |style| style.spacing_before),
                     self.dpi,
                 )
             })
@@ -476,6 +483,7 @@ impl TypesetEngine {
             ft,
             fmt,
             mt,
+            styles,
             paragraphs_all,
             ..
         } = input;
@@ -489,19 +497,6 @@ impl TypesetEngine {
             single_row_object_declared_fits_current,
         } = fit;
         let para_has_stored_line_seg = para.line_segs.iter().any(|ls| !is_synthetic_line_seg(ls));
-        let single_row_object_height_fits_current = single_row_object_declared_fits_current;
-        // HWP5-origin HWPX는 저장 object 높이 기준으로는 현재 쪽에 들어가지만,
-        // cell 내용 측정치는 더 큰 1행 자리차지 표를 쪽 하단까지 차지한 것으로
-        // 기록한다. native HWP는 RowBreak fragment의 실제 소비량을 따라야 하므로
-        // 이 HWPX 호환 보정을 적용하지 않는다.
-        let single_row_object_height_advance =
-            (st.profile.hwp5_origin_hwpx() && single_row_object_height_fits_current).then(|| {
-                if st.current_height + table_total > available {
-                    (available - st.current_height).max(0.0)
-                } else {
-                    declared_object_total
-                }
-            });
 
         let fits_after_overlay_shapes =
             st.current_column_has_only_overlay_shapes() && table_total <= available + 12.0;
@@ -520,7 +515,7 @@ impl TypesetEngine {
                 && !table.common.treat_as_char
                 && is_para_topbottom_float(&table.common)
                 && matches!(
-                    table.page_break,
+                    table.layout_page_break(),
                     crate::model::table::TablePageBreak::RowBreak
                 )
                 && table.row_count > 1
@@ -544,7 +539,7 @@ impl TypesetEngine {
         // 내용 컷이 필요한 경우의 예약·배치는 fragment 경로가 별도로 소유한다.
         let reflowed_table_uses_painted_whole_rows = table.row_count > 0
             && matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             && self.render_normalization.table_text_reflowed(table);
@@ -598,7 +593,7 @@ impl TypesetEngine {
                     top_hu.saturating_add(table.common.height.min(i32::MAX as u32) as i32);
                 hwpunit_to_px(bottom_hu, self.dpi) <= available
             });
-        let declared_fit_scope_ok = match table.page_break {
+        let declared_fit_scope_ok = match table.layout_page_break() {
             crate::model::table::TablePageBreak::None => true,
             crate::model::table::TablePageBreak::RowBreak => {
                 rowbreak_at_fragment_start || midpage_rowbreak_has_saved_object_bottom
@@ -612,7 +607,7 @@ impl TypesetEngine {
         let declared_excess_has_source_frame =
             table_declared_height_has_stored_cell_content_frame(table, self.dpi)
                 && (!matches!(
-                    table.page_break,
+                    table.layout_page_break(),
                     crate::model::table::TablePageBreak::RowBreak
                 ) || table_declared_object_covers_cell_row_frames(table, self.dpi));
         // HWPX에서는 `treatAsChar` bit만으로 inline 표가 되지 않는다. stored-layout
@@ -624,7 +619,10 @@ impl TypesetEngine {
         let hwpx_noninline_tac_measured_fit = self.profile.get().hwpx_stored_layout()
             && table.common.treat_as_char
             && !self.uses_tac_table_flow(table)
-            && matches!(table.page_break, crate::model::table::TablePageBreak::None)
+            && matches!(
+                table.layout_page_break(),
+                crate::model::table::TablePageBreak::None
+            )
             && ft.table_footnotes.is_empty()
             && st.current_height + ft.effective_height <= available + 0.5;
         // [편집 세션] 셀 편집으로 실측이 선언을 넘게 자란 표는 선언 기준 whole-fit
@@ -650,9 +648,20 @@ impl TypesetEngine {
             .cells
             .iter()
             .any(|cell| cell.row == 0 && cell.row_span > 1);
+        // 저장 원본 프레임이 아니므로 host 줄과 바깥 여백도 물리 예산에 남는다.
+        // 그림 전용 재조판 셀의 내용 하한과 같은 소유 질의를 사용한다.
+        let near_measured_occupied_height = if table
+            .cells
+            .iter()
+            .any(crate::renderer::height_measurer::unstored_square_picture_cell_owns_padding)
+        {
+            table_total
+        } else {
+            ft.effective_height
+        };
         let near_measured_rowbreak_fits = !table.common.treat_as_char
             && matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             && ft.table_footnotes.is_empty()
@@ -665,7 +674,7 @@ impl TypesetEngine {
                 || has_leading_rowspan_band)
             && declared_object_total > host_spacing_total
             && st.current_height + declared_object_total <= available
-            && st.current_height + ft.effective_height
+            && st.current_height + near_measured_occupied_height
                 <= available + NEAR_MEASURED_ROWBREAK_FIT_PX;
         // HWPX CELL(RowBreak) TAC 표는 일반적으로 선언 높이가 current fragment의
         // source-owned table frame이다. 단, 단일 빈 host의 유일한 non-synthetic
@@ -677,7 +686,7 @@ impl TypesetEngine {
             && table.common.treat_as_char
             && table.common.flow_with_text
             && matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             && para.controls.len() == 1
@@ -699,7 +708,7 @@ impl TypesetEngine {
         let hwpx_tac_cell_leftover_declared_fits = st.profile.hwpx_stored_layout()
             && table.common.treat_as_char
             && matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             && ft.table_footnotes.is_empty()
@@ -757,7 +766,7 @@ impl TypesetEngine {
             || st.profile.hwp5_stored_pagination_layout())
             && !table.common.treat_as_char
             && matches!(
-                table.page_break,
+                table.layout_page_break(),
                 crate::model::table::TablePageBreak::RowBreak
             )
             && table.row_count > 1
@@ -841,11 +850,11 @@ impl TypesetEngine {
                     table,
                     ft.effective_height,
                     fmt.spacing_before,
+                    styles,
                 )
             });
         WholeFit {
             para_has_stored_line_seg,
-            single_row_object_height_advance,
             fits_after_overlay_shapes,
             stored_rewinding_rowbreak_uses_painted_row_footprint,
             whole_fit_table_total,

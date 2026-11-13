@@ -1,3 +1,7 @@
+//! 관계형·고정형: 글꼴 메트릭 coverage 집계의 수량·출처와 입력 불변성을 검사한다.
+//! 주석 갱신: 2026-10-31T23:52:21+09:00; 직전 파일 커밋: 2026-10-31T23:19:18+09:00 (d6b5b19b30e14d913d123651df75dbc01efc456c).
+//! 합성 문서와 samples/task-001.hwp의 분석 API 계약이다. 출력 전후 동일성만 비교하며 시각 일치율을 판정하지 않는다.
+//! 근거: mydocs/tech/README.md 및 #4962 coverage 분석 API의 검사 본문.
 use rhwp::document_core::DocumentCore;
 use std::collections::BTreeMap;
 
@@ -198,7 +202,9 @@ fn trace_width_source_counts(core: &DocumentCore) -> BTreeMap<String, u64> {
 
 #[test]
 fn mixed_program_metrics_keep_each_decisions_font_names_without_mutating_output() {
-    let core = public_blank_with_font_text("함초롬바탕", "Ж😀Ж");
+    // Ж 는 #8315 이후 함초롬바탕 기호 슬롯 hmtx 보충표로 실제 측정된다. 결측 쪽은
+    // 아래 W3 표와 같이 미할당 U+0378 로 만들어 앞으로의 폭 표 보충과 무관하게 둔다.
+    let core = public_blank_with_font_text("함초롬바탕", "\u{0378}😀\u{0378}");
     let model = format!("{:?}", core.document());
     let hwp = core.export_hwp_native().unwrap();
     let hwpx = core.export_hwpx_native().unwrap();

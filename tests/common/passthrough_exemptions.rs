@@ -1,7 +1,130 @@
+// 검사 유형: 관계형 소스 가드의 위임 분류. PDF 일치율·실물 px 기대값은 비해당이다.
+// 주석 갱신: 2026-11-10 15:57 KST.
 /// 무효화하지 않는 `pub fn (&mut self)` 전수 목록 — (파일, 함수, 분류, 근거).
 ///
 /// 파일 경로는 [`SCAN_ROOT`] 기준 상대 경로다. 병합 `devel` 기준 46건(2026-08-30 동결).
 const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
+    (
+        "queries/memo_query.rs",
+        "remove_memo",
+        Exempt::DelegatesTo("remove_memo_only"),
+        "댓글 자손의 순환을 먼저 검사한 뒤 개별 삭제 helper에 위임한다. helper가 편집 구역의 raw_stream을 비운다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "insert_ruby_at",
+        Exempt::DelegatesTo("insert_compose_control"),
+        "입력을 덧말로 만든 뒤 넣기 공통 함수에 위임한다. 공통 함수가 구역의 raw_stream을 비운다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "insert_char_overlap_at",
+        Exempt::DelegatesTo("insert_compose_control"),
+        "입력을 글자 겹침으로 만든 뒤 넣기 공통 함수에 위임한다. 공통 함수가 구역의 raw_stream을 비운다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "set_compose_control_at",
+        Exempt::DelegatesTo("after_compose_edit"),
+        "컨트롤을 바꾼 뒤 다시 짜기 공통 함수에 위임한다. 공통 함수가 구역의 raw_stream을 비운다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "insert_ruby_native",
+        Exempt::DelegatesTo("insert_ruby_at"),
+        "본문 문단 주소로 영역 공통 함수에 위임한다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "insert_char_overlap_native",
+        Exempt::DelegatesTo("insert_char_overlap_at"),
+        "본문 문단 주소로 영역 공통 함수에 위임한다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "set_compose_control_native",
+        Exempt::DelegatesTo("set_compose_control_at"),
+        "본문 문단 주소로 영역 공통 함수에 위임한다.",
+    ),
+    (
+        "commands/compose_controls.rs",
+        "delete_compose_control_native",
+        Exempt::DelegatesTo("delete_compose_control_at"),
+        "본문 문단 주소로 영역 공통 함수에 위임한다.",
+    ),
+    (
+        "host_font_environment.rs",
+        "prepare_declared_font_fallbacks_with",
+        Exempt::SessionState,
+        "실제 글꼴 공급 관측과 파생 조판 캐시만 갱신한다. issue_8153_scoped_host_font_selection에서 관측 적용 전후 원본 저장 바이트를 대조한다.",
+    ),
+    (
+        "host_font_environment.rs",
+        "set_observed_font_fallbacks_native",
+        Exempt::SessionState,
+        "공급 관측을 검증한 뒤 같은 세션 환경 갱신 경로에 전달한다. issue_8153_scoped_host_font_selection에서 공개 API 적용 전후 원본 저장 바이트를 대조한다.",
+    ),
+    (
+        "native_pua_fonts.rs",
+        "prepare_native_otf_fonts_with",
+        Exempt::SessionState,
+        "실제 OTF 프로그램과 파생 조판 캐시만 갱신한다. native_pua_host_font_protocol에서 공급·해제 전후 문서 IR과 HWP 저장 바이트 보존을 검사한다.",
+
+    ),
+    (
+        "commands/object_ops/picture.rs",
+        "insert_picture_native",
+        Exempt::DelegatesTo("insert_picture_native_anchored"),
+        "기존 그림 넣기 진입점은 구역 무효화를 수행하는 공통 구현에 위임한다(칸 문단 앵커 여부만 다르다, #8556).",
+    ),
+    (
+        "commands/object_ops/picture.rs",
+        "insert_picture_in_cell_native",
+        Exempt::DelegatesTo("insert_picture_native_anchored"),
+        "칸 경로를 검증한 뒤 같은 공통 구현에 칸 문단 앵커로 위임한다(#8556).",
+    ),
+    (
+        "commands/clipboard.rs",
+        "paste_internal_native",
+        Exempt::DelegatesTo("paste_internal_at_caret_native"),
+        "기존 붙이기 진입점은 구역 무효화를 수행하는 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/clipboard.rs",
+        "paste_internal_text_logical_native",
+        Exempt::DelegatesTo("paste_internal_at_caret_native"),
+        "순수 조각과 논리 위치를 검증한 뒤 구역 무효화 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/html_import.rs",
+        "paste_html_native",
+        Exempt::DelegatesTo("paste_html_at_caret_native"),
+        "기존 HTML 붙이기는 구역 무효화 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/html_import.rs",
+        "paste_html_text_logical_native",
+        Exempt::DelegatesTo("paste_html_at_caret_native"),
+        "순수 HTML을 검증한 뒤 구역 무효화 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/text_editing.rs",
+        "delete_range_native",
+        Exempt::DelegatesTo("delete_range_internal"),
+        "기존 글자 축 삭제는 무효화와 삭제를 수행하는 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/text_editing.rs",
+        "delete_range_logical_native",
+        Exempt::DelegatesTo("delete_range_internal"),
+        "논리 경계를 검증한 뒤 실제 삭제와 구역 무효화를 수행하는 공통 구현에 위임한다.",
+    ),
+    (
+        "commands/formatting.rs",
+        "reflow_body_paragraph_range_native",
+        Exempt::DelegatesTo("refresh_section_native"),
+        "범위 전체를 검증해 줄을 계산한 뒤 구역 패스스루·파생 상태를 갱신한다.",
+    ),
     (
         "commands/border_paint_edit.rs",
         "discard_border_paint_undo_native",
@@ -22,9 +145,21 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
     ),
     (
         "native_pua_fonts.rs",
+        "register_native_pua_font_for_source",
+        Exempt::SessionState,
+        "원본 글꼴 유형별 PUA 세션 프로그램과 파생 배치만 갱신하며 문서 IR과 저장 raw는 변경하지 않는다.",
+    ),
+    (
+        "native_pua_fonts.rs",
         "register_literal_figure_space_font",
         Exempt::SessionState,
         "리터럴 공백의 실제 공급 프로그램과 파생 조판 캐시만 갱신한다. native_pua_host_font_protocol에서 등록·해제 전후 명시 exact 소유권·문서 IR·저장 HWP 바이트 보존을 검사한다.",
+    ),
+    (
+        "native_pua_fonts.rs",
+        "register_literal_figure_space_font_for_source",
+        Exempt::SessionState,
+        "원본 글꼴 유형별 공백 세션 메트릭과 파생 배치만 갱신하며 문서 IR과 저장 raw는 변경하지 않는다.",
     ),
     (
         "native_pua_fonts.rs",
@@ -46,6 +181,12 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
     ),
     (
         "commands/document/hft_outline_fonts.rs",
+        "clear_text_font_family_native",
+        Exempt::SessionState,
+        "선택한 family의 paint 전용 글꼴 공급과 coverage만 해제한다. hft_outline_font_contract에서 해제 전후 원본 IR과 저장 HWP 바이트 보존을 검사한다.",
+    ),
+    (
+        "commands/document/hft_outline_fonts.rs",
         "register_text_font_glyph_coverage_native",
         Exempt::SessionState,
         "원문 IR·raw stream 대신 paint용 pua_coverage 세션만 등록한다. text_font_coverage_registration의 registered_upright_face_resolves_quoted_css_and_keeps_document_source가 공개 등록 전후 HWP/HWPX 바이트 보존을 검사한다.",
@@ -57,13 +198,19 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
         "#7902: hft_outline_fonts의 paint 전용 프로그램만 등록·교체한다. 문서 IR과 저장 HWP 바이트 보존은 hft_outline_font_contract의 public API 실행으로 검사한다.",
     ),
     (
+        "commands/document/hft_outline_fonts.rs",
+        "register_hft_outline_font_candidates_native",
+        Exempt::SessionState,
+        "실제 후보 순서의 paint 전용 CFF 세션만 원자적으로 등록·교체한다. hft_outline_font_contract가 공개 단일·분할 API의 저장 IR·HWP 바이트 보존과 오류 시 기존 후보 보존을 검사한다. raw stream을 무효화할 문서 편집은 하지 않는다.",
+    ),
+    (
         "font_environment.rs",
         "set_font_environment",
         Exempt::SessionState,
         "#6389: 명시적 폰트 환경과 파생 조판·측정 캐시만 교체한다. issue_6389_environment_changes_measurement_and_paint_without_editing_document에서 적용·해제 전후 저장 bytes와 원본 face 보존을 검사한다.",
     ),
-    // #7084 render-session APIs do not mutate serialized document state.
-    // issue_7084_canvas_metric_session checks original HWP/HWPX IR and portable SVG preservation.
+    // #7084 렌더 세션 API는 직렬화된 문서 상태를 변경하지 않는다.
+    // issue_7084_canvas_metric_session은 원본 HWP/HWPX IR과 이동 가능한 SVG 보존을 검사한다.
     (
         "canvas_metric_requests.rs",
         "collect_canvas_metric_requests",
@@ -180,9 +327,21 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
     ),
     (
         "commands/object_ops/table.rs",
+        "delete_cell_shape_control_by_path_native",
+        Exempt::DelegatesTo("delete_cell_control_by_path_native"),
+        "#7375: 도형 종류를 검증하는 래퍼. 공통 helper가 해당 셀 컨트롤 삭제와 구역 raw_stream 무효화를 수행한다. issue_7375_cell_shape_move_transform에서 HWP/HWPX 저장·재열기 뒤 삭제가 유지되는지 검증한다.",
+    ),
+    (
+        "commands/object_ops/table.rs",
         "delete_cell_table_control_by_path_native",
         Exempt::DelegatesTo("delete_cell_control_by_path_native"),
         "표 종류를 지정하는 래퍼. 공통 helper가 삭제와 구역 raw_stream 무효화를 수행한다.",
+    ),
+    (
+        "commands/object_ops/table.rs",
+        "set_cell_shape_properties_by_path_native",
+        Exempt::DelegatesTo("finish_loaded_source_cache_after_object_edit"),
+        "#7375: 공통 helper가 변경된 모델의 원본 캐시를 무효화하고, 모델·DocInfo·저장 프레임이 모두 원본과 같아졌을 때만 봉인한 캐시를 복원한다. issue_7375_cell_shape_move_transform에서 이동·곡률 저장과 다른 편집 보존, 원래 표시 경계의 복원을 검증한다.",
     ),
     // ── 세션/캐시 상태만 변경 (문서 IR 비변경) ──────────────────────────────
     (
@@ -227,6 +386,36 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
         Exempt::SessionState,
         "dirty 구역을 다시 쪽으로 나눌 뿐(pagination·측정 캐시). 문서 IR 무변경 — \
          선행 편집 뮤테이터가 이미 무효화했다.",
+    ),
+    (
+        "queries/memo_query.rs",
+        "insert_memo_at",
+        Exempt::DelegatesTo("insert_memo_at_checked"),
+        "겹치는 메모를 막는 insertMemo 경로로 insert_memo_at_checked에 넘긴다. 구역 raw_stream 무효화는 그 함수가 한다.",
+    ),
+    (
+        "queries/memo_query.rs",
+        "insert_memo_by_path",
+        Exempt::DelegatesTo("insert_memo_by_path_checked"),
+        "겹치는 메모를 막는 insertMemoByPath 경로로 insert_memo_by_path_checked에 넘긴다. 구역 raw_stream 무효화는 그 함수가 한다.",
+    ),
+    (
+        "queries/memo_query.rs",
+        "insert_memo_reply_json_native",
+        Exempt::DelegatesTo("insert_memo_at_checked"),
+        "댓글을 부모와 같은 자리에 insert_memo_at_checked(표 칸이면 insert_memo_by_path_checked)로 단다. 두 함수 모두 구역 raw_stream을 무효화한다.",
+    ),
+    (
+        "queries/memo_query.rs",
+        "insert_memo_json_native",
+        Exempt::DelegatesTo("insert_memo_at"),
+        "insertMemo의 {author,text} JSON을 읽은 뒤 insert_memo_at에 넘긴다. 구역 raw_stream 무효화는 insert_memo_at이 한다 (#8017).",
+    ),
+    (
+        "queries/memo_query.rs",
+        "insert_memo_by_path_json_native",
+        Exempt::DelegatesTo("insert_memo_by_path"),
+        "insertMemoByPath의 셀 경로와 JSON을 읽은 뒤 insert_memo_by_path에 넘긴다. 구역 raw_stream 무효화는 insert_memo_by_path가 한다 (#8017).",
     ),
     (
         "queries/changed_pages.rs",
@@ -404,6 +593,13 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
         "활성 필드 해제 + 렌더 캐시 무효화. 직렬화 비대상.",
     ),
     // ── 문서 전체 교체·생성 ────────────────────────────────────────────────
+    (
+        "commands/document.rs",
+        "load_bytes",
+        Exempt::WholeDocument,
+        "[#8745] 인증·파싱 성공 뒤 Core 전체를 교체한다. 새 문서의 raw_stream·raw_provenance도 \
+         함께 설정하며 실패 시 기존 문서와 패스스루 상태를 유지한다.",
+    ),
     (
         "commands/document.rs",
         "create_blank_document_native",
@@ -703,6 +899,14 @@ const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
         Exempt::DelegatesTo("apply_para_format_native"),
         "리스트 아이디를 구역·문단으로 풀어 넘길 뿐이다. 서식 적용과 무효화는 본문 경로 \
          (`apply_para_format_native`)와 셀 경로(`apply_para_format_in_cell_native`)가 한다.",
+    ),
+    (
+        "commands/paragraph_format_path.rs",
+        "apply_para_format_in_cell_by_path",
+        Exempt::DelegatesTo("set_cell_para_shape_id_by_path"),
+        "#7637: 중첩 셀은 문단 모양 ID 적용 함수가 구역 raw_stream을 무효화한다. \
+         깊이 1은 직접 무효화하는 apply_para_format_in_cell_native에 위임한다. \
+         두 저장 경로는 nested-paragraph-format의 실제 WASM HWP/HWPX 왕복으로 검증한다.",
     ),
     // ── 판정 보류 ──────────────────────────────────────────────────────────
     (

@@ -16,13 +16,17 @@ pub struct GlyphRun {
 
 #[derive(Clone, Copy)]
 pub(super) enum Role {
-    Variable { italic: bool },
+    Variable {
+        italic: bool,
+    },
     Number,
     Operator,
     Greek,
     BigOperator,
     SmallOperator,
     LegacyLiteral,
+    /// 현대 HYhwpEQ의 인용 문자. 인용 밖 미분 prime과 구분한다.
+    QuotedLiteral,
 }
 
 pub(super) fn is_operator(text: &str) -> bool {
@@ -111,6 +115,9 @@ fn glyph(ch: char, role: Role) -> Option<(char, u16)> {
         // 독립 정상 저장본의 SMALLPROD는 두 수식 face의 Unicode U+220F다.
         // 큰 연산자용 PUA와 구분하며 본문 크기의 한 em 전진을 소비한다.
         Role::SmallOperator if ch == '∏' => (0x220f, 1024),
+        // 독립 6/7/9/10/12/18pt Print의 인용 작은따옴표는 ASCII/prime이
+        // 아닌 이 PUA다. 설치 공통 HYhwpEQ의 hmtx도 163/1024다.
+        Role::QuotedLiteral if ch == '\'' => (0xe050, 163),
         // A legacy equation's literal triangle and one-dot leader occupy
         // full symbol slots in Hancom Print. The equation font has no U+2024
         // cmap entry; its mathematical dot is U+22C5, with that same advance.
@@ -127,6 +134,61 @@ fn glyph(ch: char, role: Role) -> Option<(char, u16)> {
         _ => return None,
     };
     Some((char::from_u32(code)?, advance))
+}
+
+/// Decode this producer's private font codes only when the original face is
+/// unavailable. Reuse `glyph` so painter fallbacks cannot invent another code
+/// table. Uppercase italic runs already carry their shear; lowercase PUA glyphs
+/// contain intrinsic italic outlines and need an italic fallback face instead.
+#[cfg(feature = "native-skia")]
+pub(crate) fn semantic_fallback_glyph(family: &str, encoded: char) -> Option<(char, bool)> {
+    use std::collections::BTreeMap;
+    use std::sync::OnceLock;
+    type Mappings = BTreeMap<char, (char, bool)>;
+    static MAPPINGS: OnceLock<(Mappings, Mappings)> = OnceLock::new();
+    if !(0xe000..=0xf8ff).contains(&(encoded as u32)) {
+        return None;
+    }
+    let hancom_eqn = family.eq_ignore_ascii_case("HancomEQN");
+    if !hancom_eqn && !family.eq_ignore_ascii_case(FONT_FAMILY) {
+        return None;
+    }
+    let maps = MAPPINGS.get_or_init(|| {
+        let build = |extended: bool| {
+            let mut map = Mappings::new();
+            let characters = ('A'..='Z').chain('a'..='z').chain('0'..='9').chain(
+                "+-= :<>×÷≤≥∴∵,()αβγδεζηθικλμνξοπρστυφχψωΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ∑∏△․%".chars(),
+            );
+            for character in characters {
+                for role in [
+                    Role::Variable { italic: false },
+                    Role::Variable { italic: true },
+                    Role::Number,
+                    Role::Operator,
+                    Role::Greek,
+                    Role::BigOperator,
+                    Role::SmallOperator,
+                    Role::LegacyLiteral,
+                ] {
+                    if !extended && matches!(role, Role::Greek | Role::BigOperator) {
+                        continue;
+                    }
+                    if let Some((code, _)) = glyph(character, role) {
+                        if (0xe000..=0xf8ff).contains(&(code as u32)) {
+                            let intrinsic_italic = matches!(role, Role::Variable { italic: true })
+                                && character.is_ascii_lowercase();
+                            map.insert(code, (character, intrinsic_italic));
+                        }
+                    }
+                }
+            }
+            map
+        };
+        (build(false), build(true))
+    });
+    (if hancom_eqn { &maps.1 } else { &maps.0 })
+        .get(&encoded)
+        .copied()
 }
 
 pub(super) fn measure(
@@ -235,6 +297,11 @@ pub(crate) fn used_font_families(
         match &item.kind {
             LayoutKind::HancomGlyphs(run) => {
                 families.insert(run.font_family);
+            }
+            LayoutKind::FontGlyph { font_family, .. }
+                if *font_family == super::legacy_glyphs::FONT_FAMILY =>
+            {
+                families.insert(*font_family);
             }
             LayoutKind::Row(children) => pending.extend(children),
             LayoutKind::Fraction { numer, denom, .. } => {

@@ -1,3 +1,4 @@
+# #7727: 전204쪽 Native/fresh WASM 최저92.05/92.16% 수용 후 복원. fixed170b/후보의 기존 계산식 실측 모두0; 다른 원장은 유지.
 # 조이기 (#7226 곁가지): devel a4b8731ca 실측으로 94행을 내렸다 — 0 이 된 52행(합 406)과
 # 감소한 42행(1,937 -> 1,564), 원장 전체 4,322 -> 3,543. 증가·신규는 0 이라 완화가 아니다.
 # 측정은 이 게이트 자신의 RHWP_TEXT_OVERLAP_DUMP 로 떴고(16 partition), 168행 전부 렌더에
@@ -5,8 +6,7 @@
 # 원장의 5분의 1이 사실보다 컸다 — 그만큼이 새 회귀를 조용히 흡수하는 여유였다.
 # 줄어든 몫은 9/18~9/19 의 표 조판 묶음(#6935 조각 컷 인덱스 공간 · #7063 자리차지 표 좌단 ·
 # #6923 겹침 걸음 사다리 · #7254 run 폭 반올림 제거)이 만든 것이다.
-# 유보 2행 — 편람 hwp/hwpx 는 #6325 로 환경 분기가 실측된 문서다(같은 쪽 overflow 로컬 2 vs CI 4,
-# 표 높이 +103.47px). 로컬 실측(각 20)을 상한으로 쓰지 않고 기존 21 을 유지한다.
+# 사용자 요청: 두 행정업무편람 입력의 기존 원장은 제거하고 #8153에서 새로 검증한다.
 # 상한의 권위는 CI(ubuntu-latest)다 — 다른 행에서도 CI 실측이 더 크면 그 값으로 올려 적는다.
 # #7390 / PR #7406: 원 KoPub 변경만 적용하면 PrEP 상한 14 -> 15가 필요했다.
 # 69쪽 비-TAC RowBreak 표가 선언된 첫 조각 높이만으로 whole-fit되어 선행 본문을
@@ -92,6 +92,7 @@ issue6264/1977964_env_satellite_report_form.hwp	2
 issue6310/press_release_cell_logo.hwpx	4
 issue6551/113424_evaluation_guideline.hwpx	3
 issue6601/36331407_side_by_side_tac_tables.hwpx	11
+issue6764/1613000-202200037-air-traffic-controller-cbta.hwp	0
 issue6854/70833-electrical-safety-rule-regulatory-analysis.hwp	5
 issue6879/156767332-broadcast-revenue-attachment.hwp	1
 # #7418: 글머리표 머리 모양 합성 문서의 **의도된** 마커 겹침. 너비 보정 −1000·본문과의 거리 50%
@@ -109,6 +110,7 @@ issue7688/arrow-controls/control-2.hwpx	5
 issue7688/arrow-controls/control-3.hwpx	5
 issue7688/arrow-controls/control-compound.hwpx	5
 issue7688/arrow-controls/control-short.hwpx	5
+issue8755/46551_road_traffic_rule_amendment.hwp	7
 kps-ai.hwp	2
 mel-001.hwp	1
 multi-table-001.hwp	1
@@ -140,3 +142,35 @@ task2430/1382000_domestic_violence_survey.hwp	1
 # 이후 표 조판 묶음으로 37 까지 내려갔다. 33쪽 겹침은 0 이다. 여유 없이 실측으로 조인다.
 정책연구용역사업 중간진도보고서(살아있는 간장 기증자의 의학적 선별기준 연구).hwp	53
 정책연구용역사업 중간진도보고서(살아있는 간장 기증자의 의학적 선별기준 연구).hwpx	218
+# #8501 신규 공개 샘플(법령안 67477, 한/글 2020 저장): 수정 전(#8493 위)과 수정 후의 값이 같다 — 8·9쪽
+# 표(pi=38·39)가 본문 아래로 넘치는 기존 형상이며 이 PR 범위 밖이다. 같은 문서 전쪽 silhouette 은 98.8% 이상.
+issue8501/child_product_safety_rule.hwp	1
+# #8859 신규 공개 샘플(결재문서 36379333): 수정 전(devel 509c4c987e) 4건 → 수정 후 2건. 줄어든 2건은 표 위 틈 제목이
+# 표 아래로 밀려 다음 표와 겹치던 몫이다. 남은 2건은 2쪽 `pi=13` host 글 「끝.」 이 자기 자리차지 표 위에 그려지는
+# 기존 형상(한/글은 표 아래 1024.8px)이며 이 PR 범위 밖이다. 같은 문서 전쪽 silhouette 은 99.8% 이상.
+issue8859/36379333-stored-text-above-offset-float.hwpx	2
+
+# #7700: 같은 원본의 Native/fresh WASM 전103쪽90% 이상 확인 뒤 활성 복원.
+# 최소 글꼴 Mac 전쪽 실제 진단: 본문 넘침1·글자 겹침1. 기존 이관 전 허용2/1보다 늘리지 않는다.
+issue5679/10857_delegation_rules.hwp	1
+# #8641 신규 공개 샘플(서울시 결재문서 36306589, 한/글 2020 저장): 수정 전(devel ece9c3383b)과 수정 후의
+# 값이 같다 — 맨 위 6×6 제목 표 첫 칸의 두 줄 글자 상자(높이 32px, 줄 간격 28.8px)가 3.2px 겹치는 기존
+# 형상이며 이 PR 범위 밖이다. 같은 문서 1쪽 silhouette 은 Native·fresh WASM 99.98%.
+issue8641/field_table_after_page_box.hwpx	6
+# #8641 새 fixture: #8645·#8649 합본과 이 수정의 대조에서 보고서 2 → 2(이 수정으로 늘지 않음, 표 겹침은 문서 고유).
+issue8641/labor_standards_report.hwp	2
+
+# #8685 신규 공개 샘플(새마을운동 ODA 시범사업 보고서 1311000-201100125, 209쪽): 홀수 쪽 꼬리말 글줄의
+# 글자 조각끼리 겹치는 기존 형상 90건(11~53쪽 등)이다. 수정 전(devel 08963f6825) 104건 중 15쪽 표 셀 각주
+# 14건이 이 PR 로 사라지고 나머지 90건은 수정 전과 같다. #8677 최종보고서의 27쪽 14건은 이 PR 로 0건이라 행을 뺀다.
+issue8685/1311000-201100125_saemaul_oda_pilot_report.hwp	90
+issue8773/field_led_wide_table.hwpx	1
+issue8773/field_led_wide_table_nofield.hwpx	1
+issue8782/stored_field_line_table.hwpx	1
+issue8786/reflowed_gap_stored_rewind.hwpx	1
+# #8842 신규 공개 샘플(HPV 코호트 최종결과보고서 1351000-201800239, 한/글 2020 Print 235쪽): 수정 전(devel 024d610633)과
+# 수정 후의 값이 같다 — 1·118쪽 표 칸 글자 겹침(118쪽 39건)은 76~172쪽 표 쪽 나눔 어긋남 축이며 이 수정(211~234쪽 그림 무리) 범위 밖이다.
+issue8842/1351000-201800239_hpv_cohort_final_report.hwp	41
+# #8891 신규 공개 샘플(1480000-201900510 업종 시설설치관리 연구 최종보고서, 한/글 2020 Print 241쪽): 수정 전(#8879 head
+# 93dd166c25)과 수정 후의 값이 같다 — 187쪽 표 칸 글자 상자 2.5px 겹침 1건이며 이 수정(113쪽 행 소속) 범위 밖이다.
+issue8891/1480000-201900510_facility_pollution_study.hwp	1

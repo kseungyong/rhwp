@@ -1,3 +1,7 @@
+//! 관계형·고정형: 검사 대상 — 합성 래스터 진단의 기본값과 결과 전달 계약.
+//! 주석 갱신: 2026-11-01T06:03:27+09:00; 직전 파일 커밋: 2026-09-05T20:37:51+09:00 (`0dcad27b691d19a46d82f348cb8d8612238aa8e1`).
+//! 입력·기준: 파일 내부 합성 `PageLayerTree`와 테스트용 래스터 구현.
+//! API·데이터 계약을 검사하며 화면 시각 일치율은 측정하지 않는다.
 use rhwp::paint::{LayerNode, PageLayerTree};
 use rhwp::render_backend::{RenderBackend, SkiaBackend};
 use rhwp::renderer::layer_renderer::{
@@ -15,12 +19,17 @@ fn raster_diagnostics_default_is_an_unmeasured_empty_snapshot() {
             backend: None,
             render_profile: None,
             variant_selections: Vec::new(),
+            #[cfg(all(feature = "native-skia", not(target_arch = "wasm32")))]
+            native_glyph_rejections: Vec::new(),
+            #[cfg(all(feature = "native-skia", not(target_arch = "wasm32")))]
+            native_glyph_rejections_dropped: 0,
             shaped_measurements: Vec::new(),
             shaped_measurement_lines: Vec::new(),
             line_break_shadows: Vec::new(),
             shaped_measurement_paragraphs: Vec::new(),
             shaped_measurement_pages: Vec::new(),
             layer_nodes_replayed: 0,
+            layer_nodes_culled: 0,
             paint_ops_replayed: 0,
             tile_fallback_cap_hits: 0,
             image_effect_preprocess_failures: 0,

@@ -7,9 +7,18 @@ rhwp 프로젝트가 사용하는 서드파티 라이브러리 및 리소스의 
 Copyright © 2024 Unicode, Inc.이며 [Unicode License v3](assets/licenses/Unicode-3.0.txt)를 적용한다.
 원문 SHA-256은 `764f420cedfc8b43d9fec251c957a5d55fc45d40f6573f162990ed1dce7e36e0`이다.
 
+Print JPEG 인코더의 원래 라이선스·저작권 고지는 `vendor/rhwp-jpeg-encoder/LICENSE-*`에 있다.
+Print JPEG 디코더의 선택 변환은 공개 Intel MediaSDK 정수 IDCT(MIT)를 Rust로 번역하고,
+IJG 보간 규칙을 재표현한다. Intel 저작권·MIT 고지는
+`src/renderer/image_resolver/print_jpeg_idct.rs`와 `licenses/intel-mediasdk/LICENSE`, IJG 원문과 배포 조건은
+`vendor/rhwp-zune-jpeg/README.ijg`, 해당 구현은 `vendor/rhwp-zune-jpeg/src/ijg_upsampler.rs`와
+최종 JPEG 재생의 `vendor/rhwp-zune-jpeg/src/ijg_replay.rs`,
+변경 설명은 `vendor/rhwp-zune-jpeg/RHWP_PATCHES.md`에 있다.
+This software is based in part on the work of the Independent JPEG Group.
+
 기준 파일:
 
-- `Cargo.toml` / `Cargo.lock` (`rhwp` v0.8.7)
+- `Cargo.toml` / `Cargo.lock` (`rhwp` v0.9.0)
 - `rhwp-studio/package.json` / `rhwp-studio/package-lock.json`
 - `rhwp-chrome/package.json` / `rhwp-chrome/package-lock.json`
 - `rhwp-firefox/package.json` / `rhwp-firefox/package-lock.json`
@@ -29,20 +38,24 @@ Copyright © 2024 Unicode, Inc.이며 [Unicode License v3](assets/licenses/Unico
 | blake3 | 1.8.6 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | BLAKE3-team/BLAKE3 | 해시/진단 |
 | byteorder | 1.5.0 | Unlicense OR MIT | BurntSushi/byteorder | 바이너리 endian 처리 |
 | cbc | 0.2.1 | MIT OR Apache-2.0 | RustCrypto/block-modes | HWPX 암호화 모드 |
-| cfb | 0.14.0 | MIT | mdsteele/rust-cfb | OLE Compound File |
+| cfb | 0.16.0 | MIT | mdsteele/rust-cfb | OLE Compound File |
 | cipher | 0.5.2 | MIT OR Apache-2.0 | RustCrypto/traits | 암호 trait |
 | codepage | 0.1.2 | Apache-2.0 OR MIT | hsivonen/codepage | 코드페이지 처리 |
 | console_error_panic_hook | 0.1.7 | Apache-2.0/MIT | rustwasm/console_error_panic_hook | WASM panic hook |
-| crc32fast | 1.5.0 | MIT OR Apache-2.0 | srijs/rust-crc32fast | HWP3 암호 키 검증 |
+| crc32fast | 1.5.4 | MIT OR Apache-2.0 | srijs/rust-crc32fast | HWP3 암호 키 검증 |
 | des | 0.9.0 | MIT OR Apache-2.0 | RustCrypto/block-ciphers | HWP3 암호화 |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause | dalek-cryptography/curve25519-dalek | capsule 서명 |
 | embedded-io | 0.7.1 | MIT OR Apache-2.0 | rust-embedded/embedded-hal | IO trait |
-| encoding_rs | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | hsivonen/encoding_rs | 문자 인코딩 |
+| encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause | hsivonen/encoding_rs | 문자 인코딩 |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 | rust-lang/flate2-rs | 압축/해제 |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | rust-random/getrandom | 서명 키 난수 생성 |
 | hmac | 0.13.0 | MIT OR Apache-2.0 | RustCrypto/MACs | HWPX 무결성 |
 | image | 0.25.10 | MIT OR Apache-2.0 | image-rs/image | BMP/JPEG/PNG 디코딩 |
+| rhwp-zune-jpeg | 0.5.15-rhwp.1 | (MIT OR Apache-2.0 OR Zlib) AND IJG | etemesi254/zune-image, IJG | 요청별 할당 예산·인스턴스별 Print 변환; 기본 PDF import decoder는 원래 변환 유지 |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 | rustwasm/wasm-bindgen | WASM JS interop |
+| log | 0.4.35 | MIT OR Apache-2.0 | rust-lang/log | 공통 진단 기록 |
+| ml-dsa | 0.1.2 | Apache-2.0 OR MIT | RustCrypto/signatures | ML-DSA-65·hybrid 서명 |
+| ml-kem | 0.3.4 | Apache-2.0 OR MIT | RustCrypto/KEMs | ML-KEM-768 공개키 봉인 |
 | office_oxide | 0.1.9 | MIT OR Apache-2.0 | yfedoseev/office_oxide | `pdf-import` optional 호환성 제약; PDF 전이 의존성 |
 | paste | 1.0.15 | MIT OR Apache-2.0 | dtolnay/paste | 매크로 보조 |
 | pbkdf2 | 0.13.0 | MIT OR Apache-2.0 | RustCrypto/password-hashes | HWPX 키 파생 |
@@ -56,29 +69,39 @@ Copyright © 2024 Unicode, Inc.이며 [Unicode License v3](assets/licenses/Unico
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | serde-rs/json | JSON 직렬화 |
 | sha1 | 0.11.0 | MIT OR Apache-2.0 | RustCrypto/hashes | HWPX 암호 키 파생 |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | RustCrypto/hashes | 서명·CAS 해시 |
-| skia-safe | 0.99.0 | MIT | rust-skia/rust-skia | native-skia PNG/PDF backend (optional) |
+| skia-safe | 0.156.0 | MIT | rust-skia/rust-skia | native-skia PNG/PDF backend (optional) |
 | snafu | 0.9.2 | MIT OR Apache-2.0 | shepmaster/snafu | 에러 처리 |
 | strum | 0.28.0 | MIT | Peternator7/strum | enum derive |
 | subsecond | 0.7.10 | MIT OR Apache-2.0 | DioxusLabs/dioxus | 개발 핫패치 (optional) |
 | subsetter | 0.2.6 | MIT OR Apache-2.0 | typst/subsetter | 폰트 subset |
 | rhwp-jpeg-encoder | 0.7.1-rhwp.1 (upstream 0.7.1) | (MIT OR Apache-2.0) AND IJG | vstroebel/jpeg-encoder, rhwp 보정 | Print JPEG의 성분 순서·채널별 sampling·정수 DCT/YCbCr 전달. 원본 및 패치 고지 유지 |
 | rhwp-svg2pdf | 0.13.0-rhwp.1 (upstream 0.13.0) | MIT OR Apache-2.0 | typst/svg2pdf, rhwp 보정 | SVG → PDF. 원저작자·패치 고지 유지 |
-| svgtypes | 0.16.1 | Apache-2.0 OR MIT | linebender/svgtypes | SVG 값 파싱 |
+| svgtypes | 0.16.2 | Apache-2.0 OR MIT | linebender/svgtypes | SVG 값 파싱 |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | harfbuzz/ttf-parser | 폰트 파싱 |
-| unicode-properties | 0.1.4 | MIT OR Apache-2.0 | unicode-rs/unicode-properties | 유니코드 문자 분류 |
+| unicode-properties | 0.1.5 | (MIT OR Apache-2.0) AND Unicode-3.0 | unicode-rs/unicode-properties | 유니코드 문자 분류·데이터; Unicode 고지는 `assets/licenses/Unicode-3.0.txt` |
 | unicode-bidi | 0.3.18 | MIT OR Apache-2.0 | servo/unicode-bidi | 텍스트 표시 방향과 논리 구간의 시각 원점 |
 | unicode-bidi-mirroring | 0.4.0 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/unicode-bidi-mirroring |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | unicode-rs/unicode-segmentation | grapheme/word segmentation |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | unicode-rs/unicode-width | 문자 폭 계산 |
+| ureq | 3.5.1 | MIT OR Apache-2.0 | algesten/ureq | Native 공개 웹폰트 HTTPS 다운로드 |
 | usvg | 0.45.1 / 0.47.0 | Apache-2.0 OR MIT | linebender/resvg | Native SVG 파싱 / 공통 WMF surface의 resvg 파싱 |
 | wasm-bindgen | 0.2.125 | MIT OR Apache-2.0 | rustwasm/wasm-bindgen | WASM binding |
 | wasm-bindgen-test | 0.3.75 | MIT OR Apache-2.0 | rustwasm/wasm-bindgen | WASM 테스트 |
 | web-sys | 0.3.102 | MIT OR Apache-2.0 | rustwasm/wasm-bindgen | Web API binding |
-| zip | 8.6.0 | MIT | zip-rs/zip2 | HWPX ZIP 처리 |
+| zip | 9.4.0 | MIT | zip-rs/zip2 | HWPX ZIP 처리 |
 
-### PDF opt-in 코덱의 내부 보정판 (#8183)
+2026-11-09의 Dependabot #8811–#8829 검토에서 함께 교체된 전이 의존성은 다음과 같다.
+버전·라이선스는 실제 registry archive와 `Cargo.lock`을 대조했다.
 
-기본 빌드에는 다음 코덱을 포함하지 않는다. `pdf-jbig2`는 JBIG2와 내부 MMR 처리용
+| 크레이트 | 버전 | 라이선스 | 용도 |
+| --- | --- | --- | --- |
+| ctutils | 0.4.8 | Apache-2.0 OR MIT | 암호 처리의 상수 시간 연산 보조 |
+| module-lattice | 0.2.4 | Apache-2.0 OR MIT | ML-KEM·ML-DSA 격자 연산 |
+| ureq-proto | 0.7.1 | MIT OR Apache-2.0 | ureq HTTP 프로토콜 처리 |
+
+### PDF 코덱의 내부 보정판 (#8183·#8174)
+
+현재 #8174 v2-S02의 기본 빌드는 다음 코덱을 포함한다. `pdf-jbig2`는 JBIG2와 내부 MMR 처리용
 CCITT를, `pdf-jpeg2000`은 JPEG 2000을 선택한다. backend의 전체 rendering은 켜지 않는다.
 
 | 내부 패키지 | 원본 버전 | 라이선스 | 보완 범위 |
@@ -122,7 +145,7 @@ CCITT를, `pdf-jpeg2000`은 JPEG 2000을 선택한다. backend의 전체 renderi
 
 ### PDF 입력 의존성의 고지
 
-`pdf-import`는 기본 비활성이며, 활성화할 때 `rhwp-pdf-import-backend =0.3.78-rhwp.1`과
+`pdf-import`는 기본 포함이며, 이를 통해 `rhwp-pdf-import-backend =0.3.78-rhwp.1`과
 `office_oxide =0.1.9`를 모두 `default-features = false`로 사용한다.
 `office_oxide` 직접 버전 제약은 `pdf_oxide 0.3.78`과의 컴파일 호환성을 위한 것이며,
 rhwp가 Office 입력 형식 지원을 추가했다는 뜻은 아니다.
@@ -138,7 +161,7 @@ rhwp가 Office 입력 형식 지원을 추가했다는 뜻은 아니다.
 원래 MIT/Apache 라이선스·NOTICE·상표 정책도 해당 directory에 유지한다.
 내부 Rust dependency는 `rlib`만 생성한다. 원본 C API·writer 소스는 보존하지만 이 내부
 package를 독립 cdylib/staticlib 제품으로 배포하는 계약은 제공하지 않는다.
-`publish = false`이며 외부 게시·배포와 게시된 rhwp library 소비자 지원은 아직 완료하지 않았다.
+manifest는 crates.io 게시 후보로 준비되어 있지만, 실제 게시 일정과 공개 registry 소비 검증은 제품 릴리즈와 별도로 확정한다.
 
 아래 고지는 해당 버전 crate 배포본의 `NOTICE`와 `LICENSE-MIT` 원문이다.
 두 crate의 재배포에는 dual license 중 MIT 선택지를 적용한다. 이 고지와 각 전이 의존성의
@@ -314,12 +337,13 @@ USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
 |--------|-----------|---------|------|
 | canvaskit-wasm | 0.42.0 | BSD-3-Clause | CanvasKit 렌더링 backend |
 | @noble/hashes | 2.4.0 | MIT | 렌더 리소스 키와 문서 digest |
+| @anthropic-ai/sdk | 1.6.0 | Apache-2.0 | 사용자 키 기반 Claude API·SSE |
 | @types/chrome | 0.2.5 | MIT | Chrome API 타입 |
 | pixelmatch | 7.2.0 | ISC | 시각 diff 픽셀 비교 |
 | pngjs | 7.0.0 | MIT | 시각 diff PNG 처리 |
 | puppeteer-core | 25.5.0 | Apache-2.0 | E2E 테스트 / CDP 연결 |
 | typescript | 7.0.2 | Apache-2.0 | TypeScript 컴파일 |
-| vite | 8.2.1 | MIT | 개발 서버 + 빌드 |
+| vite | 8.3.6 | MIT | 개발 서버 + 빌드 |
 | vite-plugin-pwa | 1.3.0 | MIT | PWA 빌드 보조 |
 | workbox-window | 7.4.1 | MIT | Service worker runtime 보조 |
 
@@ -328,7 +352,7 @@ USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
 | 패키지 | Lock 버전 | 라이선스 | 용도 |
 |--------|-----------|---------|------|
 | typescript | 7.0.2 | Apache-2.0 | TypeScript 컴파일 |
-| vite | 8.2.1 | MIT | 확장 번들 빌드 |
+| vite | 8.3.6 | MIT | 확장 번들 빌드 |
 
 ### rhwp-vscode
 
@@ -342,7 +366,7 @@ USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
 | ts-loader | 9.6.2 | MIT | Webpack TypeScript 로더 |
 | typescript | 6.0.2 | Apache-2.0 | TypeScript 컴파일 |
 | webpack | 5.109.2 | MIT | 번들러 |
-| webpack-cli | 7.2.2 | MIT | Webpack CLI |
+| webpack-cli | 7.3.1 | MIT | Webpack CLI |
 | @noble/hashes | 2.4.0 | MIT | 문서 digest |
 | canvaskit-wasm | 0.42.0 | BSD-3-Clause | 자동 선택 CanvasKit backend |
 
@@ -442,6 +466,11 @@ GUST Font License를 유지하며 사설 글꼴의 윤곽·바이트는 포함�
 
 ## 직접 포팅한 알고리즘
 
+공통 Print 장치 면적 표본(`src/renderer/print_image_sampling.rs`)은 공개 PDFium
+`chromium/7999`의 CStretchEngine 고정소수점 산술 계약을 적용한다. 원래 PDFium Authors와
+Foxit Software의 저작권 고지 및 BSD-3-Clause 조건은 `licenses/pdfium/LICENSE`에 보존한다.
+이 항목은 Cargo 크레이트 의존성이 아니다. 출처는 `licenses/pdfium/README.md`에 있다.
+
 ### Volexity hwp-extract
 
 - 출처: [volexity/hwp-extract](https://github.com/volexity/hwp-extract), commit
@@ -513,3 +542,20 @@ rhwp는 **MIT 라이선스**로 배포된다.
 공개 테스트·Native 원본 18개를 [목록](assets/fonts/licenses/font-notices.json)에 등록하며,
 등록되지 않은 공개 폰트 또는 배포 고지 누락은 `scripts/frontend-font-assets.test.mjs`가 검출한다.
 상용 글꼴의 문서 요청 이름은 대체 설정에서 처리하고, 파생 폰트의 내부 이름으로 사용하지 않는다.
+
+### 기본 ICC CMM
+
+`pdf-icc`는 기본 feature이며 Native/WASM에서 같은 순수 Rust CMM인 `rhwp-qcms`를
+사용한다. qcms 0.3.0의 내부 보정판이며 Mozilla Foundation·Marti Maria 등의 원 저작권과
+MIT 전문은 [COPYING](vendor/rhwp-qcms/COPYING)에 보존한다. 원본 archive·VCS commit과
+요청별 CLUT 예약·작업량 변경은 [패치 기록](vendor/rhwp-qcms/RHWP_PATCHES.md)에 있다.
+공식 qcms 릴리스나 이미 게시된 crate로 표시하지 않는다. 실제 포장·독립 소비는 #8174 S05에서
+최종 dependency graph로 재검증한다.
+
+## Nimbus Roman 계량 자료
+
+`src/renderer/font_metric_nimbus_roman.rs`와 `data/font-metrics/nimbus-roman/`은
+URW Base35의 글꼴 프로그램에서 추출한 이름·Unicode 대응·전진폭 계량 자료다.
+원본 프로그램 SHA-256과 생성 방법은 해당 디렉터리의 `source.json`·`README.md`에 있다.
+글꼴 프로그램 바이트와 윤곽선은 이 자료에 포함하지 않는다. 원본의 고지는 패키지에 동봉한
+`data/font-metrics/nimbus-roman/URW-FONT-NOTICE.txt`에 보존한다.

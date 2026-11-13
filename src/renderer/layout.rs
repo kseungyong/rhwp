@@ -5,6 +5,7 @@
 
 mod auto_number_positions;
 mod decorated_tac_frame;
+mod table_paint_order;
 mod textless_shape_host;
 use decorated_tac_frame::tac_has_only_in_front_decoration_shapes_before;
 pub(crate) use decorated_tac_frame::{
@@ -151,7 +152,7 @@ struct ColumnItemCtx<'a> {
 }
 
 impl ColumnItemCtx<'_> {
-    /// A block TAC table and its visible text tail share one paragraph ending.
+    /// 블록 TAC 표와 실제 방출된 독립 꼬리 줄은 하나의 문단 끝을 공유한다.
     /// Use the emitted items, including other columns, rather than control order.
     fn tac_text_tail_spacing_after(&self, para_index: usize) -> Option<f64> {
         let para = self.paragraphs.get(para_index)?;
@@ -187,11 +188,11 @@ impl ColumnItemCtx<'_> {
                     return false;
                 };
                 *owner == para_index && *start_line > table_line
-                    && comp.lines.get(*start_line..*end_line).is_some_and(|lines| {
+                    && (comp.lines.get(*start_line..*end_line).is_some_and(|lines| {
                         lines.iter().any(|line| line.runs.iter().any(|run| {
                             run.text.chars().any(|c| !c.is_whitespace() && c > '\u{001F}' && c != '\u{FFFC}')
                         }))
-                    })
+                    }) || stored_tac_frame::independent_stored_tail(para, *start_line, *end_line))
             })
         }).then_some(spacing)
     }
@@ -251,6 +252,25 @@ fn stored_empty_full_band_tac_table_top(
         .then(|| col_area.y + stored_y + hwpunit_to_px(table.outer_margin_top as i32, dpi))
 }
 
+/// [#8507] 글자 없는 host 의 개체 줄을 rhwp 가 재조판했을 때, 표가 첫 줄이 아닌 자기 줄에
+/// 놓인 만큼의 세로 오프셋. 줄 재조판은 필드 시작 뒤 줄 폭에 들지 않는 표를 다음 줄로
+/// 넘기고(한/글 2020 합성 field_over19: 빈 필드 줄 1600HU 아래), 저장본이라면
+/// [`stored_empty_full_band_tac_table_top`] 이 같은 줄을 저장 vpos 로 찾는다. 재조판 줄은
+/// 절대 vpos 대신 같은 문단 첫 줄과의 차이만 쓴다.
+fn composed_empty_host_tac_line_offset(
+    para: &Paragraph,
+    control_index: usize,
+    dpi: f64,
+) -> Option<f64> {
+    if !crate::renderer::para_has_composed_object_rows(para) {
+        return None;
+    }
+    let line = control_line_seg_index(para, control_index).filter(|line| *line > 0)?;
+    let (first, owner) = (para.line_segs.first()?, para.line_segs.get(line)?);
+    (owner.vertical_pos > first.vertical_pos)
+        .then(|| hwpunit_to_px(owner.vertical_pos - first.vertical_pos, dpi))
+}
+
 /// 빈 host의 full-band TAC 표가 표 paint frame과 다음 문단의 시작을 같은 저장
 /// `LINE_SEG`에 기록한 경우, 표 뒤 흐름의 하한을 복원한다.
 ///
@@ -308,16 +328,9 @@ fn note_separator_length_px(raw: i32, available_width: f64, dpi: f64) -> f64 {
     resolved.clamp(0.0, available_width)
 }
 
-/// 현재 FootnoteArea는 다단 각주도 body 전체 폭으로 합쳐 그린다.
-///
-/// 고정 길이(-1/-2)와 양수 HWPUNIT은 그 구조와 무관하게 해석할 수 있지만,
-/// 상대 길이(-3/-4)는 실제 소유 단의 폭/시작점을 알아야 한다. 다단 placement를
-/// 함께 고치기 전까지 상대 sentinel은 기존 1/3 폭을 보존해 범위를 넓히지 않는다.
+/// 각주 프레임이 소유 단 또는 통합 본문의 실제 폭을 전달한다.
 fn footnote_separator_length_px(raw: i32, area_width: f64, dpi: f64) -> f64 {
-    match raw {
-        -3 | -4 => area_width.max(0.0) / 3.0,
-        _ => note_separator_length_px(raw, area_width, dpi),
-    }
+    note_separator_length_px(raw, area_width, dpi)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -464,8 +477,8 @@ fn para_border_can_use_rect_stroke(
 /// 서명/날인 자리를 필요로 하는지 판정했다. 그러나 실측(`samples/복학원서.hwp`
 /// 문단 16)에서 F081C 채움 안에 U+F012B 한 글자가 실제로 섞여 저장돼 있음을 확인했다
 /// — 한컴이 서명/날인 자리를 만들 때 채움 문자 사이에 이 PUA 를 심어 저장하는 게
-/// 원인이다(`issue_937`: U+F012B 는 어디서나 `(인)` 으로 렌더돼야 하는 범용 한컴
-/// 서명/날인 기호). 표 제목 문구는 사용자가 언제든 편집해 사라지지만, 이 PUA 는
+/// 원인이다(U+F012B 는 한컴이 어디서나 타원 안 '인' 한 글자로 그리는 범용 서명/날인
+/// 기호, #8201). 표 제목 문구는 사용자가 언제든 편집해 사라지지만, 이 PUA 는
 /// 문서가 실제로 서명/날인 자리를 저장했다는 구조적 사실 자체라 편집으로 없어지지
 /// 않는다. 10,000건 실 문서 코퍼스에서 이 F081C+F012B 조합을 쓰는 문서는
 /// `samples/복학원서.hwp` 계열 외에 없었다(#4384 조사) — 문구 매칭보다 좁으면 좁았지
@@ -541,8 +554,10 @@ fn receipt_seal_line_text(
     available_width: f64,
 ) -> (String, f64) {
     let mut side_count = (filler_count.saturating_sub(3) / 2).clamp(8, 96);
+    // 가운데 기호는 원 U+F012B 그대로 둔다. 한컴 PDF 도 이 자리에 서명란과 같은
+    // 타원 안 '인' 글리프를 찍으며, 측정·paint 는 합성 기호 경로가 소유한다(#8201).
     let build =
-        |count: usize| -> String { format!("{}(인){}", "-".repeat(count), "-".repeat(count)) };
+        |count: usize| -> String { format!("{}\u{F012B}{}", "-".repeat(count), "-".repeat(count)) };
     let mut text = build(side_count);
     let mut width = estimate_text_width(&text, style);
 
@@ -945,12 +960,67 @@ fn is_deferred_blank_para_float_stack_anchor(
     coanchored_float_count >= 2
 }
 
+/// [#8426] 같은 단에서 비-TAC 표 항목 **뒤에** 같은 host 문단의 글줄 항목이 놓였는지.
+///
+/// typeset 은 host 줄이 표 아래에 있으면 `Table → PartialParagraph` 순서로 남긴다.
+/// 그 조각이 줄 높이·간격을 소비하므로 표 경로는 그 줄 상자를 대체 간격으로 더하지 않는다.
+/// 저장 사다리가 host 줄을 표 **아래**에 두었을 때만 해당한다 — 앞 문단 끝에서 host 줄
+/// 원점까지가 표 높이 이상이어야 한다. 줄이 표 상단과 같은 자리(결재 양식 첫 문단, vpos 0)
+/// 이면 조각이 줄을 다시 쌓지 않으므로 기존 간격 계약을 유지한다.
+fn host_line_item_follows_table(
+    page_content: &PageContent,
+    paragraphs: &[Paragraph],
+    para_index: usize,
+    control_index: usize,
+) -> bool {
+    let Some(para) = paragraphs.get(para_index) else {
+        return false;
+    };
+    let Some(Control::Table(table)) = para.controls.get(control_index) else {
+        return false;
+    };
+    let [host_line] = para.line_segs.as_slice() else {
+        return false;
+    };
+    let previous_end = para_index
+        .checked_sub(1)
+        .and_then(|index| paragraphs.get(index))
+        .and_then(|previous| previous.line_segs.last())
+        .map_or(0, |last| {
+            last.vertical_pos
+                .saturating_add(last.line_height)
+                .saturating_add(last.line_spacing)
+        });
+    let host_below_table =
+        host_line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
+            && i64::from(host_line.vertical_pos) - i64::from(previous_end)
+                >= i64::from(table.common.height);
+    host_below_table
+        && page_content.column_contents.iter().any(|column| {
+            column
+                .items
+                .iter()
+                .position(|item| {
+                    matches!(item, PageItem::Table { para_index: p, control_index: c }
+                    if *p == para_index && *c == control_index)
+                })
+                .is_some_and(|table_at| {
+                    column.items[table_at + 1..].iter().any(|item| {
+                        matches!(item,
+                        PageItem::PartialParagraph { para_index: p, .. }
+                        | PageItem::FullParagraph { para_index: p }
+                            if *p == para_index)
+                    })
+                })
+        })
+}
+
 /// 표 경로의 단일 레벨 (표 → 셀 → 문단)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CellPathEntry {
     /// 문단 내 컨트롤 인덱스 (표)
     pub control_index: usize,
-    /// 표 내 셀 인덱스
+    /// 표의 셀 번호. 도형이면 독립 글상자는 0, 묶음은 원본 깊이 우선 글상자 번호다.
     pub cell_index: usize,
     /// 셀 내 문단 인덱스
     pub cell_para_index: usize,
@@ -1123,36 +1193,6 @@ fn para_has_visible_text(para: &Paragraph) -> bool {
     para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
 }
 
-/// 저장 LINE_SEG가 없는 공백 전용 ViewText 문단에서 첫 RowBreak TAC 표는 한/글이
-/// 좌우 대칭 기본 padding을 표 시작 inset으로 보존한다. PageItem TAC fallback의
-/// 좌표에만 적용해, 저장 줄·후행 표·비대칭 padding의 기존 배치를 유지한다.
-fn viewtext_first_rowbreak_table_left_inset(
-    para: &Paragraph,
-    control_index: usize,
-    table: &crate::model::table::Table,
-    dpi: f64,
-) -> f64 {
-    if crate::renderer::para_has_no_stored_line_segs(para)
-        && !para.text.is_empty()
-        && para.text.chars().all(char::is_whitespace)
-        && control_index == 0
-        && table.common.treat_as_char
-        && matches!(
-            table.page_break,
-            crate::model::table::TablePageBreak::RowBreak
-        )
-        && table.padding.left > 0
-        && table.padding.left == table.padding.right
-    {
-        hwpunit_to_px(
-            i32::from(table.padding.left) + i32::from(table.outer_margin_left),
-            dpi,
-        )
-    } else {
-        0.0
-    }
-}
-
 /// [#7203] 쪽(단) 맨 위에 앉은 어울림(TAC) 표 호스트의 저장 첫 줄 `vertical_pos`(px).
 ///
 /// `LINE_SEG.vertical_pos` 는 문단 기준이 아니라 쪽(단) 상단 기준 절대값이다. 호스트
@@ -1181,10 +1221,11 @@ fn tac_column_top_stored_vpos_px(para: &Paragraph, spacing_before: f64, dpi: f64
     (vpos_px <= spacing_before + 0.5).then_some(vpos_px)
 }
 
-fn para_has_non_whitespace_text(para: &Paragraph) -> bool {
+pub(crate) fn para_has_non_whitespace_text(para: &Paragraph) -> bool {
     para.text
         .chars()
         .any(|c| c > '\u{001F}' && c != '\u{FFFC}' && !c.is_whitespace())
+        || crate::renderer::is_unstored_whitespace_object_host(para)
 }
 
 /// [#5584] 자리차지 표 호스트 문단의 **저장 줄 전부가 표 위**인가.
@@ -1235,7 +1276,7 @@ pub(crate) fn stored_host_lines_precede_float(
 ///
 /// 제어 문자 위치를 못 구하면 `None` 을 돌려 호출부가 첫 줄로 되돌아가게 한다 — 호스트가
 /// 한 줄이면 어느 쪽이든 같은 값이라 종전 계약(#5584 · #1686)은 그대로다.
-fn stored_float_anchor_line_top(
+pub(crate) fn stored_float_anchor_line_top(
     para: &Paragraph,
     control_index: usize,
     stored: &[&crate::model::paragraph::LineSeg],
@@ -1327,6 +1368,37 @@ pub(crate) fn stored_float_anchor_offset_hu(
     (anchor_top - base).max(0)
 }
 
+/// [#8441] 앞 TAC 형제가 줄을 차지한 문단에서 자기 저장 줄에 실린 글자처럼 취급한 그림의
+/// 줄 위치(문단 첫 줄 기준, HU). 같은 쪽에서 앞 줄 뒤로 이어지는 저장 줄 사다리일 때만 쓴다.
+///
+/// 앞 TAC 항목이 문단 원점을 진행된 흐름 y 로 갱신한 뒤 줄 높이 대조로 앞 줄 높이를 다시
+/// 더하면 그림이 앞 줄만큼 두 번 내려간다(156715172 pi=47: 저장 줄1 vpos 4480 → 한컴 그림
+/// 위끝 153.9px, rhwp 220.6px). 저장 사다리가 원점을 정하므로 그 이중 계상이 없다.
+pub(crate) fn stored_tac_picture_line_offset_hu(
+    para: &Paragraph,
+    control_index: usize,
+) -> Option<i32> {
+    if para.stored_text_partition_is_dirty()
+        || para.cell_format_vpos_dirty
+        || para_has_visible_text(para)
+        || !has_line_taking_tac_sibling_before(para, control_index)
+    {
+        return None;
+    }
+    let line = control_line_seg_index(para, control_index).filter(|&line| line > 0)?;
+    let segs = para.line_segs.get(..=line)?;
+    if segs
+        .iter()
+        .any(|seg| seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0)
+    {
+        return None;
+    }
+    let (prev, own) = (&segs[line - 1], &segs[line]);
+    // 쪽 되감김(vpos 리셋)이면 같은 쪽 사다리가 아니다.
+    (own.vertical_pos >= prev.vertical_pos + prev.line_height)
+        .then(|| own.vertical_pos - segs[0].vertical_pos)
+}
+
 /// [#6879] 이 float 보다 **앞에** 줄을 차지하는 TAC 형제가 있는가.
 ///
 /// `#6879` 가 앵커 줄 기준점을 조각 경로 밖(일반 배치·흐름 예약)까지 넓힌 형상은
@@ -1362,6 +1434,82 @@ pub(crate) fn tac_sibling_float_anchor_offset_px(
         return 0.0;
     }
     stored_float_anchor_offset_px(para, table, control_index, dpi)
+}
+
+/// [#8435] 앵커 줄을 밀어낸 자리차지 표의 바깥 상자 안 표 상단(문단 첫 줄 기준 px).
+///
+/// 저장 밴드가 `바깥 위 여백 + 높이 + 바깥 아래 여백` 을 소유하므로 표 상단은 앵커 줄
+/// 자리 + 바깥 위 여백이다(세로 오프셋은 호출부가 더한다). 조판 예약과 layout 이 같은
+/// 값을 소비한다. 형상이 아니면 `None`.
+pub(crate) fn pushed_anchor_line_table_top_px(
+    para: &Paragraph,
+    table: &crate::model::table::Table,
+    control_index: usize,
+    dpi: f64,
+) -> Option<f64> {
+    if table.caption.is_some() || !has_line_taking_tac_sibling_before(para, control_index) {
+        return None;
+    }
+    stored_pushed_anchor_line_offset_hu(
+        para,
+        &table.common,
+        i64::from(table.outer_margin_top) + i64::from(table.outer_margin_bottom),
+        control_index,
+    )
+    .map(|hu| hwpunit_to_px(hu + i32::from(table.outer_margin_top), dpi))
+}
+
+/// [#8435] 앞 TAC 줄 **뒤** 줄에 앵커된 자리차지 개체가 그 앵커 줄을 자기 아래로
+/// 밀어낸 저장 사다리의 개체 원점(문단 첫 줄 기준 HWPUNIT).
+///
+/// 한/글은 개체의 세로 기준을 앵커 줄이 놓일 자리, 곧 앞 줄의 끝
+/// (`vpos + line_height + line_spacing`)으로 잡고 앵커 줄은 개체 아래로 보낸다.
+/// 보도자료 끝머리의 담당 부서 TAC 표(줄0) 뒤 로고 표·글상자(줄1, `vertOffset` 0)가
+/// 그 형상이다 — 156770078 문단 29: 줄0 끝 3448+780 = 4228, 줄1 vpos 8558,
+/// 차이 4330 = 로고 표 바깥 여백 283 + 높이 3764 + 283. 156638890 문단 29: 줄0 끝
+/// 6210+452 = 6662, 줄1 vpos 10895, 차이 4233 = 사각형 높이 4233(여백 0).
+/// 한컴 2022 Print 도 두 개체를 줄0 끝 바로 아래에 그린다.
+///
+/// 저장 간격이 개체 상자(오프셋 + 바깥 여백 + 높이)와 **정확히** 같을 때만 그 밀림의
+/// 증거로 받아들인다. 앵커가 첫 줄이거나 앞 줄이 개체 위에서 끝나는 #6860 형상
+/// (앵커 줄이 밀리지 않음)은 `None` 이라 종전 기준점이 그대로다.
+pub(crate) fn stored_pushed_anchor_line_offset_hu(
+    para: &Paragraph,
+    common: &crate::model::shape::CommonObjAttr,
+    outer_margin_hu: i64,
+    control_index: usize,
+) -> Option<i32> {
+    use crate::model::paragraph::LineSeg;
+    use crate::model::shape::{TextWrap, VertAlign, VertRelTo};
+    let v_off = i64::from(signed_hwpunit(common.vertical_offset));
+    if common.treat_as_char
+        || common.text_wrap != TextWrap::TopAndBottom
+        || common.vert_rel_to != VertRelTo::Para
+        || common.vert_align != VertAlign::Top
+        || v_off < 0
+        || para.stored_text_partition_is_dirty()
+        || para.cell_format_vpos_dirty
+        || para
+            .line_segs
+            .iter()
+            .any(|ls| ls.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0)
+    {
+        return None;
+    }
+    let line = control_line_seg_index(para, control_index)?;
+    let previous = para.line_segs.get(line.checked_sub(1)?)?;
+    let anchor = para.line_segs.get(line)?;
+    if previous.line_spacing < 0 {
+        return None;
+    }
+    let previous_end = i64::from(previous.vertical_pos)
+        + i64::from(previous.line_height)
+        + i64::from(previous.line_spacing);
+    let frame = v_off + outer_margin_hu + i64::from(common.height);
+    if frame <= 0 || i64::from(anchor.vertical_pos) - previous_end != frame {
+        return None;
+    }
+    i32::try_from(previous_end - i64::from(para.line_segs[0].vertical_pos)).ok()
 }
 
 /// [#4610 · #4599 ④] 결재문서 템플릿의 공백-전용 TAC 캐리어 문단 페인트 변위.
@@ -1752,7 +1900,7 @@ fn is_single_noninline_picture_table(table: &crate::model::table::Table) -> bool
         || table.row_count != 1
         || table.col_count != 1
         || table.cells.len() != 1
-        || !matches!(table.page_break, TablePageBreak::RowBreak)
+        || !matches!(table.layout_page_break(), TablePageBreak::RowBreak)
     {
         return false;
     }
@@ -1809,7 +1957,7 @@ fn is_two_row_picture_caption_rowbreak_table(table: &crate::model::table::Table)
 /// 신뢰할 수 있는 그림 표 구조만 통과시킨다.
 fn is_stored_anchor_picture_table(table: &crate::model::table::Table) -> bool {
     !table.common.treat_as_char
-        && matches!(table.page_break, TablePageBreak::RowBreak)
+        && matches!(table.layout_page_break(), TablePageBreak::RowBreak)
         && (is_single_noninline_picture_table(table)
             || is_two_row_picture_caption_rowbreak_table(table))
 }
@@ -1826,7 +1974,7 @@ fn is_single_rowbreak_table_with_trustworthy_declared_height(
         || table.row_count != 1
         || table.col_count != 1
         || table.cells.len() != 1
-        || !matches!(table.page_break, TablePageBreak::RowBreak)
+        || !matches!(table.layout_page_break(), TablePageBreak::RowBreak)
     {
         return false;
     }
@@ -1908,7 +2056,7 @@ pub(crate) fn native_hwp5_internal_reset_rowbreak_first_fragment_saved_top(
         || table.row_count != 1
         || table.col_count != 1
         || table.cells.len() != 1
-        || !matches!(table.page_break, TablePageBreak::RowBreak)
+        || !matches!(table.layout_page_break(), TablePageBreak::RowBreak)
         || para
             .controls
             .iter()
@@ -2454,7 +2602,7 @@ fn textless_host_ladder_line_advance(
 ///
 /// 이 형상의 종전 간격은 `line_spacing` 뿐이다 — `#1133` 이 "빈 앵커 스택의 줄간격은
 /// 표-표 사이 간격"이라고 보존하는 경로이고, `#6147` 의 사다리 증언은
-/// `next_text_paragraph_vpos` 가 **다음 문단에 실제 글자**를 요구해 이 형상에서 침묵한다.
+/// `next_text_paragraph_vpos` 가 **개체를 가진 빈 다음 문단**을 제외해 이 형상에서 침묵한다.
 ///
 /// 그런데 저장 사다리는 그 문단이 줄 상자와 문단 간격까지 전진했다고 증언한다. 임대차
 /// 계약서양식(#7047) 3쪽 표 host 둘이 각각 줄간격만 전진해 아래 개체가 10.0px · 19.3px
@@ -2582,6 +2730,36 @@ fn textless_infront_para_host_requires_line_advance(para: &Paragraph) -> bool {
     })
 }
 
+/// 저장 줄 배치가 전혀 없는 문서(기계 생성 HWPX)에서 빈 host 문단이 글 뒤로(BehindText)
+/// 그림 때문에 줄을 잃지 말아야 하는가.
+///
+/// Why: 법제처 국가법령정보센터 HWPX 는 `linesegarray` 가 없고 첫 문단이 QR 그림(BehindText,
+/// 문단 기준)만 얹은 빈 문단이다. 조판(typeset)은 이 host 의 한 줄(13.3px + 줄간격 4.0px =
+/// 17.3px)을 계상하지만 페인트는 그 줄을 잃는다 — FullParagraph 경로가 BehindText host 를
+/// 전진시키지 않고, 그림 항목도 BehindText 를 "비전진 레거시 경로"로 되돌리기 때문이다. 본문
+/// 전체가 한 줄 위로 올라오고, 독립 한컴 Print PDF 는 본문이 정확히 그 한 줄만큼 아래에서
+/// 시작한다.
+///
+/// 비전진 경로의 근거(`samples/복학원서.hwp`)는 **저장 줄 배치가 있는** 문서의 것이라 건드리지
+/// 않는다. 저장 증거가 전혀 없을 때만(합성 줄 배치 또는 줄 배치 없음) 조판을 따른다.
+/// InFrontOfText 는 이미 전진한 커서를 유지한다.
+///
+/// Pre-condition: `para` 는 `pic` 을 컨트롤로 가진 문단이다.
+/// Post-condition: true 이면 FullParagraph 경로가 host 줄만큼 전진하고, 그림 항목도 그 끝에
+/// 흐름 커서를 둔다.
+fn textless_synthesized_host_keeps_line_for_behind_text_picture(
+    para: &Paragraph,
+    pic: &crate::model::image::Picture,
+) -> bool {
+    let common = &pic.common;
+    !common.treat_as_char
+        && common.text_wrap == TextWrap::BehindText
+        && matches!(common.vert_rel_to, VertRelTo::Para)
+        && !para_has_visible_text(para)
+        && !para_has_visible_inline_control(para)
+        && crate::renderer::para_has_no_stored_line_segs(para)
+}
+
 fn paragraph_line_advance_px(
     para: &Paragraph,
     composed: Option<&ComposedParagraph>,
@@ -2707,17 +2885,17 @@ fn is_tolerated_endnote_column_bottom_bleed_with_limit(
 pub(crate) struct NumberingState {
     /// 현재 활성 numbering_id
     current_id: Option<u16>,
-    /// 수준별 카운터 (0~6 → 1~7수준)
-    counters: [u32; 7],
+    /// 수준별 카운터 (0~9 → 1~10수준)
+    counters: [u32; crate::model::style::NUMBERING_LEVELS],
     /// numbering_id별 카운터 히스토리 ("이전 번호 목록에 이어" 지원)
-    history: std::collections::HashMap<u16, [u32; 7]>,
+    history: std::collections::HashMap<u16, [u32; crate::model::style::NUMBERING_LEVELS]>,
 }
 
 impl NumberingState {
     /// 카운터를 초기 상태로 리셋
     fn reset(&mut self) {
         self.current_id = None;
-        self.counters = [0; 7];
+        self.counters = [0; crate::model::style::NUMBERING_LEVELS];
         self.history.clear();
     }
 
@@ -2727,9 +2905,9 @@ impl NumberingState {
         numbering_id: u16,
         level: u8,
         restart: Option<crate::model::paragraph::NumberingRestart>,
-    ) -> [u32; 7] {
+    ) -> [u32; crate::model::style::NUMBERING_LEVELS] {
         use crate::model::paragraph::NumberingRestart;
-        let level = (level as usize).min(6);
+        let level = (level as usize).min(crate::model::style::NUMBERING_LEVELS - 1);
 
         // numbering_id가 변경되면 현재 카운터를 히스토리에 저장하고
         // 새 numbering_id의 히스토리에서 복원 (없으면 리셋)
@@ -2747,7 +2925,7 @@ impl NumberingState {
             } else {
                 // 처음 등장하는 id → 상위 레벨 카운터 상속, 현재 레벨 이하 리셋
                 let prev = self.counters;
-                self.counters = [0; 7];
+                self.counters = [0; crate::model::style::NUMBERING_LEVELS];
                 self.counters[..level].copy_from_slice(&prev[..level]);
             }
             self.current_id = Some(numbering_id);
@@ -2762,9 +2940,7 @@ impl NumberingState {
                 // 해당 수준의 카운터를 지정 값 - 1로 설정 (advance에서 +1 하므로)
                 self.counters[level] = start.saturating_sub(1);
                 // 하위 수준 리셋
-                for i in (level + 1)..7 {
-                    self.counters[i] = 0;
-                }
+                self.counters[level + 1..].fill(0);
             }
             None => {
                 // 기본: 앞 번호 목록에 이어
@@ -2775,9 +2951,7 @@ impl NumberingState {
         self.counters[level] += 1;
 
         // 하위 수준 리셋
-        for i in (level + 1)..7 {
-            self.counters[i] = 0;
-        }
+        self.counters[level + 1..].fill(0);
 
         self.counters
     }
@@ -3081,30 +3255,62 @@ pub(crate) fn vpos_corrected_end_y(
 /// 논리 1칸씩 증가하지만 HWP `LINE_SEG.text_start`는 컨트롤당 8-unit 원시 스트림을
 /// 보존하므로, 그 단위로 환산해 소유 줄을 고른다.
 pub(crate) fn control_line_seg_index(para: &Paragraph, control_index: usize) -> Option<usize> {
-    match para.line_segs.len() {
-        0 => return None,
-        1 => return Some(0),
-        _ => {}
+    match control_line_seg_index_with_storage(para, control_index, &crate::storage::Unbounded) {
+        Ok(v) => v,
+        Err(never) => match never {},
     }
-    let positions = para.control_text_positions();
-    let p = *positions.get(control_index)?;
-    if para.text.is_empty() && para.char_offsets.is_empty() {
-        let stream_pos = para
-            .empty_control_stream_position(control_index)
-            .map_or_else(|| p.saturating_mul(8), |pos| pos as usize);
-        // [#5961] `stream_pos` 는 컨트롤당 8유닛인 HWP5 축이므로 `text_start` 도 올린다.
-        return para
-            .line_segs
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(idx, _)| para.line_seg_text_start(*idx) as usize <= stream_pos)
-            .map(|(idx, _)| idx)
-            .or(Some(0));
-    }
-    // 같은 논리 문자 뒤의 서로 다른 제어 슬롯도 각자의 원시 줄을 소유한다.
-    // 보이는 문자 위치로 줄 시작을 압축하면 공백 뒤 여러 표가 마지막 줄에 몰린다.
-    crate::renderer::composer::control_slot_line_index(para, control_index)
+}
+
+pub(crate) fn control_line_seg_index_with_storage<S: crate::storage::Storage>(
+    para: &Paragraph,
+    control_index: usize,
+    storage: &S,
+) -> Result<Option<usize>, S::Error> {
+    crate::storage::with_optional(|failure| {
+        match para.line_segs.len() {
+            0 => return None,
+            1 => return Some(0),
+            _ => {}
+        }
+        let positions =
+            crate::storage::optional(para.try_control_text_positions(storage), failure)?;
+        let p = *positions.get(control_index)?;
+        if para.text.is_empty() && para.char_offsets.is_empty() {
+            // [#8507] 완전 대응을 증명하지 못한 스트림(필드 범위 등)은 줄 재조판이 줄 시작을
+            // 매기는 것과 같은 축 — 앞 컨트롤의 제어 슬롯 수 — 으로 센다. 글자 없는 문단의
+            // 논리 위치 `p` 는 모든 컨트롤에서 0 이라, 필드 뒤 다음 줄로 넘긴 표도 첫 줄에 붙었다.
+            let stream_pos = para
+                .empty_control_stream_position(control_index)
+                .map(|pos| pos as usize)
+                .unwrap_or_else(|| {
+                    para.controls[..control_index.min(para.controls.len())]
+                        .iter()
+                        .filter(|control| control.occupies_ctrl_char_slot())
+                        .count()
+                        .saturating_mul(crate::model::control::CTRL_CHAR_CODE_UNITS as usize)
+                        .max(p.saturating_mul(8))
+                });
+            // [#5961] `stream_pos` 는 컨트롤당 8유닛인 HWP5 축이므로 `text_start` 도 올린다.
+            return para
+                .line_segs
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(idx, _)| para.line_seg_text_start(*idx) as usize <= stream_pos)
+                .map(|(idx, _)| idx)
+                .or(Some(0));
+        }
+        // 같은 논리 문자 뒤의 서로 다른 제어 슬롯도 각자의 원시 줄을 소유한다.
+        // 보이는 문자 위치로 줄 시작을 압축하면 공백 뒤 여러 표가 마지막 줄에 몰린다.
+        crate::storage::optional(
+            crate::renderer::composer::control_slot_line_index_with_storage(
+                para,
+                control_index,
+                storage,
+            ),
+            failure,
+        )?
+    })
 }
 
 /// [#7702] 쪽 첫 문단이 합성 줄(`TAG_IMPLEMENTATION_PROPERTY`)로 시작하면 쪽 기준점에서
@@ -3114,24 +3320,75 @@ pub(crate) fn control_line_seg_index(para: &Paragraph, control_index: usize) -> 
 /// 20쪽: 제목 앞 간격 284 HU, 뒤 저장 문단 pi=290 이 3.8px 위로). 저장 줄 경우
 /// (`stored_first_margin_is_page_relative`)와 달리 명시적 쪽 나눔 문단도 포함한다 — 그 20쪽
 /// 제목이 `pageBreak="1"` 문단이고, 한/글 2024 PDF 는 거기서도 앞 간격을 둔다.
-pub(crate) fn synthesized_first_margin_hu(
-    first: &Paragraph,
+/// [#8797] 한/글 저장 줄이어도 첫 vpos 가 앞 간격보다 작으면 그 vpos 는 간격을 담지 못한다.
+/// 이 문단의 마지막 저장 줄 끝 + 뒤 간격 + 다음 문단 앞 간격이 다음 문단 첫 vpos 와 정확히
+/// 닫히면, 원본 사다리가 계상하지 않은 양은 이 첫 문단 앞 간격뿐이다. 흐름은 그 간격을 쪽
+/// 맨 위에 두므로(36392221: 제목 앞 간격 852HU, 저장 vpos 0) 같은 양을 뺀다. 원점이 그대로면
+/// 뒤 단일 저장 개체 줄의 투영이 간격만큼 위로 어긋난다. 사다리가 닫히지 않으면 원본 축의
+/// 의미를 알 수 없으므로 원점을 바꾸지 않는다. vpos 가 간격을 담는 경우는
+/// `stored_first_margin_is_page_relative` 가 먼저 원점 0 으로 처리한다.
+pub(crate) fn unstored_first_margin_hu(
+    paragraphs: &[Paragraph],
+    index: usize,
     styles: &ResolvedStyleSet,
     dpi: f64,
 ) -> i32 {
-    let synthesized = first.line_segs.first().is_some_and(|seg| {
-        seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
-    });
-    if !synthesized {
+    let Some(first) = paragraphs.get(index) else {
         return 0;
-    }
-    styles
-        .para_styles
-        .get(first.para_shape_id as usize)
+    };
+    let Some(seg) = first.line_segs.first() else {
+        return 0;
+    };
+    let style = |para: &Paragraph| styles.para_styles.get(para.para_shape_id as usize);
+    let before = style(first)
         .map(|style| style.spacing_before)
         .filter(|before| *before > 0.5)
         .map(|before| px_to_hwpunit(before, dpi))
-        .unwrap_or(0)
+        .unwrap_or(0);
+    if seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0 {
+        return before;
+    }
+    if seg.vertical_pos >= before {
+        return 0;
+    }
+    let closes_next = || -> Option<bool> {
+        let next = paragraphs.get(index.checked_add(1)?)?;
+        let last = first.line_segs.last()?;
+        let next_seg = next.line_segs.first()?;
+        let stored = |line: &crate::model::paragraph::LineSeg| {
+            line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
+        };
+        if first.stored_text_partition_is_dirty()
+            || next.stored_text_partition_is_dirty()
+            || first.cell_format_vpos_dirty
+            || next.cell_format_vpos_dirty
+            || !first.line_segs.iter().all(stored)
+            || !stored(next_seg)
+            || !first.line_segs.windows(2).all(|pair| {
+                i64::from(pair[0].vertical_pos)
+                    + i64::from(pair[0].line_height)
+                    + i64::from(pair[0].line_spacing)
+                    == i64::from(pair[1].vertical_pos)
+            })
+        {
+            return Some(false);
+        }
+        let after = style(first).map_or(0, |style| px_to_hwpunit(style.spacing_after, dpi));
+        let next_before = style(next).map_or(0, |style| px_to_hwpunit(style.spacing_before, dpi));
+        Some(
+            i64::from(last.vertical_pos)
+                + i64::from(last.line_height)
+                + i64::from(last.line_spacing)
+                + i64::from(after)
+                + i64::from(next_before)
+                == i64::from(next_seg.vertical_pos),
+        )
+    };
+    if closes_next().unwrap_or(false) {
+        before
+    } else {
+        0
+    }
 }
 
 /// 새 쪽으로 이월된 첫 한 줄의 간격을 다음 원본 줄의 새 축에서 확인한다.
@@ -3201,6 +3458,123 @@ pub(crate) fn stored_carried_first_line_margin(
         .then_some(first_style.spacing_before)
 }
 
+/// 쪽 첫 저장 줄의 vpos가 같은 쪽의 쪽·종이 기준 어울림 표 바깥 상자 바닥과 같으면
+/// 그 vpos는 쪽 원점부터의 거리다. 한/글은 쪽 위를 차지한 제목 표 아래에서 첫 줄을
+/// 시작한다. 같은 쪽의 유효한 저장 사다리에서 표를 찾는다. 문단 수는 쪽 경계가
+/// 아니며 명시적 쪽·단 나눔, 저장 줄의 되감김·무효화에서 탐색을 끝낸다.
+/// #7699 의 상단 예약(`stored_square_top_band`)이 맡는 표는 뺀다.
+pub(crate) fn stored_page_square_preserves_source_origin(
+    paragraphs: &[Paragraph],
+    first_index: usize,
+    layout: &PageLayoutInfo,
+    dpi: f64,
+) -> bool {
+    /// 저장 vpos와 상자 바닥이 같다고 볼 허용치(약 2px).
+    const TOLERANCE_HU: i32 = 150;
+    let Some(first_seg) = paragraphs
+        .get(first_index)
+        .and_then(|p| p.line_segs.first())
+    else {
+        return false;
+    };
+    if first_seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+        || first_seg.vertical_pos < 0
+    {
+        return false;
+    }
+    let paper = LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        width: layout.page_width,
+        height: layout.page_height,
+    };
+    let frame = crate::renderer::float_placement::ObjectPlacementFrame {
+        container: &layout.body_area,
+        column: &layout.body_area,
+        body: &layout.body_area,
+        paper: &paper,
+        paragraph_y: layout.body_area.y,
+        alignment: crate::model::style::Alignment::Left,
+        dpi,
+    };
+    let body_top = px_to_hwpunit(layout.body_area.y, dpi);
+    let mut previous = first_seg.vertical_pos;
+    for (index, para) in paragraphs.iter().enumerate().skip(first_index) {
+        if (index != first_index
+            && para.column_type != crate::model::paragraph::ColumnBreakType::None)
+            || para.stored_text_partition_is_dirty()
+            || para.cell_format_vpos_dirty
+            || para.line_segs.is_empty()
+            || para.line_segs.iter().any(|line| {
+                line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+                    || line.line_height <= 0
+            })
+        {
+            break;
+        }
+        let mut same_page = true;
+        for line in &para.line_segs {
+            if line.vertical_pos < previous
+                || line.vertical_pos >= px_to_hwpunit(layout.body_area.height, dpi)
+            {
+                same_page = false;
+                break;
+            }
+            previous = line.vertical_pos;
+        }
+        if !same_page {
+            break;
+        }
+        for control in &para.controls {
+            let Control::Table(table) = control else {
+                continue;
+            };
+            let Some(exclusion) = frame.page_anchored_square_table_exclusion(table) else {
+                continue;
+            };
+            // #7699 가 본문 위를 예약하는 상단 전폭 표는 그 예약이 첫 줄을 표 아래로
+            // 내린다. 원점까지 0 으로 두면 두 번 내려간다.
+            if crate::renderer::float_placement::stored_square_top_band(
+                para,
+                control,
+                &layout.body_area,
+                dpi,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            let first_clears_bottom = first_seg.vertical_pos > TOLERANCE_HU
+                && (exclusion.vertical.end - body_top - first_seg.vertical_pos).abs()
+                    <= TOLERANCE_HU;
+            // 첫 앵커 줄이 원점 0에 남고 다음 저장 줄이 표 아래에서 시작하는
+            // 쪽도 같은 source 축을 쓴다. 쪽마다 달라지는 좌우 여백에서 앵커가
+            // 옆 차선을 쓰더라도, 표를 그린 뒤 후속 줄의 원점을 다시 빼지 않는다.
+            let first_is_page_origin = first_seg.vertical_pos == 0
+                && paragraphs.get(index + 1).is_some_and(|next| {
+                    next.column_type == crate::model::paragraph::ColumnBreakType::None
+                        && !next.stored_text_partition_is_dirty()
+                        && !next.cell_format_vpos_dirty
+                        && next.line_segs.first().is_some_and(|line| {
+                            line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                                == 0
+                                && line.line_height > 0
+                                && line.vertical_pos > first_seg.vertical_pos
+                                && (i64::from(exclusion.vertical.end)
+                                    - i64::from(body_top)
+                                    - i64::from(line.vertical_pos))
+                                .abs()
+                                    <= i64::from(TOLERANCE_HU)
+                        })
+                });
+            if first_clears_bottom || first_is_page_origin {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn para_has_overlay_shape(para: &Paragraph) -> bool {
     use crate::model::shape::{TextWrap, VertRelTo};
     para.controls.iter().any(|c| match c {
@@ -3225,6 +3599,65 @@ pub(crate) fn para_has_overlay_shape(para: &Paragraph) -> bool {
         }
         _ => false,
     })
+}
+
+/// 표를 가진 문단의 표 가로 원점에 쓰는 host 왼쪽 여백(px).
+///
+/// 문단 기준 자리차지 표의 원점은 문단 상자(왼쪽 여백)이다. 첫 줄 들여쓰기·내어쓰기는
+/// 표가 글줄에 참여할 때(글자처럼 취급) 그 표가 소유한 글줄에만 적용한다. 저장 LINE_SEG 의
+/// `TAG_INDENTATION`(bit 20)이 꺼진 첫 줄에는 들여쓰기를 얹지 않으며(#6190), 줄 상자에
+/// 들여쓰기를 얹을 자리가 모자라면 한/글은 들여쓰기를 버린다(#7816).
+/// 온전한 표와 쪽을 넘어 나뉜 표의 조각이 같은 값을 소비한다(#8748).
+pub(crate) fn table_host_margin_left(
+    para: &Paragraph,
+    control_index: usize,
+    table: &crate::model::table::Table,
+    composed: Option<&ComposedParagraph>,
+    (margin_left, indent, margin_right): (f64, f64, f64),
+    col_width: f64,
+    dpi: f64,
+) -> f64 {
+    if !table.common.treat_as_char {
+        return margin_left;
+    }
+    let stored_first_seg_denies_indent = para.line_segs.first().is_some_and(|seg| {
+        seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
+            && seg.tag & crate::model::paragraph::LineSeg::TAG_INDENTATION == 0
+    });
+    let table_owner_line = composed.and_then(|comp| {
+        para.control_text_positions()
+            .get(control_index)
+            .and_then(|position| {
+                comp.lines
+                    .iter()
+                    .rposition(|line| line.char_start <= *position)
+            })
+            .map(|index| (index, comp.lines.len()))
+    });
+    let line_box_width = col_width - margin_left - margin_right;
+    if let Some((index, count)) = table_owner_line {
+        // 표도 자신이 속한 글줄의 들여쓰기·내어쓰기와 저장 플래그를 소비한다.
+        margin_left
+            + crate::renderer::equation_tac_flow::paragraph_line_indent_for_source(
+                indent,
+                index,
+                Some(para),
+                count,
+                true,
+                line_box_width,
+                dpi,
+            )
+    } else if indent > 0.0
+        && !stored_first_seg_denies_indent
+        && crate::renderer::equation_tac_flow::indent_leaves_line_room_hwp(
+            crate::renderer::px_to_hwpunit(indent, dpi),
+            crate::renderer::px_to_hwpunit(line_box_width, dpi),
+        )
+    {
+        margin_left + indent
+    } else {
+        margin_left
+    }
 }
 
 /// [#2019] 문단이 "부동 개체 전용 빈 앵커"인지 — 텍스트가 없고 모든 컨트롤이 부동
@@ -3466,6 +3899,11 @@ pub struct LayoutEngine {
     /// 이 문단은 셀-상단(is_column_top)이고 셀-상대 인덱스>0 이지만, 한컴은 앞 간격
     /// (spacing_before)을 유지하므로 column-top 트림을 우회해 전량 적용한다.
     keep_continuation_column_top_spacing_before: std::cell::Cell<bool>,
+    /// [#7282] 이 쪽에서 둘 이상의 단에 걸친 비-TAC 자리차지 개체들의 저장 틀 높이(HU,
+    /// 높이 + 바깥 위·아래 여백). 한/글은 이 틀이 지나가는 모든 단의 줄을 틀 아래로 밀어
+    /// 저장한다. 앵커가 다른 단에 있어도 문단 안 줄 사이의 저장 vpos 점프가 이 높이와
+    /// 같으면 그 문단의 줄을 저장 vpos 로 놓는다.
+    page_spanning_float_frames: std::cell::RefCell<shape_layout::PageSpanningFloatFrames>,
     /// [#5601] 셀 저장-앵커 스냅이 `para_y = anchored − spacing_before` 로 준비한
     /// 문단에서만 set. 스냅 계약은 composed 가 spacing_before 를 재가산하는 것인데,
     /// Center/Bottom 셀의 column-top 문단은 suppress 플래그가 그 재가산까지 막아
@@ -3487,6 +3925,17 @@ pub struct LayoutEngine {
     /// 하단 고정 틀(#1658/#1858)은 빈 host 라 클램프가 흐름을 넘어도 겹칠 텍스트가
     /// 없지만, 글이 있는 host 는 클램프가 곧 겹침이다.
     para_float_host_has_text: std::cell::Cell<bool>,
+    /// [#8735] 지금 배치하는 문단 기준 자리차지 표의 host 가 공백 글자만 가진 문단이다.
+    /// 이 표의 바깥 상자 원점은 문단 상단이고, 보이는 표 위끝은 그 아래 바깥 위 여백이다.
+    para_float_host_is_whitespace: std::cell::Cell<bool>,
+    /// [#8735] 공백 host 표 뒤에 이어지는 그 host 의 밀린 줄. 저장 사다리는 이 줄을
+    /// 「표 아래끝 + 바깥 아래 여백」에 두므로 문단 앞 간격을 다시 더하지 않는다.
+    whitespace_float_host_line_owner: std::cell::Cell<Option<usize>>,
+    /// [#8735] 공백 host 에 함께 앵커한 자리차지 표들의 바깥 상자
+    /// (host 문단, 문단 상단, 왼쪽, 오른쪽, 바깥 아래 끝). 가로로 겹치는 앞 표만 다음 표를 민다.
+    whitespace_host_frames: std::cell::RefCell<Vec<(usize, f64, f64, f64, f64)>>,
+    /// [#8735] 지금 배치하는 공백 host 표의 (문단 상단, 왼쪽, 오른쪽, 표 앞 흐름 y).
+    whitespace_host_pending_frame: std::cell::Cell<Option<(f64, f64, f64, f64)>>,
     /// [#7063] 이 아이템의 (**저장-vpos 스냅 이전 흐름 커서**, **직전 아이템 내용
     /// 바닥**). 글자 없는 자리차지 표 host 는 스냅이 `spacing_before` 를 사전 차감한
     /// 자리에 그대로 앉는데(#7203 — 조판할 글줄이 없어 재가산 경로를 안 탄다), 저장
@@ -3516,6 +3965,10 @@ pub struct LayoutEngine {
     /// `cell_units_uncached` 안에서 계산되어 52,694 셀 표에서 O(셀²)(≈28억) 로 폭증했다.
     /// `cell_units_cache` 와 동일 조판 경계에서 clear 한다.
     table_nested_text_flag_cache: std::cell::RefCell<std::collections::HashMap<usize, bool>>,
+    /// 중첩 표 본체 높이 — (표 주소, 스타일 주소) 키. `cell_units_cache` 와 같은 경계에서
+    /// 비우고, 셀 편집 무효화 때는 통째로 비운다.
+    nested_table_body_height_cache:
+        std::cell::RefCell<std::collections::HashMap<(usize, usize), f64>>,
     table_row_index_cache: table_rows::TableRowIndexCache,
     /// 셀 안에 든 표(중첩 표)의 포인터. 저장 쪽 되감김 줄간격 트림은 쪽 프레임을 소유하는
     /// 바깥 표에만 쓴다. `cell_units_cache` 와 동일 조판 경계에서 clear 한다.
@@ -3528,6 +3981,7 @@ pub struct LayoutEngine {
     /// cell width. This lives for the layout session and is cleared at the same
     /// source/style invalidation boundary as the other pointer-keyed caches.
     single_line_overflow_cache: super::composer::SingleLineOverflowCache,
+    section_tab_key: std::cell::Cell<u64>,
     /// Issue #2214 test-only: cache miss가 실제 table-wide scan으로 이어진 횟수.
     #[cfg(test)]
     table_nested_text_flag_scan_count: std::cell::Cell<usize>,
@@ -3541,15 +3995,20 @@ mod column_separators;
 mod fill_background;
 mod fixed_textbox_flow;
 mod floating_equation;
+mod footnote_frames;
+mod footnote_marker_geometry;
 mod header_footer_layout;
 mod hidden_paragraph_marker;
+mod nested_table_origin;
 mod note_reference;
+mod note_separator;
 mod paragraph_border;
 mod paragraph_layout;
 mod picture_border;
 mod picture_footnote;
 mod shape_layout;
 mod stored_shape_host;
+mod stored_tac_frame;
 mod table_cell_content;
 mod table_grid_width;
 mod table_host_flow;
@@ -3561,6 +4020,7 @@ mod kopub_symbol_metrics;
 mod leader_tab;
 mod paragraph_frame_widths;
 mod square_host_flow;
+mod table_break_border;
 mod table_partial;
 mod table_rows;
 mod terminal_tracking;
@@ -3571,7 +4031,10 @@ pub(crate) use super::composer::shape_caption_for_layout;
 pub(crate) use paragraph_layout::ensure_min_baseline;
 pub(crate) use paragraph_layout::leading_endnote_prefix_geometry;
 pub(crate) use paragraph_layout::{assign_numbering_markers, list_marker_geometry};
-pub(crate) use shape_layout::normalized_single_line_inline_textbox_host;
+pub(crate) use shape_layout::{
+    normalized_single_line_inline_textbox_host,
+    normalized_single_line_inline_textbox_host_with_storage,
+};
 pub(crate) use table_layout::border_style_has_diagonal;
 pub(crate) use table_layout::SavedZeroOriginWitness;
 pub(crate) use table_partial::cell_crosses_fragment_end;
@@ -3581,11 +4044,14 @@ pub(crate) use table_partial::{PartialTableCellProbe, ProbeCutPlan};
 pub(crate) use terminal_tracking::glyph_letter_spacing_advance;
 pub(crate) use text_measurement::{
     char_width_decision, compute_char_positions, compute_glyph_fit_positions, estimate_text_width,
-    estimate_text_width_exact, estimate_text_width_unrounded, extract_tab_leaders_with_extended,
+    estimate_text_width_exact, estimate_text_width_unrounded,
+    estimate_text_width_unrounded_with_storage, extract_tab_leaders_with_extended,
     find_next_tab_stop, hancom_regenerated_space_width, has_hft_bold_tracking, is_cjk_char,
     is_halfwidth_cjk_quote, kopub_declared_space_em, kopub_space_advance_em,
     resolved_letter_spacing, resolved_to_text_style, split_into_clusters,
-    trace_char_width_decisions, CharWidthDecision,
+    trace_char_width_decisions, try_resolved_to_text_style, verified_source_projection_face,
+    verified_source_projection_text, verified_source_projection_text_with_fallback,
+    CharWidthDecision,
 };
 // [#6060] forces_halfwidth_cjk_quote 는 통합 테스트
 // (tests/cases/issue_6060_cjk_quote_paint_measure_parity.rs) 에서 측정-페인트 정합을
@@ -3677,11 +4143,16 @@ impl LayoutEngine {
                 crate::renderer::render_normalization::RenderNormalizationOverlay::default(),
             )),
             keep_continuation_column_top_spacing_before: std::cell::Cell::new(false),
+            page_spanning_float_frames: std::cell::RefCell::new(Default::default()),
             reapply_snap_anchored_spacing_before: std::cell::Cell::new(false),
             page_top_float_caption_spacing_para: std::cell::Cell::new(None),
             page_top_axis_restart_spacing: std::cell::Cell::new(None),
             confirmed_paragraph_spacing: std::cell::Cell::new(None),
             para_float_host_has_text: std::cell::Cell::new(false),
+            para_float_host_is_whitespace: std::cell::Cell::new(false),
+            whitespace_float_host_line_owner: std::cell::Cell::new(None),
+            whitespace_host_frames: std::cell::RefCell::new(Vec::new()),
+            whitespace_host_pending_frame: std::cell::Cell::new(None),
             item_flow_snap_context: std::cell::Cell::new(None),
             hwpx_page_preview: std::cell::RefCell::new(None),
             declared_trust_allowed: std::cell::Cell::new(true),
@@ -3689,9 +4160,13 @@ impl LayoutEngine {
             nested_table_ptrs: std::cell::RefCell::new(std::collections::HashSet::new()),
             stored_frame_row_plans: std::cell::RefCell::new(std::collections::HashMap::new()),
             table_nested_text_flag_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            nested_table_body_height_cache: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
             table_row_index_cache: Default::default(),
             cursor_probe_block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             single_line_overflow_cache: Default::default(),
+            section_tab_key: Default::default(),
             #[cfg(test)]
             table_nested_text_flag_scan_count: std::cell::Cell::new(0),
         }
@@ -3704,6 +4179,7 @@ impl LayoutEngine {
         self.nested_table_ptrs.borrow_mut().clear();
         self.stored_frame_row_plans.borrow_mut().clear();
         self.table_nested_text_flag_cache.borrow_mut().clear();
+        self.nested_table_body_height_cache.borrow_mut().clear();
         self.table_row_index_cache.clear();
         self.cursor_probe_block_cache.borrow_mut().clear();
         self.single_line_overflow_cache.clear();
@@ -3764,6 +4240,29 @@ impl LayoutEngine {
         self.table_row_index_cache.lookup(table).map_or_else(
             || Self::row_cut_cell_order(table, row),
             |rows| rows.single_by_column(row).to_vec(),
+        )
+    }
+
+    fn indexed_stored_plain_object_row_frame_heights(
+        &self,
+        table: &crate::model::table::Table,
+    ) -> Option<std::sync::Arc<Vec<i32>>> {
+        self.table_row_index_cache.lookup(table).map_or_else(
+            || {
+                crate::renderer::float_placement::stored_plain_object_row_frame_heights(table)
+                    .map(std::sync::Arc::new)
+            },
+            |rows| rows.plain_object_row_frames(),
+        )
+    }
+
+    fn indexed_stored_row_boxes_exceed_object_frame(
+        &self,
+        table: &crate::model::table::Table,
+    ) -> bool {
+        self.table_row_index_cache.lookup(table).map_or_else(
+            || Self::stored_row_boxes_exceed_object_frame(table),
+            |rows| rows.row_boxes_exceed_object_frame(),
         )
     }
 
@@ -3939,6 +4438,12 @@ impl LayoutEngine {
         overlay: std::sync::Arc<crate::renderer::render_normalization::RenderNormalizationOverlay>,
     ) {
         *self.render_normalization.borrow_mut() = overlay;
+    }
+
+    pub(crate) fn set_section_tab_key(&self, key: u64) {
+        if self.section_tab_key.replace(key) != key {
+            self.clear_layout_caches();
+        }
     }
 
     pub(crate) fn set_section_column_spacing_hu(&self, spacing: i32) {
@@ -4469,7 +4974,10 @@ impl LayoutEngine {
         // [#6175] 본문 저장 행 admission의 외부-기하 증거 - 조판이 구역당 한 번
         // 계산하는 것과 **같은 함수·같은 입력**이라 두 경로가 갈리지 않는다.
         *self.body_float_carve_evidence.borrow_mut() =
-            super::float_placement::paper_or_page_float_carve_evidence(paragraphs);
+            super::float_placement::paper_or_page_float_carve_evidence(
+                paragraphs,
+                super::px_to_hwpunit(layout.body_area.y, self.dpi),
+            );
         let mut tree = PageRenderTree::new(
             page_content.page_index,
             layout.page_width,
@@ -4554,7 +5062,7 @@ impl LayoutEngine {
 
         // 단별 콘텐츠 레이아웃
         let mut paper_images: Vec<RenderNode> = Vec::new();
-        self.build_columns(
+        let body_flow_bottoms = self.build_columns(
             tree.frame_mut(),
             &mut body_node,
             &mut paper_images,
@@ -4618,7 +5126,7 @@ impl LayoutEngine {
                 inside_textbox: bool,
             ) {
                 // 배치 bbox는 변환 원점을 소유한다. clip만 실제 채움 경로를 포함한다.
-                let mut cb = super::filled_path_bounds::including_filled_path(node);
+                let mut cb = super::filled_path_bounds::including_shape_ink(node);
                 // 위 밑줄·강조점은 글줄 상자 위로 그려져 첫 줄에서 본문 clip 에 잘린다.
                 // 글자 상자는 캐럿/선택이 쓰므로 키우지 않고 clip 에만 잉크를 합친다.
                 // 글상자 안은 글상자 자체 clip 이 자르므로 반영하지 않는다.
@@ -4727,6 +5235,7 @@ impl LayoutEngine {
             styles,
             layout,
             bin_data_content,
+            &body_flow_bottoms,
         );
 
         // 꼬리말 + 쪽 번호 (감추기 설정 시 건너뜀)
@@ -4873,6 +5382,17 @@ impl LayoutEngine {
         styles: &ResolvedStyleSet,
     ) -> ComposedParagraph {
         let mut comp = crate::renderer::composer::compose_paragraph_in_context(para, styles);
+        // 번호·개요 문단은 본문처럼 번호를 그린다. 번호는 문서 순서로 미리 정해 두었다.
+        // 글머리표는 한/글 인쇄본으로 확인하지 못해 그리지 않는 종전 동작을 둔다.
+        let numbered_head = styles
+            .para_styles
+            .get(para.para_shape_id as usize)
+            .is_some_and(|style| matches!(style.head_type, HeadType::Number | HeadType::Outline));
+        if numbered_head {
+            if let Some(numbered) = self.apply_paragraph_numbering(Some(&comp), para, styles, 0) {
+                comp = numbered;
+            }
+        }
         self.substitute_hf_field_markers(&mut comp, page_number);
         if para.controls.iter().any(|ctrl| {
             matches!(ctrl, Control::AutoNumber(an)
@@ -5026,11 +5546,18 @@ impl LayoutEngine {
             if value == 0 {
                 continue;
             }
-            let value_str = value.to_string();
-            let mut positions = self.auto_number_placeholder_positions(para, an_type);
-            positions.sort_unstable();
-            positions.dedup();
-            replacements.extend(positions.into_iter().map(|pos| (pos, value_str.clone())));
+            // [#8697] 컨트롤의 번호 모양(표 134)과 장식 문자를 본문 쪽번호 필드와 같은
+            // 규칙으로 쓴다. 종전에는 늘 아라비아 숫자여서 로마 숫자 쪽번호가 「5」로 나왔다.
+            for position in Self::resolve_auto_number_placeholder_addresses(para, an_type) {
+                let text = match para.controls.get(position.control_index) {
+                    Some(Control::AutoNumber(number)) => {
+                        crate::renderer::note_marker::page_number_display(number, value)
+                    }
+                    _ => None,
+                }
+                .unwrap_or_else(|| value.to_string());
+                replacements.push((position.source, text));
+            }
         }
         if replacements.is_empty() {
             return;
@@ -5038,14 +5565,6 @@ impl LayoutEngine {
         replacements.sort_unstable_by_key(|(pos, _)| *pos);
         replacements.dedup_by_key(|(pos, _)| *pos);
         Self::replace_composed_chars_with_display(comp, &replacements);
-    }
-
-    fn auto_number_placeholder_positions(
-        &self,
-        para: &Paragraph,
-        an_type: crate::model::control::AutoNumberType,
-    ) -> Vec<usize> {
-        Self::resolve_auto_number_placeholder_positions(para, an_type)
     }
 
     pub(crate) fn resolve_auto_number_placeholder_positions(
@@ -5297,11 +5816,39 @@ impl LayoutEngine {
             footer_area.y + footer_area.height / 2.0
         };
         // 글상자 상단과 기준선을 혼용하지 않고 아래끝에서 기준선 여유를 뺀다.
-        // 독립 한컴 Print의 HFT Type3 글상자는 em=1000, yMin=-200이다.
-        // TTF의 기존 기준선 여유를 HFT에도 쓰면 자동 번호가 약 0.133em 위에 놓인다.
-        // 미수록 TTF는 기존 여유를 유지한다. SFNT 하강 메트릭이 있는 경우
-        // 측정 원본의 값을 쓰며 출력용 대체 face의 메트릭으로 바꾸지 않는다.
-        let descent = if source_hft {
+        band_bottom - Self::page_number_descent(style, source_hft, source_descent_em)
+    }
+
+    /// 위쪽 자동 쪽번호의 최종 글자 기준선이다. 꼬리말 쪽의 거울이다.
+    /// 한컴 Print는 글자 칸(1em)의 위끝을 머리말 밴드의 위끝(위쪽 여백 선)에 두고,
+    /// 머리말 밴드가 없으면 위쪽 여백의 중앙에 둔다. 위쪽 10mm·머리말 30mm는 36.12pt,
+    /// 위쪽 20mm·머리말 15mm는 64.44pt, 위쪽 25mm·머리말 0mm는 43.20pt(10pt 함초롬바탕)다.
+    fn header_page_number_y(
+        header_area: &LayoutRect,
+        style: &TextStyle,
+        source_hft: bool,
+        source_descent_em: Option<f64>,
+    ) -> f64 {
+        let band_top = if header_area.height > 1e-6 {
+            header_area.y
+        } else {
+            header_area.y / 2.0
+        };
+        band_top + style.font_size - Self::page_number_descent(style, source_hft, source_descent_em)
+    }
+
+    /// 자동 쪽번호 글자 칸의 기준선 아래 여유.
+    /// 독립 한컴 Print의 HFT Type3 글상자는 em=1000, yMin=-200이다.
+    /// TTF의 기존 기준선 여유를 HFT에도 쓰면 자동 번호가 약 0.133em 위에 놓인다.
+    /// 미수록 TTF는 기존 여유를 유지한다. SFNT 하강 메트릭이 있는 경우
+    /// 측정 원본의 값을 쓰며 출력용 대체 face의 메트릭으로 바꾸지 않는다.
+    fn page_number_descent(
+        style: &TextStyle,
+        source_hft: bool,
+        source_descent_em: Option<f64>,
+    ) -> f64 {
+        let font_size = style.font_size;
+        if source_hft {
             font_size * 0.2
         } else {
             let face = super::style_resolver::primary_font_name(
@@ -5313,8 +5860,7 @@ impl LayoutEngine {
             let descent_em = source_descent_em
                 .or_else(|| font_metrics_data::win_descent_em(face, style.bold, style.italic));
             font_size * descent_em.unwrap_or(1.0 / 3.0)
-        };
-        band_bottom - descent
+        }
     }
 
     fn page_number_baseline_y(
@@ -5387,9 +5933,6 @@ impl LayoutEngine {
 
                 let top_nodes =
                     create_border_line_nodes(tree.frame_mut(), &borders[2], bx, by, bx + bw, by);
-                for n in top_nodes {
-                    tree.root.children.push(n);
-                }
                 let bottom_nodes = create_border_line_nodes(
                     tree.frame_mut(),
                     &borders[3],
@@ -5398,14 +5941,8 @@ impl LayoutEngine {
                     bx + bw,
                     by + bh,
                 );
-                for n in bottom_nodes {
-                    tree.root.children.push(n);
-                }
                 let left_nodes =
                     create_border_line_nodes(tree.frame_mut(), &borders[0], bx, by, bx, by + bh);
-                for n in left_nodes {
-                    tree.root.children.push(n);
-                }
                 let right_nodes = create_border_line_nodes(
                     tree.frame_mut(),
                     &borders[1],
@@ -5414,7 +5951,18 @@ impl LayoutEngine {
                     bx + bw,
                     by + bh,
                 );
-                for n in right_nodes {
+                for mut n in top_nodes
+                    .into_iter()
+                    .chain(bottom_nodes)
+                    .chain(left_nodes)
+                    .chain(right_nodes)
+                {
+                    if let RenderNodeType::Line(line) = &mut n.node_type {
+                        // 독립 Print의 용지 테두리는 최소 한 장치 픽셀의
+                        // 폭을 유지하면서 원래 분수 좌표에 coverage를 나눈다.
+                        // 표 격자·일반 도형의 기존 화소 중심 정렬과 구분한다.
+                        line.style.preserve_fractional_position = true;
+                    }
                     tree.root.children.push(n);
                 }
             }
@@ -5514,7 +6062,16 @@ impl LayoutEngine {
                 mp_node.layer = Some(RenderLayerInfo::new(None, 0, 0).for_master_page());
                 // 바탕쪽 문단 렌더링: 컨트롤(표/도형/그림)은 compute_object_position으로 배치,
                 // 텍스트 문단은 layout_paragraph로 배치
-                let mut mp_y_offset = paper_area.y;
+                // Master-page plain paragraphs belong to the declared text frame,
+                // whose origin is the page's body margin (as for master column
+                // separators). Paper-relative objects retain paper_area below.
+                let text_area = LayoutRect {
+                    x: body_area.x,
+                    y: body_area.y,
+                    width: hwpunit_to_px(mp.text_width as i32, self.dpi),
+                    height: hwpunit_to_px(mp.text_height as i32, self.dpi),
+                };
+                let mut mp_y_offset = text_area.y;
                 for (pi, para) in mp.paragraphs.iter().enumerate() {
                     let has_controls = !para.controls.is_empty();
                     if has_controls {
@@ -5687,8 +6244,16 @@ impl LayoutEngine {
                                 );
                             }
                         }
-                    } else if !para.text.is_empty() {
-                        // 컨트롤 없는 텍스트 문단: vpos 기반 y 위치 사용
+                    }
+                    // 글이 있는 문단과 빈 문단은 글 영역에 vpos 기준으로 놓는다. 개체만 든 문단은
+                    // 글을 그리지 않고, 글자처럼 취급한 개체가 든 문단은 위 개체 배치가 맡는다.
+                    let lays_text = if has_controls {
+                        !para.text.is_empty()
+                            && !para.controls.iter().any(Control::is_treat_as_char_object)
+                    } else {
+                        true
+                    };
+                    if lays_text {
                         let mut comp =
                             crate::renderer::composer::compose_paragraph_in_context(para, styles);
                         self.substitute_hf_field_markers(&mut comp, page_number);
@@ -5697,7 +6262,7 @@ impl LayoutEngine {
                         // LINE_SEG vpos로 문단 시작 y 결정 (빈 문단 건너뜀 보상)
                         if let Some(first_ls) = para.line_segs.first() {
                             let vpos_y =
-                                paper_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
+                                text_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
                             if vpos_y > mp_y_offset {
                                 mp_y_offset = vpos_y;
                             }
@@ -5708,7 +6273,7 @@ impl LayoutEngine {
                             para,
                             Some(&comp),
                             styles,
-                            &paper_area,
+                            &text_area,
                             mp_y_offset,
                             0,
                             usize::MAX - pi,
@@ -5716,20 +6281,21 @@ impl LayoutEngine {
                             None,
                             None, // 바탕쪽 컨텍스트 — wrap zone 무관
                         );
-                    } else {
-                        // 빈 문단: LINE_SEG vpos로 y 위치 갱신
-                        if let Some(first_ls) = para.line_segs.first() {
-                            let vpos_y =
-                                paper_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
-                            let lh = hwpunit_to_px(first_ls.line_height, self.dpi);
-                            let ls = hwpunit_to_px(first_ls.line_spacing, self.dpi);
-                            mp_y_offset = (vpos_y + lh + ls).max(mp_y_offset);
-                        }
                     }
                 }
                 // Hancom prepares master-page furniture through object order, not raw XML
                 // order: text-wrap plane, zOrder, then stable source index.
                 Self::sort_paper_render_nodes(&mut mp_node.children);
+                if mp.page_front {
+                    // 맨 위로 보내기 바탕쪽의 모든 노드를 본문 위 plane으로 보낸다.
+                    fn mark_front(node: &mut RenderNode) {
+                        if let Some(layer) = node.layer.as_mut().filter(|layer| layer.master_page) {
+                            layer.master_front = true;
+                        }
+                        node.children.iter_mut().for_each(mark_front);
+                    }
+                    mark_front(&mut mp_node);
+                }
                 tree.root.children.push(mp_node);
                 self.current_page_number.set(previous_page_number);
             }
@@ -6081,52 +6647,6 @@ impl LayoutEngine {
         footer_node
     }
 
-    /// 각주 영역 노드를 생성하여 tree에 추가한다.
-    #[allow(clippy::too_many_arguments)]
-    fn build_footnote_area(
-        &self,
-        tree: &mut PageRenderTree,
-        page_content: &PageContent,
-        paragraphs: &[Paragraph],
-        footnote_shape: &FootnoteShape,
-        styles: &ResolvedStyleSet,
-        layout: &PageLayoutInfo,
-        bin_data_content: &[BinDataContent],
-    ) {
-        let mut footnote_layout = layout.clone();
-        if !page_content.footnotes.is_empty() {
-            let fn_height = self.estimate_footnote_area_height(
-                &page_content.footnotes,
-                paragraphs,
-                footnote_shape,
-                styles,
-                layout.body_area.width,
-            );
-            footnote_layout.update_footnote_area(fn_height);
-        }
-
-        if !page_content.footnotes.is_empty() {
-            let fn_id = tree.next_id();
-            let mut fn_node = RenderNode::new(
-                fn_id,
-                RenderNodeType::FootnoteArea,
-                layout_rect_to_bbox(&footnote_layout.footnote_area),
-            );
-
-            self.layout_footnote_area(
-                tree.frame_mut(),
-                &mut fn_node,
-                &page_content.footnotes,
-                paragraphs,
-                styles,
-                &footnote_layout.footnote_area,
-                footnote_shape,
-                bin_data_content,
-            );
-            tree.root.children.push(fn_node);
-        }
-    }
-
     /// 쪽 번호를 렌더링한다.
     fn build_page_number(
         &self,
@@ -6153,6 +6673,7 @@ impl LayoutEngine {
                 pnp.prefix_char,
                 pnp.suffix_char,
                 pnp.dash_char,
+                pnp.user_symbol,
             );
             let target_area = match pnp.position {
                 1..=3 | 7 | 9 => &layout.header_area,
@@ -6170,15 +6691,24 @@ impl LayoutEngine {
             // 쪽번호도 본문과 같은 글자모양을 소비한다. 굵게·장평·자간과
             // 선언 글꼴 메트릭을 빼면 폭 측정과 실제 glyph가 원본 계약을 잃는다.
             // 숫자·장식은 기존과 같이 영문 슬롯(1)의 스타일로 잰 뒤 그대로 칠한다.
+            // HWP3의 8바이트 쪽번호 제어에는 글꼴 지정이 없다. 독립 한컴 Print의
+            // 기본 생성 번호는 Haansoft Batang을 쓴다. 모호한 `바탕` 이름으로 두면
+            // Windows Batang 설치 여부에 따라 다른 줄표 폭·윤곽을 선택한다.
+            // 명시한 쪽번호 스타일은 그대로 우선하며 측정과 paint의 기본 소유자만 맞춘다.
+            let default_font_family = if styles.source_hwp3_native {
+                "Haansoft Batang"
+            } else {
+                "바탕"
+            };
             let mut page_num_style = page_number_style_id
                 .map(|id| resolved_to_text_style(styles, id as u32, 1))
                 .unwrap_or_else(|| TextStyle {
-                    font_family: "바탕".to_string(),
+                    font_family: default_font_family.to_string(),
                     font_size: PAGE_NUMBER_PT * self.dpi / 72.0,
                     ..Default::default()
                 });
             if page_num_style.font_family.is_empty() {
-                page_num_style.font_family = "바탕".to_string();
+                page_num_style.font_family = default_font_family.to_string();
             }
             if page_num_style.font_size <= 0.0 {
                 page_num_style.font_size = PAGE_NUMBER_PT * self.dpi / 72.0;
@@ -6231,8 +6761,7 @@ impl LayoutEngine {
                 _ => target_area.x + (target_area.width - text_width) / 2.0,
             };
 
-            // 자동 꼬리말 쪽번호는 아래쪽 여백 선을 기준으로 배치한다.
-            // 머리말 위치의 기존 실제 글자 배치는 이번 보정 범위 밖이다.
+            // 자동 쪽번호는 아래쪽 여백 선·위쪽 여백 선을 기준으로 배치한다.
             let border_drawn = !page_content
                 .page_hide
                 .as_ref()
@@ -6248,7 +6777,12 @@ impl LayoutEngine {
                     source_descent_em,
                 )
             } else {
-                target_area.y + target_area.height / 2.0 + font_size / 3.0
+                Self::header_page_number_y(
+                    target_area,
+                    &page_num_style,
+                    styles.page_number_font_is_hft,
+                    source_descent_em,
+                )
             };
             // 본문 기준 테두리 경로도 공통 쪽번호 기준선을 사용한다.
             // 종이 기준 테두리·감추기 여부로 별도의 글자 원점을 만들지 않는다.
@@ -6265,9 +6799,9 @@ impl LayoutEngine {
             } else {
                 footer_center
             };
-            // 꼬리말의 줄과 글자 상자는 같은 최종 기준선을 공유한다.
+            // 줄과 글자 상자는 같은 최종 기준선을 공유한다.
             // 글꼴 이름이나 각주 유무에 따른 임시 이동은 적용하지 않는다.
-            let run_y = if is_footer { y - font_size } else { y };
+            let run_y = y - font_size;
 
             let line_id = tree.next_id();
             let mut line_node = RenderNode::new(
@@ -6326,7 +6860,8 @@ impl LayoutEngine {
         layout: &PageLayoutInfo,
         outline_numbering_id: u16,
         wrap_around_paras: &[super::pagination::WrapAroundPara],
-    ) {
+    ) -> footnote_frames::BodyFlowBottoms {
+        let mut body_flow_bottoms = footnote_frames::BodyFlowBottoms::new(layout.body_area.y);
         let mut prev_zone_y_end: f64 = 0.0;
         let mut current_zone_start_y: f64 = 0.0;
         let mut last_zone_y_offset: f64 = -1.0;
@@ -6364,15 +6899,26 @@ impl LayoutEngine {
 
         // 다단 레이아웃: body_area 전체에 걸치는 TopAndBottom 개체의 예약 높이
         // (한 단에만 할당되더라도 모든 단에 적용)
-        let body_wide_reserved: Vec<(usize, f64)> = if page_content.column_contents.len() > 1 {
-            self.calculate_body_wide_shape_reserved(
-                paragraphs,
-                &page_content.column_contents,
-                &layout.body_area,
-            )
-        } else {
-            Vec::new()
-        };
+        // 단 하나짜리 영역이 위아래로 쌓인 쪽(다단 나누기로 1단 영역만 바뀐 쪽)은 단이 나란히
+        // 서지 않으므로 전폭 예약 대상이 아니다. 문단 기준 표를 단 위끝에서 잰 예약이 앞
+        // 본문을 표 높이만큼 밀어낸다.
+        let has_side_by_side_columns = page_content
+            .column_contents
+            .iter()
+            .any(|column| column.column_index > 0);
+        let body_wide_reserved: Vec<(usize, f64)> =
+            if page_content.column_contents.len() > 1 && has_side_by_side_columns {
+                self.calculate_body_wide_shape_reserved(
+                    paragraphs,
+                    &page_content.column_contents,
+                    &layout.body_area,
+                )
+            } else {
+                Vec::new()
+            };
+
+        *self.page_spanning_float_frames.borrow_mut() =
+            self.collect_page_spanning_float_frames(paragraphs, page_content, layout, styles);
 
         for (col_content_idx, col_content) in page_content.column_contents.iter().enumerate() {
             let zone_layout = col_content.zone_layout.as_ref().unwrap_or(layout);
@@ -6508,17 +7054,8 @@ impl LayoutEngine {
                     current_zone_start_y = 0.0;
                 }
                 prev_zone_design_px = new_zone_design;
-                prev_zone_was_solo = new_zone_is_solo_zero
-                    || (new_zone_design > 0.5
-                        && new_zone_first_para
-                            .and_then(|pi| paragraphs.get(pi))
-                            .map(|p| {
-                                p.controls.iter().any(|c| {
-                                    matches!(c,
-                            Control::ColumnDef(cd) if cd.column_count.max(1) <= 1)
-                                })
-                            })
-                            .unwrap_or(false));
+                // 이어진 쪽에는 ColumnDef가 없어도 실제 영역의 단수는 유지된다.
+                prev_zone_was_solo = zone_layout.column_areas.len() == 1;
                 prev_zone_was_multi = zone_layout.column_areas.len() >= 2;
                 last_zone_y_offset = col_content.zone_y_offset;
                 prev_zone_sep_y_end = 0.0;
@@ -6548,7 +7085,7 @@ impl LayoutEngine {
                 *col_area_base
             };
 
-            let (col_node, y_offset) = self.build_single_column(
+            let (col_node, y_offset, body_content_bottom) = self.build_single_column(
                 tree,
                 paper_images,
                 col_content,
@@ -6631,7 +7168,48 @@ impl LayoutEngine {
                     zone_layout.column_areas.len(),
                     self.dpi,
                 ));
-            let y_offset_no_trailing = (y_offset - last_para_trailing_ls).max(0.0);
+            // 수용 판정과 같은 줄 구성의 내용 하단일 때만 새 텍스트 영역과 겹치는 뒤 여백을 제외한다.
+            body_flow_bottoms.record(col_content.column_index, body_content_bottom);
+            let closing_content_bottom = (blank_band_tail.is_none() && apply_trailing_ls_subtract)
+                .then(|| {
+                    let PageItem::FullParagraph { para_index } = col_content.items.last()? else {
+                        return None;
+                    };
+                    let paragraph = paragraphs.get(*para_index)?;
+                    let (_, closing_line_spacing) = super::closing_text_zone_line_metrics(
+                        paragraph,
+                        col_content.computed_paragraphs.get(para_index),
+                        self.dpi,
+                    )?;
+                    let next = page_content.column_contents.get(col_content_idx + 1)?;
+                    if next.zone_y_offset <= col_content.zone_y_offset {
+                        return None;
+                    }
+                    let next_para = match next.items.first()? {
+                        PageItem::FullParagraph { para_index }
+                        | PageItem::PartialParagraph { para_index, .. } => *para_index,
+                        _ => return None,
+                    };
+                    if !super::plain_text_column_zone(
+                        paragraphs,
+                        next_para,
+                        super::declared_column_type_at(paragraphs, *para_index),
+                        styles,
+                    ) {
+                        return None;
+                    }
+                    let after = styles
+                        .para_styles
+                        .get(paragraph.para_shape_id as usize)?
+                        .spacing_after;
+                    let tail = y_offset - body_content_bottom - after;
+                    (tail.abs() < 1e-6 || (tail - closing_line_spacing).abs() < 1e-6)
+                        .then_some(body_content_bottom)
+                })
+                .flatten();
+            let y_offset_no_trailing = closing_content_bottom
+                .unwrap_or(y_offset - last_para_trailing_ls)
+                .max(0.0);
 
             if y_offset_no_trailing > prev_zone_y_end {
                 prev_zone_y_end = y_offset_no_trailing;
@@ -6731,6 +7309,7 @@ impl LayoutEngine {
                 prev_zone_sep_y_end,
             );
         }
+        body_flow_bottoms
     }
 
     /// [Task #866 v2 Stage 3] 단일 zone 의 단 구분선을 emit.
@@ -6853,7 +7432,7 @@ impl LayoutEngine {
         // [#4277] 높이 측정 전용 — paint 트리가 아니라 흐름 상태만 만든다.
         let mut frame = PageLayoutContext::new(0, col_area.width, col_area.y + col_area.height);
         let mut paper_images: Vec<RenderNode> = Vec::new();
-        let (node, y_offset) = self.build_single_column(
+        let (node, y_offset, _) = self.build_single_column(
             &mut frame,
             &mut paper_images,
             &col_content,
@@ -6985,7 +7564,7 @@ impl LayoutEngine {
             layout.page_height,
         );
         let mut paper_images: Vec<RenderNode> = Vec::new();
-        let (_node, y_offset) = self.build_single_column(
+        let (_node, y_offset, _) = self.build_single_column(
             &mut frame,
             &mut paper_images,
             col_content,
@@ -7315,13 +7894,19 @@ impl LayoutEngine {
                 } else {
                     // 이어받는 외곽선은 필요한 면만 그린다. 채우기는 아래 문단별 paint가 소유한다.
                     let mut push_border_line =
-                        |border: &BorderLine, x1: f64, y1: f64, x2: f64, y2: f64| {
-                            if !para_border_is_visible(border) {
+                        |border: &BorderLine,
+                         far_side: bool,
+                         x1: f64,
+                         y1: f64,
+                         x2: f64,
+                         y2: f64| {
+                            if !super::layout::border_rendering::text_border_is_drawn(border) {
                                 return;
                             }
-                            let nodes = super::layout::border_rendering::create_border_line_nodes(
-                                tree, border, x1, y1, x2, y2,
-                            );
+                            let nodes =
+                                super::layout::border_rendering::create_box_border_line_nodes(
+                                    tree, border, far_side, x1, y1, x2, y2,
+                                );
                             for node in nodes {
                                 border_nodes.push(node);
                             }
@@ -7331,13 +7916,13 @@ impl LayoutEngine {
                     let y_top = rect_y;
                     let y_bot = rect_y + rect_h;
                     if let Some(borders) = borders {
-                        push_border_line(&borders[0], x_left, y_top, x_left, y_bot);
-                        push_border_line(&borders[1], x_right, y_top, x_right, y_bot);
+                        push_border_line(&borders[0], false, x_left, y_top, x_left, y_bot);
+                        push_border_line(&borders[1], true, x_right, y_top, x_right, y_bot);
                         if !skip_top {
-                            push_border_line(&borders[2], x_left, y_top, x_right, y_top);
+                            push_border_line(&borders[2], false, x_left, y_top, x_right, y_top);
                         }
                         if !skip_bottom {
-                            push_border_line(&borders[3], x_left, y_bot, x_right, y_bot);
+                            push_border_line(&borders[3], true, x_left, y_bot, x_right, y_bot);
                         }
                     }
                 }
@@ -7433,7 +8018,7 @@ impl LayoutEngine {
         outline_numbering_id: u16,
         wrap_around_paras: &[super::pagination::WrapAroundPara],
         body_wide_reserved: &[(usize, f64)],
-    ) -> (RenderNode, f64) {
+    ) -> (RenderNode, f64, f64) {
         let col_node_id = tree.next_id();
         let mut col_node = RenderNode::new(
             col_node_id,
@@ -7659,6 +8244,25 @@ impl LayoutEngine {
                         )
                     })
         );
+        let page_square_preserves_source_origin = (self.profile.get().hwpx_stored_layout()
+            || self.profile.get().hwp5_stored_pagination_layout())
+            && col_content
+                .items
+                .first()
+                .and_then(|item| match item {
+                    PageItem::FullParagraph { para_index } | PageItem::Table { para_index, .. } => {
+                        Some(*para_index)
+                    }
+                    PageItem::PartialParagraph {
+                        para_index,
+                        start_line: 0,
+                        ..
+                    } => Some(*para_index),
+                    _ => None,
+                })
+                .is_some_and(|first| {
+                    stored_page_square_preserves_source_origin(paragraphs, first, layout, self.dpi)
+                });
         let opening_tac_origin = (col_content.start_height == 0.0
             && !col_content.endnote_flow
             && !self.profile.get().session_edited()
@@ -7674,10 +8278,16 @@ impl LayoutEngine {
             )
         })
         .flatten();
+        // 옵션으로 숨긴 쪽 시작 표식은 저장 좌표의 기준을 소유하지 않는다.
+        // 다음 실제 흐름 요소를 측정과 배치의 원점 선택에 함께 사용한다.
+        let first_flow_item = col_content.items.iter().find(|item| match item {
+            PageItem::FullParagraph { para_index } => {
+                !self.hidden_empty_paras.borrow().contains(para_index)
+            }
+            _ => true,
+        });
         // 첫 문단과 표는 실제 수용에서 확정한 같은 측정 원점을 소비한다.
-        let measured_first_origin = col_content
-            .items
-            .first()
+        let measured_first_origin = first_flow_item
             .and_then(|item| {
                 let para_index = match item {
                     PageItem::FullParagraph { para_index } | PageItem::Table { para_index, .. } => {
@@ -7732,9 +8342,7 @@ impl LayoutEngine {
         } else {
             opening_tac_origin
                 .map(|(_, origin)| origin)
-                .or_else(|| col_content
-            .items
-            .first()
+                .or_else(|| first_flow_item
             .and_then(|item| {
                 match item {
                     PageItem::FullParagraph { .. } | PageItem::PartialParagraph { .. } => {
@@ -7752,6 +8360,7 @@ impl LayoutEngine {
                         });
                         crate::renderer::float_placement::stored_table_column_origin(
                             paragraphs.get(*para_index)?,
+                            paragraphs.get(*para_index + 1),
                             has_host_line,
                             col_content.paragraph_float_placements.get(&(*para_index, *control_index)),
                             self.dpi,
@@ -7782,20 +8391,21 @@ impl LayoutEngine {
                 // vpos(예: 1000HU)는 쪽 원점이 아니다. 도형은 자체 좌표로 그려지고
                 // 뒤따르는 본문은 쪽-상대 vpos를 그대로 따른다. 제목 vpos를
                 // page_base로 빼면 뒤의 문단·표가 그만큼 위로 밀린다.
-                if saved_inline_heading_page || stored_first_margin_is_page_relative_in_column {
+                if saved_inline_heading_page
+                    || stored_first_margin_is_page_relative_in_column
+                    || page_square_preserves_source_origin
+                {
                     0
-                } else if let Some(frame) = col_content.items.first().and_then(|item| match item {
+                } else if let Some(frame) = first_flow_item.and_then(|item| match item {
                     PageItem::FullParagraph { para_index }
                     | PageItem::PartialParagraph { para_index, start_line: 0, .. } =>
                         col_content.stored_column_top_spacings.get(para_index),
                     _ => None,
                 }) {
                     frame.source_origin_hu
-                } else if let Some(PageItem::FullParagraph { para_index }) = col_content.items.first() {
-                    let margin = paragraphs
-                        .get(*para_index)
-                        .map(|first| synthesized_first_margin_hu(first, styles, self.dpi))
-                        .unwrap_or(0);
+                } else if let Some(PageItem::FullParagraph { para_index }) = first_flow_item {
+                    let margin =
+                        unstored_first_margin_hu(paragraphs, *para_index, styles, self.dpi);
                     base - margin
                 } else {
                     base
@@ -7819,6 +8429,29 @@ impl LayoutEngine {
         );
         hcursor.suppress_hwpx_stale_forward = self.profile.get().hwpx_stored_layout();
         hcursor.stored_equation_reflow = self.profile.get().hwp5_container();
+        // 쪽 첫 문단(제목 표 host 포함)이 제목 표 아래에서 시작하면 그 문단도 저장 위치
+        // (쪽 원점 + 첫 vpos)에 둔다.
+        if page_square_preserves_source_origin {
+            if let Some(first_vpos) = col_content
+                .items
+                .first()
+                .and_then(|item| match item {
+                    PageItem::FullParagraph { para_index }
+                    | PageItem::Table { para_index, .. }
+                    | PageItem::PartialParagraph {
+                        para_index,
+                        start_line: 0,
+                        ..
+                    } => Some(*para_index),
+                    _ => None,
+                })
+                .and_then(|first| paragraphs.get(first))
+                .and_then(|para| para.line_segs.first())
+                .map(|seg| seg.vertical_pos)
+            {
+                y_offset = y_offset.max(col_anchor_y + hwpunit_to_px(first_vpos, self.dpi));
+            }
+        }
         // [#5854] 통짜 합성 LINE_SEG 사다리 판정 — 본문 단에서만 갱신한다. 미주 단은
         // `paragraphs` 가 미주 전용 재색인 배열이라 구역 판정의 근거가 아니므로 본문에서
         // 정해진 값을 그대로 이어 쓴다 (조판 경로 `TypesetEngine` 과 같은 구역 단위 값).
@@ -8401,12 +9034,17 @@ impl LayoutEngine {
                 .checked_sub(1)
                 .and_then(|previous| col_content.items.get(previous))
                 .and_then(|previous| {
-                    let PageItem::Table {
-                        para_index: owner,
-                        control_index,
-                    } = previous
-                    else {
-                        return None;
+                    let (owner, control_index) = match previous {
+                        PageItem::Table {
+                            para_index,
+                            control_index,
+                        }
+                        | PageItem::PartialTable {
+                            para_index,
+                            control_index,
+                            ..
+                        } => (para_index, control_index),
+                        _ => return None,
                     };
                     let starts_paragraph = matches!(
                         item,
@@ -8487,6 +9125,7 @@ impl LayoutEngine {
             hcursor.stored_boundary_spacing_before = 0.0;
             if !shape_jumped
                 && !session_fresh_partial_table
+                && !self.hidden_empty_paras.borrow().contains(&item_para)
                 && (!prev_tac_seg_applied
                     || current_is_endnote_question_title
                     || prev_tac_host_sibling_float)
@@ -8550,7 +9189,8 @@ impl LayoutEngine {
             // [#7696] 쪽·종이 기준 자리차지 그림·도형의 밴드가 민 문단은 측정이 확정한 시작
             // (밴드 하단)에서 그린다. 배치는 밴드를 따로 판정하지 않는다 — 측정과 배치가 같은
             // 줄 시작을 써야 쪽 넘김과 그리기가 갈라지지 않는다.
-            if item_is_paragraph {
+            // 표 문단도 측정(`prepare_table_paragraph_column`)이 같은 밴드로 시작을 확정한다.
+            if item_is_paragraph || matches!(item, PageItem::Table { .. }) {
                 if let Some(&start) = col_content.page_band_flow_starts.get(&item_para) {
                     let band_start = col_area.y + start;
                     if band_start > y_offset + 0.5 {
@@ -9105,7 +9745,7 @@ impl LayoutEngine {
                         }
                     }
                 }
-            } else {
+            } else if !self.hidden_empty_paras.borrow().contains(&item_para) {
                 hcursor.prev_layout_para = Some(item_para);
                 hcursor.prev_reissued_equation_rows =
                     composed.get(item_para).is_some_and(|actual| {
@@ -9157,60 +9797,34 @@ impl LayoutEngine {
             }
 
             if item_is_paragraph && !visible_float_exclusions.is_empty() {
-                // [#4613 · #4599 밴드-플로우] 낡은 사다리 전방 스냅 기각 — 한글 2022 는
-                // TopAndBottom 자리차지 표 위 틈에 들어가는 줄을 틈에 배치하는데,
-                // 구세대 한글이 저장한 사다리는 그 줄을 표 아래에 둔 채였다
-                // (36477266 p2: pi5 'ㅇ 사업명' 저장 Δv=259px = 표 아래, 한글 2022
-                // PDF 실측 y=369 = 표 위 틈). 순차 흐름 위치에서 줄 전체가 활성
-                // exclusion 밴드 위에 들어가는 단일 줄 문단을 저장 사다리가 밴드
-                // 안/아래로 보내면, 그 전방 스냅을 기각하고 사다리 base 를 역보정해
-                // 후속 문단의 상대 간격을 유지한다. 서명-한정: hwpx stored layout,
-                // 선행 문단 소유 zone, 단일 저장 seg, 8px 초과 전방 스냅만.
-                if self.profile.get().hwpx_stored_layout() && y_offset > y_before_vpos_adjust + 8.0
-                {
-                    // 잉크 있는(비공백 텍스트) 단일 줄만 — 공백 줄의 밴드 배치는
-                    // PDF 로 관측 불가한 데다, 전화친절도 6460000-202600001 p58 실측
-                    // 에서 공백 줄 기각이 후속 흐름을 −25px 어긋내는 반증이 나왔다.
-                    let single_line_probe = paragraphs.get(item_para).and_then(|p| {
-                        (p.line_segs.len() == 1 && para_has_non_whitespace_text(p))
-                            .then(|| {
-                                p.line_segs
-                                    .first()
-                                    .map(|seg| hwpunit_to_px(seg.line_height, self.dpi))
-                            })
-                            .flatten()
+                // 측정과 같은 판정으로 낡은 사다리의 전방 스냅을 버린다.
+                let previous_line_owner = item_ordinal
+                    .checked_sub(1)
+                    .and_then(|idx| col_content.items.get(idx))
+                    .and_then(|prev_item| match prev_item {
+                        PageItem::FullParagraph { para_index }
+                        | PageItem::PartialParagraph { para_index, .. } => Some(*para_index),
+                        _ => None,
                     });
-                    // 틈이 실제로 비어 있다는 증거 — 직전 렌더 아이템이 zone 소유
-                    // 문단의 줄(호스트 제목/줄)이어야 한다. 페이지/단 상단처럼 틈을
-                    // 이미 다른 항목(호스트 줄 미방출 상태의 표 상단 영역)이 차지한
-                    // 형상에서 기각하면 줄이 그 위에 겹친다(36425171 p4 pi17 실측:
-                    // 정당한 96→297 스냅을 기각해 +24.9px 악화 — 귀책 격리로 좁힘).
-                    let prev_item_is_owner_line = |owner: usize| {
-                        item_ordinal
-                            .checked_sub(1)
-                            .and_then(|idx| col_content.items.get(idx))
-                            .is_some_and(|prev_item| {
-                                matches!(prev_item,
-                                    PageItem::FullParagraph { para_index }
-                                    | PageItem::PartialParagraph { para_index, .. }
-                                        if *para_index == owner)
-                            })
-                    };
-                    if let Some(probe) = single_line_probe {
-                        if probe > 0.0
-                            && visible_float_exclusions.iter().any(|zone| {
-                                zone.blocks_text
-                                    && zone.owner_para < item_para
-                                    && prev_item_is_owner_line(zone.owner_para)
-                                    && y_before_vpos_adjust + probe <= zone.top + 0.5
-                                    && y_offset + 0.5 >= zone.top
-                            })
-                        {
-                            let delta = y_offset - y_before_vpos_adjust;
-                            y_offset = y_before_vpos_adjust;
-                            hcursor.shift_vpos_base_for_rendered_backtrack(delta);
-                        }
-                    }
+                if self.profile.get().hwpx_stored_layout()
+                    && paragraphs.get(item_para).is_some_and(|para| {
+                        crate::renderer::height_cursor::stale_snap_stays_above_band(
+                            para,
+                            item_para,
+                            y_before_vpos_adjust,
+                            y_offset,
+                            visible_float_exclusions
+                                .iter()
+                                .filter(|zone| zone.blocks_text)
+                                .map(|zone| (zone.owner_para, zone.top)),
+                            previous_line_owner,
+                            self.dpi,
+                        )
+                    })
+                {
+                    let delta = y_offset - y_before_vpos_adjust;
+                    y_offset = y_before_vpos_adjust;
+                    hcursor.shift_vpos_base_for_rendered_backtrack(delta);
                 }
                 visible_float_exclusions
                     .retain(|zone| zone.fixed_textbox || y_offset < zone.bottom - 0.5);
@@ -9681,6 +10295,49 @@ impl LayoutEngine {
                         spacing_before,
                         y_offset - col_area.y,
                     );
+                let stored_frame_shared_spacing = if stored_frame_shared_spacing > 0.0 {
+                    stored_frame_shared_spacing
+                } else {
+                    crate::renderer::float_placement::stored_visible_host_successor_spacing(
+                        &col_content.items[..item_ordinal],
+                        paragraphs,
+                        item_para,
+                        spacing_before,
+                        (self.profile.get().hwpx_stored_layout()
+                            || self.profile.get().hwp5_stored_pagination_layout())
+                            && !self.profile.get().session_edited(),
+                        y_offset - col_area.y,
+                        self.dpi,
+                    )
+                };
+                // [#8149] 인증 배치가 없는 빈 host 자리차지 표 상자 뒤도 조판과 같은 소비를 한다.
+                // 소비량은 상자 바닥(스냅 전 흐름 끝)에서 잰다. 저장 줄 스냅이 이미 같은 앞 간격을
+                // 되돌렸으면 다시 빼지 않는다.
+                let stored_frame_shared_spacing = if stored_frame_shared_spacing > 0.0 {
+                    stored_frame_shared_spacing
+                } else {
+                    let absorbed =
+                        crate::renderer::float_placement::empty_host_float_successor_absorbed_spacing_px(
+                            item_ordinal
+                                .checked_sub(1)
+                                .and_then(|index| col_content.items.get(index)),
+                            paragraphs,
+                            item_para,
+                            spacing_before,
+                            (self.profile.get().hwpx_stored_layout()
+                                || self.profile.get().hwp5_stored_pagination_layout())
+                                && !self.profile.get().session_edited(),
+                            self.profile.get().hwpx_container(),
+                            self.profile.get().hwp5_origin_hwpx(),
+                            y_offset - col_area.y,
+                            self.dpi,
+                        );
+                    if absorbed > 0.0 {
+                        (y_offset - (y_before_vpos_adjust - absorbed)).clamp(0.0, absorbed)
+                    } else {
+                        0.0
+                    }
+                };
                 y_offset -= stored_frame_shared_spacing;
                 let shared_spacing =
                     crate::renderer::float_placement::stored_after_partial_table_shared_spacing_px(
@@ -10519,6 +11176,24 @@ impl LayoutEngine {
             let stored_square_host_keeps_page_base = matches!(item, PageItem::Shape { .. })
                 && stored_textless_square_host_line(paragraphs, styles, self.dpi, item_para)
                     .is_some();
+            // 첫 줄이 제목 표 아래에서 시작한 쪽은 쪽 원점이 확정돼 있다. 종이·쪽 기준 제목
+            // 표는 흐름과 무관하게 놓이고, 쪽을 연 제목 표 host 의 개체 줄은 저장 위치에
+            // 있으므로 그 뒤 문단도 같은 원점을 쓴다(조판과 같은 판정).
+            let page_title_table_keeps_page_base = page_square_preserves_source_origin
+                && (matches!(item, PageItem::Table { para_index, control_index }
+                if matches!(
+                    paragraphs.get(*para_index).and_then(|para| para.controls.get(*control_index)),
+                    Some(Control::Table(table))
+                        if !table.common.treat_as_char
+                            && matches!(table.common.text_wrap, TextWrap::Square)
+                            && matches!(table.common.vert_rel_to, VertRelTo::Page | VertRelTo::Paper)
+                )) || matches!(
+                    (item, col_content.items.first()),
+                    (
+                        PageItem::Table { para_index, .. } | PageItem::Shape { para_index, .. },
+                        Some(PageItem::Table { para_index: first, .. }),
+                    ) if para_index == first
+                ));
             if !heading_shape_keeps_page_base
                 && !stored_overlay_host_keeps_page_base
                 && !shape_keeps_host_line_base
@@ -10526,6 +11201,7 @@ impl LayoutEngine {
                 && !opening_tac_keeps_page_base
                 && accepted_tac_frame.is_none()
                 && !stored_square_host_keeps_page_base
+                && !page_title_table_keeps_page_base
                 && (was_tac || (is_table_or_shape && !is_para_float_table && !is_inline_tac_object))
             {
                 hcursor.vpos_page_base = None;
@@ -10663,6 +11339,9 @@ impl LayoutEngine {
                 });
             }
         }
+
+        // 겹친 표·도형의 후처리가 덮어쓰기 전에 마지막 본문 항목의 내용 하단을 확보한다.
+        let body_content_bottom = self.last_item_content_bottom.get();
 
         // 2차 패스: 글상자(Shape) z-order 정렬 후 렌더링
         self.layout_column_shapes_pass(
@@ -10814,7 +11493,7 @@ impl LayoutEngine {
             0,
         );
 
-        (col_node, y_offset)
+        (col_node, y_offset, body_content_bottom)
     }
 
     /// [#4533 ④-a] 비-tac TopAndBottom 자리차지 표의 앵커 줄을 한글은 밴드
@@ -11189,6 +11868,7 @@ impl LayoutEngine {
                                 tree,
                                 col_node,
                                 para,
+                                &para.text,
                                 comp,
                                 styles,
                                 col_area,
@@ -11293,8 +11973,20 @@ impl LayoutEngine {
                                     )
                                     && matches!(cm.vert_rel_to, VertRelTo::Para)
                             });
+                        // [#7905] 글 뒤로(BehindText) 그림 host 도 저장 증거가 없으면 같은 길을
+                        // 간다 — typeset 은 그 줄을 계상하는데(`dump-pages`: pi=0 h=17.3) 페인트만
+                        // 0 으로 두면 본문 전체가 한 줄 위로 올라온다(법제처 HWPX 첫 문단: QR 그림).
+                        // 그림 항목이 흐름 커서를 되돌리지 않는 짝 규칙은 `layout_shape_item`.
+                        let no_stored_ladder_behind_text_picture_host = ladder_verdict.is_none()
+                            && para.controls.iter().any(|c| {
+                                matches!(c, Control::Picture(pic)
+                                if textless_synthesized_host_keeps_line_for_behind_text_picture(
+                                    para, pic,
+                                ))
+                            });
                         let advance_line = ladder_verdict.unwrap_or_else(|| {
                             no_stored_ladder_square_host
+                                || no_stored_ladder_behind_text_picture_host
                                 || textless_infront_para_host_requires_line_advance(para)
                         });
                         if advance_line {
@@ -11703,13 +12395,15 @@ impl LayoutEngine {
                                     .get(para.para_shape_id as usize)
                                     .map(|s| (s.spacing_before, s.spacing_after))
                                     .unwrap_or((0.0, 0.0));
-                                // 단 상단 문단은 한컴이 `sb` 를 트림한다(`is_column_top`)
-                                // — `layout_paragraph` 도 그렇게 놓으므로 여기서 더하면
-                                // 되레 어긋난다. 단 아래로 흐른 문단에만 더한다.
+                                // 저장 첫 줄이 앞 간격을 입증해 typeset이 보존한
+                                // 프레임은 단 상단에서도 같은 값을 소비한다. 프레임이
+                                // 없으면 기존 단 상단 간격 제거 계약을 유지한다.
                                 let sb_applied = if para_start > col_area.y + 0.5 {
                                     sb.max(0.0)
                                 } else {
-                                    0.0
+                                    ctx.stored_column_top_spacings
+                                        .get(para_index)
+                                        .map_or(0.0, |frame| frame.before)
                                 };
                                 let shape_bottom = para_start + sb_applied + effective_h;
                                 if shape_bottom > y_offset {
@@ -11739,10 +12433,41 @@ impl LayoutEngine {
                                                     .get(*para_index + 1)
                                                     .and_then(|next| next.line_segs.first())
                                                     .is_some_and(|next| {
-                                                        i64::from(next.vertical_pos)
-                                                            - i64::from(seg.vertical_pos)
-                                                            == i64::from(seg.line_height)
-                                                                + i64::from(seg.line_spacing)
+                                                        // [#8149] 사다리 경계는 `줄 + 줄간격 + 이
+                                                        // 문단 아래 간격 + 다음 문단 위 간격` 이다.
+                                                        // 문단 간격이 있어도 줄간격 전진은 같다
+                                                        // (한글문서파일형식 21쪽 pi=140: 18340 + 15255
+                                                        // + 628 + 700 + 500 = 35423).
+                                                        let line_advance =
+                                                            i64::from(seg.line_height)
+                                                                + i64::from(seg.line_spacing);
+                                                        let gap = i64::from(next.vertical_pos)
+                                                            - i64::from(seg.vertical_pos);
+                                                        let next_before = paragraphs
+                                                            .get(*para_index + 1)
+                                                            .and_then(|next_para| {
+                                                                styles.para_styles.get(
+                                                                    next_para.para_shape_id
+                                                                        as usize,
+                                                                )
+                                                            })
+                                                            .map_or(0, |style| {
+                                                                i64::from(px_to_hwpunit(
+                                                                    style.spacing_before.max(0.0),
+                                                                    self.dpi,
+                                                                ))
+                                                            });
+                                                        let own_after = i64::from(px_to_hwpunit(
+                                                            sa.max(0.0),
+                                                            self.dpi,
+                                                        ));
+                                                        gap == line_advance
+                                                            || (gap
+                                                                - (line_advance
+                                                                    + own_after
+                                                                    + next_before))
+                                                                .abs()
+                                                                <= 2
                                                     }) =>
                                         {
                                             hwpunit_to_px(seg.line_spacing, self.dpi)
@@ -11830,6 +12555,10 @@ impl LayoutEngine {
                         return (y_offset, false);
                     }
 
+                    let accepted_composition = ctx.host_compositions.get(para_index);
+                    let source_comp = accepted_composition
+                        .map(std::sync::Arc::as_ref)
+                        .or_else(|| composed.get(*para_index));
                     // TAC 블록 표 문단의 post-text PP: 텍스트가 공백만이면 건너뜀
                     // (Table PageItem에서 이미 y_offset이 결정됨)
                     if prev_tac_seg_applied {
@@ -11843,8 +12572,11 @@ impl LayoutEngine {
                                     t, seg_width, para))
                         });
                         if has_tac_block {
-                            let pp_text_only_ws = if let Some(comp) = composed.get(*para_index) {
-                                comp.lines[*start_line..*end_line].iter().all(|line| {
+                            let pp_text_only_ws = if let Some(comp) = source_comp {
+                                // 쪽 나눔이 정한 줄 범위가 현재 조합 줄 수보다 길 수 있다. 남은 줄만 본다.
+                                let end = (*end_line).min(comp.lines.len());
+                                let start = (*start_line).min(end);
+                                comp.lines[start..end].iter().all(|line| {
                                     line.runs.iter().all(|r| {
                                         r.text.chars().all(|c| {
                                             c.is_whitespace() || c <= '\u{001F}' || c == '\u{FFFC}'
@@ -11856,30 +12588,29 @@ impl LayoutEngine {
                             };
                             // 가시 글자가 없어도 표와 다른 저장 줄은 자기 높이·간격을 소유한다.
                             // 실제 TAC 소유 줄의 끝 뒤에서 시작하는 원본 꼬리는 표 밴드의 사본이 아니다.
-                            let independent_stored_tail = para
-                                .line_segs
-                                .get(*start_line..*end_line)
-                                .filter(|segs| !segs.is_empty())
-                                .is_some_and(|segs| {
-                                    segs.iter().all(|seg| {
-                                        seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
-                                            && seg.line_height > 0
-                                    }) && para.controls.iter().enumerate().all(|(ci, control)| {
-                                        if !matches!(control, Control::Table(table) if table.common.treat_as_char) {
-                                            return true;
-                                        }
-                                        control_line_seg_index(para, ci)
-                                            .filter(|line| *line < *start_line)
-                                            .and_then(|line| para.line_segs.get(line))
-                                            .is_some_and(|host| {
-                                                i64::from(segs[0].vertical_pos)
-                                                    >= i64::from(host.vertical_pos)
-                                                        + i64::from(host.line_height)
-                                                        + i64::from(host.line_spacing)
-                                            })
+                            let independent_stored_tail = stored_tac_frame::independent_stored_tail(
+                                para,
+                                *start_line,
+                                *end_line,
+                            );
+                            // 저장 줄이 없는 host도 프레임이 표와 꼬리 기준 문자를
+                            // 서로 다른 물리 줄에 배정했으면 그 줄의 전진을 보존한다.
+                            // 같은 가시 char_start를 가진다는 이유로 표 줄과 합치지 않는다.
+                            let independent_composed_tail = accepted_composition.is_some_and(|comp| {
+                                comp.lines.get(*start_line..*end_line)
+                                    .is_some_and(|lines| !lines.is_empty() && lines.iter().all(|line| line.line_height > 0))
+                                    && comp.control_line_indices(para).is_some_and(|owners| {
+                                        para.controls.iter().enumerate().all(|(ci, control)| {
+                                            !matches!(control, Control::Table(table) if table.common.treat_as_char)
+                                                || (comp.frame_owns_inline_table(ci)
+                                                    && owners.get(ci).is_some_and(|owner| *owner < *start_line))
+                                        })
                                     })
-                                });
-                            if pp_text_only_ws && !independent_stored_tail {
+                            });
+                            if pp_text_only_ws
+                                && !independent_stored_tail
+                                && !independent_composed_tail
+                            {
                                 // 같은 개체 줄의 공백 캐리어는 이미 소비한 표 높이를 더하지 않는다.
                                 return (y_offset, true);
                             }
@@ -11892,10 +12623,6 @@ impl LayoutEngine {
                         .para_styles
                         .get(para.para_shape_id as usize)
                         .is_some_and(|style| style.head_type == HeadType::Bullet);
-                    let accepted_composition = ctx.host_compositions.get(para_index);
-                    let source_comp = accepted_composition
-                        .map(std::sync::Arc::as_ref)
-                        .or_else(|| composed.get(*para_index));
                     let comp = if *start_line == 0 || continuation_bullet {
                         let numbered = self.apply_paragraph_numbering(
                             source_comp,
@@ -12070,6 +12797,7 @@ impl LayoutEngine {
                     y_offset,
                 );
                 self.table_push_floor.set(None);
+                self.para_float_host_is_whitespace.set(false);
                 return out;
             }
             PageItem::PartialTable {
@@ -12195,26 +12923,23 @@ impl LayoutEngine {
             self.dpi,
         );
         let center_y = y_offset + geometry.center_offset;
-        if geometry.width > 0.0 {
-            let (dash, line_type) = super::line_style::hwp_line_type(line_type);
+        if geometry.width > 0.0 && super::note_separator::has_ink(color) {
             let sep_length = note_separator_length_px(separator_length, col_area.width, self.dpi);
-            let line_id = tree.next_id();
-            let sep_line = LineNode::new(
-                col_area.x,
-                center_y,
-                col_area.x + sep_length,
-                center_y,
-                LineStyle {
-                    color,
-                    width: geometry.width,
-                    dash,
-                    line_type,
-                    ..Default::default()
-                },
-            );
-            let sep_bbox = sep_line.ink_bbox();
-            let line_node = RenderNode::new(line_id, RenderNodeType::Line(sep_line), sep_bbox);
-            col_node.children.push(line_node);
+            let border = crate::model::style::BorderLine {
+                line_type: border_rendering::border_line_type_from_code(line_type),
+                width: line_width_raw,
+                color,
+            };
+            col_node
+                .children
+                .extend(border_rendering::create_border_line_nodes(
+                    tree,
+                    &border,
+                    col_area.x,
+                    center_y,
+                    col_area.x + sep_length,
+                    center_y,
+                ));
         }
         y_offset + geometry.advance
     }
@@ -12295,6 +13020,7 @@ impl LayoutEngine {
                         // as pagination, including hosts with caption text.
                         super::typeset::fit_measured_for_host(
                             para,
+                            paragraphs.get(para_index + 1),
                             t,
                             Some(measured),
                             self.dpi,
@@ -12340,52 +13066,16 @@ impl LayoutEngine {
             let alignment = para_style.map(|s| s.alignment).unwrap_or(Alignment::Left);
             let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
             let indent = para_style.map(|s| s.indent).unwrap_or(0.0);
-            // [Issue #6190] 저장 LINE_SEG 의 `TAG_INDENTATION`(bit 20)이 꺼진 첫 줄에는
-            // 들여쓰기를 얹지 않는다 — `paragraph_layout` 의 본문 줄과 같은 계약이다.
-            // 이 계약이 없으면 표 호스트 문단이 들여쓰기만큼 밀려 표가 용지 밖으로
-            // 나간다(156458354 3쪽: 표 우변 829.8, 용지 793.7).
-            let stored_first_seg_denies_indent = para.line_segs.first().is_some_and(|seg| {
-                seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
-                    && seg.tag & crate::model::paragraph::LineSeg::TAG_INDENTATION == 0
-            });
-            let table_owner_line = composed.get(para_index).and_then(|comp| {
-                para.control_text_positions()
-                    .get(control_index)
-                    .and_then(|position| {
-                        comp.lines
-                            .iter()
-                            .rposition(|line| line.char_start <= *position)
-                    })
-                    .map(|index| (index, comp.lines.len()))
-            });
             let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
-            // [#7816] 줄 상자에 들여쓰기를 얹을 자리가 모자라면 한/글은 들여쓰기를 버린다.
-            let line_box_width = col_area.width - margin_left - margin_right;
-            let effective_margin =
-                if let Some((index, count)) = table_owner_line.filter(|_| t.common.treat_as_char) {
-                    // 표도 자신이 속한 글줄의 들여쓰기·내어쓰기와 저장 플래그를 소비한다.
-                    margin_left
-                        + crate::renderer::equation_tac_flow::paragraph_line_indent_for_source(
-                            indent,
-                            index,
-                            Some(para),
-                            count,
-                            true,
-                            line_box_width,
-                            self.dpi,
-                        )
-                } else if t.common.treat_as_char
-                    && indent > 0.0
-                    && !stored_first_seg_denies_indent
-                    && crate::renderer::equation_tac_flow::indent_leaves_line_room_hwp(
-                        crate::renderer::px_to_hwpunit(indent, self.dpi),
-                        crate::renderer::px_to_hwpunit(line_box_width, self.dpi),
-                    )
-                {
-                    margin_left + indent
-                } else {
-                    margin_left
-                };
+            let effective_margin = table_host_margin_left(
+                para,
+                control_index,
+                t,
+                composed.get(para_index),
+                (margin_left, indent, margin_right),
+                col_area.width,
+                self.dpi,
+            );
             // 여백·이동이 반영된 표 원점과 원래 문단 앵커를 구분한다.
             let _host_scope =
                 self.reflow_block_host_scope(true, col_area.x + effective_margin, para_y_for_table);
@@ -12449,7 +13139,7 @@ impl LayoutEngine {
             };
             let note_advance: f64 = table_note_references
                 .iter()
-                .map(|reference| reference.4)
+                .map(|reference| reference.width)
                 .sum();
             // 저장 줄 없는 빈 host 의 전폭 어울림 표: typeset 과 같은 helper 로 표 상단과
             // 표 아래 host 줄을 정한다.
@@ -12658,15 +13348,7 @@ impl LayoutEngine {
                 // 바깥 여백이 이미 들어 있다고 간주하지 않고 개체 여백을 별도로 더한다.
                 let om_l = hwpunit_to_px(t.outer_margin_left as i32, self.dpi);
                 let om_r = hwpunit_to_px(t.outer_margin_right as i32, self.dpi);
-                let base_x = col_area.x
-                    + effective_margin
-                    + leading
-                    + om_l
-                    + if computed_own_line {
-                        0.0
-                    } else {
-                        viewtext_first_rowbreak_table_left_inset(para, control_index, t, self.dpi)
-                    };
+                let base_x = col_area.x + effective_margin + leading + om_l;
                 // [Issue #291] ParaShape align 반영:
                 // TAC 표가 inline_shape_position 미설정 상태에서 단/문단 좌측에
                 // 붙어버리는 회귀를 막는다. ParaShape align=Right 인 경우 표를
@@ -12869,7 +13551,7 @@ impl LayoutEngine {
                         if self.profile.get().hwp5_origin_hwpx()
                             && !is_current_empty_square_sibling_float
                             && is_para_topbottom_float(&t.common)
-                            && matches!(t.page_break, TablePageBreak::None)
+                            && matches!(t.layout_page_break(), TablePageBreak::None)
                         {
                             return hwpunit_to_px(t.outer_margin_top as i32, self.dpi);
                         }
@@ -12916,6 +13598,9 @@ impl LayoutEngine {
                             para_y_for_table - col_area.y - spacing_before,
                             spacing_before,
                             mt.map_or(declared_height, |measured| measured.total_height),
+                            // 조판이 정한 배치가 없을 때의 출력 폴백이다. 앞 간격 흡수 판정(#8149)은
+                            // 조판(`entry.rs`)이 앞 항목으로 정하므로 여기서는 종전대로 받는다.
+                            true,
                             self.dpi,).map(|placement| col_area.y + placement.table_top)
                     });
                     let stored_flow_advance = stored_top.and_then(|_| {
@@ -13024,6 +13709,16 @@ impl LayoutEngine {
             }
             let mut table_visual_shift = 0.0;
             let mut table_y_end = y_offset;
+            // 어울림 표 옆 차선에서 뒤 문단이 시작하면 흐름은 표 높이로 전진하지 않는다.
+            // 조판(typeset)과 같은 저장 차선 판정을 소비한다.
+            let successor_starts_beside_table =
+                crate::renderer::float_placement::square_successor_starts_beside_table(
+                    para,
+                    paragraphs
+                        .get(para_index + 1)
+                        .and_then(crate::renderer::float_placement::stored_line_lane_probe),
+                    t,
+                );
             if renders_outside_body {
                 let tmp_id = tree.next_id();
                 let mut tmp_node = RenderNode::new(
@@ -13115,6 +13810,10 @@ impl LayoutEngine {
                     // typeset의 확정 결과에는 앵커와 바깥 여백이 이미 포함된다.
                     // legacy 호스트 높이/제목/앵커 보정을 다시 실행하지 않는다.
                     col_area.y + placement.table_top
+                } else if let Some(placement) = flow_placement {
+                    // 수용한 줄 pen이 표 원점의 소유자다. 뒤의 저장 줄·회피·캡션
+                    // 폴백이 같은 원점을 다시 해석하지 않도록 이 경로에서 확정한다.
+                    col_area.y + placement.y + hwpunit_to_px(t.outer_margin_top as i32, self.dpi)
                 } else {
                     let table_y_start =
                         if let Some((_, _, _, lane_top, _, _)) = para_float_lane_info {
@@ -13239,6 +13938,17 @@ impl LayoutEngine {
                             if zone.fixed_textbox {
                                 continue;
                             }
+                            // [#8516] 같은 host 의 앞 표와 가로로 겹치지 않는 공동 앵커 표는 그
+                            // 표의 밴드로 내려가지 않고 자기 오프셋에 나란히 놓인다(조판과 짝).
+                            if zone.owner_para == para_index
+                                && is_textless_coanchored_float_host(para)
+                                && !crate::renderer::float_placement::coanchored_float_overlaps_preceding_horizontally(
+                                    para,
+                                    control_index,
+                                )
+                            {
+                                continue;
+                            }
                             if natural_top + 0.5 >= zone.top && natural_top < zone.bottom {
                                 // 빈-host(text 없는) float 은 자기 offset 이 선행 exclusion 에
                                 // 흡수되어 표끼리 붙는다. zone 하단 아래로 그 offset 만큼 띄워
@@ -13327,8 +14037,10 @@ impl LayoutEngine {
                     // 같은 문단 앵커를 공유하고 선행 float exclusion 으로 함께 같은 y 까지 밀리므로,
                     // 작은 offset 은 흡수되어 둘이 겹친다. 제목이 그려지는 위치(선행 exclusion 아래로
                     // 밀린 para 흐름) + 제목 줄높이 아래로 표를 내려 겹침을 막는다. 큰 offset 으로 표가
-                    // 이미 더 아래면 max 라 영향 없다.
+                    // 이미 더 아래면 max 라 영향 없다. 글 없는 공동 앵커도 위의 배제 경로를
+                    // 공유하지만, 실제 제목은 없으므로 이 줄 높이 예약은 적용하지 않는다.
                     let table_y_start = if is_current_visible_para_float
+                        && para_has_non_whitespace_text(para)
                         && signed_hwpunit(t.common.vertical_offset) > 0
                         && !crate::renderer::float_placement::visible_host_text_flows_below_offset_float(
                             para,
@@ -13410,8 +14122,13 @@ impl LayoutEngine {
                     } else {
                         None
                     };
-                let table_y_start = if is_tac && inline_pos.is_none() {
+                let table_y_start = if is_tac && inline_pos.is_none() && flow_placement.is_none() {
+                    // 확정된 줄 원점에는 그 줄까지의 오프셋이 이미 포함되어 있다.
                     stored_empty_full_band_tac_table_top(para, control_index, t, col_area, self.dpi)
+                        .or_else(|| {
+                            composed_empty_host_tac_line_offset(para, control_index, self.dpi)
+                                .map(|offset| table_y_start + offset)
+                        })
                         .unwrap_or(table_y_start)
                 } else {
                     table_y_start
@@ -13591,7 +14308,7 @@ impl LayoutEngine {
                     && is_current_empty_para_float
                     && !is_current_empty_square_sibling_float
                     && is_para_topbottom_float(&t.common)
-                    && matches!(t.page_break, TablePageBreak::RowBreak)
+                    && matches!(t.layout_page_break(), TablePageBreak::RowBreak)
                     && t.row_count == 1
                     && t.col_count == 1
                     && t.cells.len() == 1
@@ -13701,13 +14418,7 @@ impl LayoutEngine {
                     flow_y
                 } else if paper_page_square_empty_top.is_some() {
                     table_y_before
-                } else if crate::renderer::float_placement::square_successor_starts_beside_table(
-                    para,
-                    paragraphs
-                        .get(para_index + 1)
-                        .and_then(crate::renderer::float_placement::stored_line_lane_probe),
-                    t,
-                ) {
+                } else if successor_starts_beside_table {
                     // 표 원점 이동은 개체의 배타 영역이다. 표 옆 후속 줄의 흐름을
                     // 표 높이로 덮어쓰기 전에 같은 저장 차선 결과를 소비한다.
                     table_y_before
@@ -14195,7 +14906,12 @@ impl LayoutEngine {
                     para_index,
                     wrap_around_paras,
                     table_y_before,
-                    y_offset,
+                    // 표 옆 차선의 흐름 커서는 표 위끝에 머문다. 옆 문단 범위는 표 아래끝이다.
+                    if successor_starts_beside_table {
+                        y_offset.max(table_y_end)
+                    } else {
+                        y_offset
+                    },
                     wrap_text_x,
                     wrap_text_width,
                     strip_x,
@@ -14395,6 +15111,22 @@ impl LayoutEngine {
                 .saturating_sub(table.outer_margin_top as i32);
             (delta_hu > 0).then(|| hwpunit_to_px(delta_hu as i32, self.dpi))
         });
+        // 머리 표 아래에 저장된 host 줄의 글자처럼 취급한 표는 조판과 같은 저장 줄 위끝에서 시작한다.
+        // 앞 표의 pen 은 표의 바깥 아래 여백을 지나지 않는다.
+        if is_current_tac
+            && para_start_y
+                .get(&para_index)
+                .is_some_and(|start| (start - col_area.y).abs() <= 0.5)
+        {
+            if let Some(top) = paragraphs.get(para_index).and_then(|para| {
+                crate::renderer::float_placement::stored_inline_host_line_top_below_float(
+                    para,
+                    paragraphs.get(para_index + 1),
+                )
+            }) {
+                y_offset = y_offset.max(col_area.y + hwpunit_to_px(top, self.dpi));
+            }
+        }
         let y_offset_before_tac_in_front_decoration_shift = y_offset;
         if let Some(shift) = tac_in_front_decoration_line_shift {
             y_offset += shift;
@@ -14404,10 +15136,14 @@ impl LayoutEngine {
             // 남겨야 한다. 그렇지 않으면 표까지 본문 높이만큼 함께 아래로 이동한다.
             para_start_y.insert(para_index, anchor_y);
         } else if let Some(existing_y) = para_start_y.get(&para_index) {
-            // A preceding host fragment owns the paragraph origin; advancing
-            // the table cursor does not create a new origin for its later row.
+            // 앞 호스트 조각의 문단 원점은 뒤 개체 줄의 pen과 별개다.
+            // 확정한 줄 프레임은 표 배치가 직접 소비하며 공동 앵커를 다시 쓰지 않는다.
             if tac_in_front_decoration_line_shift.is_none()
                 && is_current_tac
+                && !ctx
+                    .inline_placements
+                    .get(&(para_index, control_index))
+                    .is_some_and(|placement| placement.owns_vertical_frame())
                 && self.table_push_floor.get().is_none()
                 && y_offset > *existing_y + 1.0
                 && !tac_line_fits_above_offset_float
@@ -14488,8 +15224,13 @@ impl LayoutEngine {
             {
                 para_y_for_table = col_area.y + placement.anchor_y;
             } else if let Some(Control::Table(t)) = para.controls.get(control_index) {
+                // [#8435] 앵커 줄을 밀어낸 표는 그 줄 자리 + 바깥 위 여백에서 시작한다.
+                // 문단 기준 자리차지 표의 y 계산은 바깥 위 여백을 더하지 않으므로 여기서 함께 옮긴다.
                 let anchor_offset =
-                    tac_sibling_float_anchor_offset_px(para, t, control_index, self.dpi);
+                    pushed_anchor_line_table_top_px(para, t, control_index, self.dpi)
+                        .unwrap_or_else(|| {
+                            tac_sibling_float_anchor_offset_px(para, t, control_index, self.dpi)
+                        });
                 if anchor_offset > 0.0 {
                     para_y_for_table += anchor_offset;
                 }
@@ -14512,6 +15253,62 @@ impl LayoutEngine {
                 .unwrap_or(false);
             self.para_float_host_has_text
                 .set(is_current_visible_para_float);
+            // [#8735] 공백만 있는 host 의 문단 기준 자리차지 표. 빈 host(글자 없음)도 글 host
+            // (공백 아닌 글자)도 아니어서 아래 「표 위 간격」의 마지막 갈래가 문단 앞 간격을
+            // 흐름에 더했고, 그 흐름이 표의 push-down 바닥(`y_start`)이 되어 표가 앞 간격만큼
+            // 내려갔다. 문단 기준 자리차지 개체의 원점은 문단 상단이며 앞 간격은 표가 민
+            // 글줄에 붙는다(#7203·#7330; 1741000-202200045 7쪽: 한/글 표 위끝 208.4, 종전
+            // 226.4). 분류 자체(빈/글 host)는 바꾸지 않는다 — 공백 host 를 글 host 경로로
+            // 보내면 캡션·오프셋 처리까지 바뀌어 다른 문서가 후퇴한다.
+            let is_current_whitespace_para_float = para.controls.get(control_index).is_some_and(
+                |c| matches!(c, Control::Table(t) if is_para_topbottom_float(&t.common)),
+            ) && para_has_visible_text(para)
+                && !para_has_non_whitespace_text(para);
+            self.para_float_host_is_whitespace
+                .set(is_current_whitespace_para_float);
+            // [#8735] 같은 공백 host 의 표들은 문단 상단을 공통 원점으로 쓰고, 가로로 겹치는
+            // 앞 표의 바깥 아래 끝만 push 바닥이 된다. 저장 사다리는 겹치는 표만 쌓는다 —
+            // 156564488 1쪽(가로 겹침 셋): 16381 = 3560 + 3363 + 9458, 1190000-200700032 1쪽
+            // (나란한 둘): 5527 = 141 + 5245 + 141(앞 표만).
+            self.whitespace_host_pending_frame.set(None);
+            if is_current_whitespace_para_float {
+                if let Some(Control::Table(t)) = para.controls.get(control_index) {
+                    let width_px = hwpunit_to_px(signed_hwpunit(t.common.width), self.dpi);
+                    let placement_ctx =
+                        super::float_placement::FloatPlacementContext::new(**col_area)
+                            .with_body_area(layout.body_area)
+                            .with_paper_width(layout.page_width);
+                    let (left, right) = super::float_placement::horizontal_range(
+                        &t.common,
+                        width_px,
+                        placement_ctx,
+                        self.dpi,
+                    );
+                    let mut frames = self.whitespace_host_frames.borrow_mut();
+                    frames.retain(|frame| frame.0 == para_index);
+                    // host 자기 줄이 표보다 먼저 배치된 경우에도 그 줄은 표가 미는 줄이지 표의
+                    // 바닥이 아니다(1130000-200400010 1쪽: 줄 4090 = 375 + 283 + 3149 + 283).
+                    let para_top = frames.first().map(|frame| frame.1).unwrap_or_else(|| {
+                        para_start_y
+                            .get(&para_index)
+                            .copied()
+                            .filter(|top| *top <= y_offset)
+                            .unwrap_or(y_offset)
+                    });
+                    let flow_before = y_offset;
+                    y_offset = frames
+                        .iter()
+                        .filter(|frame| right > frame.2 + 0.5 && left < frame.3 - 0.5)
+                        .map(|frame| frame.4)
+                        .fold(para_top, f64::max);
+                    self.whitespace_host_pending_frame.set(Some((
+                        para_top,
+                        left,
+                        right,
+                        flow_before,
+                    )));
+                }
+            }
             let is_first_empty_para_float_control = is_current_empty_para_float
                 && para.controls.iter().position(|c| {
                     matches!(
@@ -14607,6 +15404,114 @@ impl LayoutEngine {
                                     } if *pi == para_index && *end_line == host_text_line_count)
                                 })
                             });
+                        // [#8778] 앞 줄 항목 없이 표가 자기 문단 원점에 놓이는데 저장 사다리가 표
+                        // 줄을 문단 첫 줄 아래에 두었으면(누름틀 시작만 든 줄 등), 표는 그 저장 줄
+                        // 차이만큼 아래다. 조판은 그 줄 전진을 이미 문단 높이에 셌다 — 쪽 맨 위
+                        // 문단에서는 저장 vpos 로 표 줄을 잡아 줄 앞 항목이 없어 그 차이를 잃었다.
+                        if !host_text_precedes
+                            && host_text_line_count > 0
+                            && para_start_y
+                                .get(&para_index)
+                                .is_some_and(|start| (*start - y_offset).abs() < 0.5)
+                            && (self.profile.get().hwp5_stored_pagination_layout()
+                                || self.profile.get().hwpx_stored_layout())
+                        {
+                            // 앞 줄에 글자처럼 놓인 개체가 있으면 그 줄은 표 줄과 같은 흐름 줄 상자를
+                            // 쓰므로 저장 줄 차이로 표를 내리지 않는다.
+                            let prefix_has_inline_object =
+                                para.controls.iter().enumerate().any(|(ci, control)| {
+                                    let inline = match control {
+                                        Control::Table(t) => t.common.treat_as_char,
+                                        Control::Picture(p) => p.common.treat_as_char,
+                                        Control::Shape(s) => s.common().treat_as_char,
+                                        Control::Equation(e) => e.common.treat_as_char,
+                                        _ => false,
+                                    };
+                                    inline
+                                        && control_line_seg_index(para, ci)
+                                            .is_some_and(|line| line < host_text_line_count)
+                                });
+                            // 앞 줄에 보이는 글자가 있으면 그 줄은 문단 글줄 배치가 그리고 전진한다
+                            // (합성 날인선 filler 등). 이 보정은 그리지 않는 줄(빈칸·누름틀 시작뿐)의
+                            // 자리만 잇는다.
+                            let prefix_has_visible_text =
+                                composed.get(para_index).is_some_and(|comp| {
+                                    comp.lines.iter().take(host_text_line_count).any(|line| {
+                                        line.runs.iter().any(|run| {
+                                            run.text.chars().any(|c| {
+                                                c > '\u{001F}'
+                                                    && c != '\u{FFFC}'
+                                                    && !c.is_whitespace()
+                                            })
+                                        })
+                                    })
+                                });
+                            // 표 높이를 담은 저장 줄이 앞 줄에 있으면 그 줄이 표 자신의 줄이다 —
+                            // 컨트롤 줄 귀속이 뒤 개체 줄로 밀린 경우라 앞 줄 차이는 없다.
+                            let table_height_hu = match para.controls.get(control_index) {
+                                Some(Control::Table(t)) => t.common.height as i32,
+                                _ => 0,
+                            };
+                            let prefix_holds_table_row = table_height_hu > 0
+                                && para.line_segs[..host_text_line_count]
+                                    .iter()
+                                    .any(|seg| seg.text_height >= table_height_hu);
+                            // 저장 사다리는 재계산 전 원본 vpos 로 읽는다(재계산은 쪽 리셋을 지운다).
+                            let source_vpos = |p: &Paragraph, line: usize| {
+                                p.source_line_seg_vertical_pos
+                                    .as_ref()
+                                    .and_then(|v| v.get(line).copied())
+                                    .or_else(|| p.line_segs.get(line).map(|s| s.vertical_pos))
+                            };
+                            let rows: Option<Vec<i32>> = (0..=host_text_line_count)
+                                .map(|line| source_vpos(para, line))
+                                .collect();
+                            let table_seg = &para.line_segs[host_text_line_count];
+                            let offset = rows.as_ref().and_then(|rows| {
+                                let synthetic = para.line_segs[..=host_text_line_count]
+                                    .iter()
+                                    .any(|seg| seg.tag & 0x8000_0000 != 0);
+                                // 저장 쪽 리셋이 앞 줄과 표 줄 사이에 있으면 앞 줄은 앞 쪽에 남았다.
+                                let increasing = rows.windows(2).all(|w| w[1] > w[0]);
+                                let offset = rows[host_text_line_count] - rows[0];
+                                // 리셋이 표 줄 뒤(다음 문단 앞)에 있을 때, 다음 문단 첫 줄에서 표 줄
+                                // 전진을 뺀 값이 0 이상이면 표 줄은 다음 문단과 같은 새 쪽에 있고 그 값이
+                                // 쪽 안 위치다. 그 위치가 앞 줄 차이보다 위면 표 줄만 새 쪽 맨 위로
+                                // 넘어갔고 앞 줄은 앞 쪽에 남았다. 음수면 표 줄은 앞 줄과 같은 쪽에서
+                                // 끝나고 다음 문단부터 새 쪽이다.
+                                let table_row_on_prefix_page = paragraphs
+                                    .get(para_index + 1)
+                                    .and_then(|next| source_vpos(next, 0))
+                                    .filter(|next| *next < rows[host_text_line_count])
+                                    .is_none_or(|next| {
+                                        let table_top =
+                                            next - (table_seg.line_height + table_seg.line_spacing);
+                                        table_top < 0 || table_top >= offset
+                                    });
+                                (!prefix_has_inline_object
+                                    && !prefix_has_visible_text
+                                    && !prefix_holds_table_row
+                                    && !synthetic
+                                    && increasing
+                                    && table_row_on_prefix_page)
+                                    .then_some(offset)
+                            });
+                            if let (Some(offset), Some(rows)) = (offset, rows.as_ref()) {
+                                // 표 줄은 흐름 원점에서 앞 줄 차이만큼 아래다. 다만 저장 첫 줄의 쪽 안
+                                // 위치가 흐름과 맞으면(#6598 과 같은 4px) 표 줄의 저장 위치가 상한이다 —
+                                // 앞 줄 자리를 앞 개체(떠 있는 표 등)가 정해 흐름 원점이 저장보다 아래면
+                                // 차이를 더한 위치가 저장 표 줄을 지나친다.
+                                let para_start = y_offset;
+                                y_offset += hwpunit_to_px(offset, self.dpi);
+                                let stored_first = col_area.y + hwpunit_to_px(rows[0], self.dpi);
+                                if (stored_first - para_start).abs() <= 4.0 {
+                                    y_offset = y_offset.min(
+                                        col_area.y
+                                            + hwpunit_to_px(rows[host_text_line_count], self.dpi),
+                                    );
+                                }
+                            }
+                        }
                         if host_text_precedes
                             && (self.profile.get().hwp5_stored_pagination_layout()
                                 || self.profile.get().hwpx_stored_layout())
@@ -14623,12 +15528,32 @@ impl LayoutEngine {
                                     segs[host_text_line_count].vertical_pos - segs[0].vertical_pos,
                                     self.dpi,
                                 );
-                                let flowed: f64 = segs[..host_text_line_count]
-                                    .iter()
-                                    .map(|seg| {
-                                        hwpunit_to_px(seg.line_height + seg.line_spacing, self.dpi)
-                                    })
-                                    .sum();
+                                // 흐른 양은 앞 PartialParagraph 가 실제로 그린 줄 전진이다. 저장
+                                // `line_height` 는 줄 밖 개체(글앞 표 등)의 높이를 담을 수 있어
+                                // 그린 줄 높이와 다르다(09142 pi=4: lh 25325, 글자 높이 1100).
+                                let drawn_lines = composed
+                                    .get(para_index)
+                                    .and_then(|comp| comp.lines.get(..host_text_line_count));
+                                let flowed: f64 = match drawn_lines {
+                                    Some(lines) => lines
+                                        .iter()
+                                        .map(|line| {
+                                            hwpunit_to_px(
+                                                line.line_height + line.line_spacing,
+                                                self.dpi,
+                                            )
+                                        })
+                                        .sum(),
+                                    None => segs[..host_text_line_count]
+                                        .iter()
+                                        .map(|seg| {
+                                            hwpunit_to_px(
+                                                seg.line_height + seg.line_spacing,
+                                                self.dpi,
+                                            )
+                                        })
+                                        .sum(),
+                                };
                                 let correction = stored - flowed;
                                 // 저장 사다리와 흐름이 줄 하나 넘게 갈리면 다른 축이다.
                                 let one_line = hwpunit_to_px(segs[0].line_height, self.dpi);
@@ -14657,7 +15582,7 @@ impl LayoutEngine {
                         // 3.8px 위로 앉아 직전 표 괘선과 4.2px 겹친다 (156505870
                         // 연달은 자리차지 표 4개 중 2~4번째, 한글 이중 괘선 간격
                         // 0.4px vs rhwp 4.3px).
-                        if Self::tac_stored_band_is_outer_box(para, t)
+                        if Self::tac_stored_band_is_captioned_outer_box(para, t)
                             || crate::renderer::para_has_no_stored_line_segs(para)
                         {
                             y_offset += hwpunit_to_px(t.outer_margin_top as i32, self.dpi);
@@ -14670,9 +15595,14 @@ impl LayoutEngine {
                         // sb 20) 대비 19.8px 위, 9쪽 연속 host 4개(sb 6.7px)는 표당
                         // ~sb 씩 계단 누적. 같은 문단 안의 후속 TAC(vpos 델타 전진이
                         // 간격을 이미 담음)와 구분하기 위해 첫 컨트롤로 한정한다.
+                        // [#8149] HWP5 저장본도 같다 — 저장 사다리가 앞 TAC host 뒤에 이 문단의 위
+                        // 간격을 둔다(한글문서파일형식 25쪽 pi=166→167: 5438 + 15368 + 600 + 500 =
+                        // 21906). 조판은 이 간격을 이미 전진에 넣으므로 배치만 빠뜨려 표마다
+                        // 6.67px 씩 위로 누적됐다.
                         if control_index == 0
                             && !is_column_top
                             && (self.profile.get().hwpx_stored_layout()
+                                || self.profile.get().hwp5_stored_pagination_layout()
                                 || crate::renderer::para_has_no_stored_line_segs(para))
                             && t.common.treat_as_char
                             && matches!(
@@ -14699,7 +15629,18 @@ impl LayoutEngine {
                     }
                 } else if !is_current_empty_para_float
                     && !is_current_visible_para_float
+                    && !is_current_whitespace_para_float
                     && !host_before_consumed
+                    // [#8836] 쪽·용지 기준 자리차지 표도 흐름 커서로 놓이지 않는다. 여기서 더한
+                    // 앞 간격은 host 글줄만 밀고, 그 글줄의 배치가 앞 간격을 다시 소비한다 —
+                    // 위 #6267 과 같은 이중 계상이다(표가 민 첫 줄은 조판이 확정한 남은 앞 간격).
+                    && !matches!(
+                        para.controls.get(control_index),
+                        Some(Control::Table(table))
+                            if crate::renderer::float_placement::is_absolute_topbottom_float_text_host(
+                                para, table,
+                            )
+                    )
                 {
                     // [#6267] 자리차지(para-float) 표는 흐름을 소비하지 않고
                     // compute_table_y_position 이 sb 이전 앵커(para_y_for_table)로
@@ -14853,13 +15794,36 @@ impl LayoutEngine {
             } else {
                 false
             };
-            if !tac_seg_applied && !is_outside_body && !is_current_visible_para_float {
+            // [#8735] 공백 host 의 표 뒤에는 host 자기 줄(PartialParagraph)이 이어진다. 저장
+            // 사다리는 그 줄을 「표 아래끝 + 바깥 아래 여백」에 둔다(6500000-201700118 58쪽:
+            // 42327 = 35080 + 1417 + 5264 + 566). 표를 줄처럼 보고 뒤 간격·줄간격을 더하지 않는다.
+            if is_current_whitespace_para_float && !tac_seg_applied && !is_outside_body {
+                if let Some(Control::Table(t)) = para.controls.get(control_index) {
+                    y_offset += hwpunit_to_px(t.outer_margin_bottom as i32, self.dpi);
+                }
+                self.whitespace_float_host_line_owner.set(Some(para_index));
+                if let Some((para_top, left, right, flow_before)) =
+                    self.whitespace_host_pending_frame.take()
+                {
+                    let mut frames = self.whitespace_host_frames.borrow_mut();
+                    frames.retain(|frame| frame.0 == para_index);
+                    frames.push((para_index, para_top, left, right, y_offset));
+                    // host 줄은 모든 표 아래로 밀린다. 이미 그린 앞 흐름도 되돌리지 않는다.
+                    y_offset = frames
+                        .iter()
+                        .map(|frame| frame.4)
+                        .fold(y_offset.max(flow_before), f64::max);
+                }
+            } else if !tac_seg_applied && !is_outside_body && !is_current_visible_para_float {
                 let comp = composed.get(para_index);
                 let para_style_id = comp
                     .map(|c| c.para_style_id as usize)
                     .unwrap_or(para.para_shape_id as usize);
                 if let Some(para_style) = styles.para_styles.get(para_style_id) {
-                    if para_style.spacing_after > 0.0 && (is_tac || !host_after_consumed) {
+                    if para_style.spacing_after > 0.0
+                        && (is_tac || !host_after_consumed)
+                        && ctx.tac_text_tail_spacing_after(para_index).is_none()
+                    {
                         y_offset += para_style.spacing_after;
                     }
                 }
@@ -14869,8 +15833,14 @@ impl LayoutEngine {
                 // 표-표 사이 간격이므로 HWP처럼 보존한다.
                 let next_is_empty_topbottom_table_anchor = paragraphs
                     .get(para_index + 1)
-                    .map(para_is_empty_topbottom_table_anchor)
-                    .unwrap_or(false);
+                    .is_some_and(|next| {
+                        para_is_empty_topbottom_table_anchor(next)
+                            && !(self.profile.get().hwp5_stored_pagination_layout()
+                                && !self.profile.get().session_edited()
+                                && crate::renderer::stored_float_anchor::stored_anchor_successor_rewinds(
+                                    para, next,
+                                ))
+                    });
                 let suppress_empty_anchor_spacing =
                     is_current_empty_para_float && !next_is_empty_topbottom_table_anchor;
                 let reflow_host_tail = para.controls.get(control_index).and_then(|control| {
@@ -14881,6 +15851,17 @@ impl LayoutEngine {
                         para, table, comp, styles, self.dpi,
                     )
                 });
+                // [#8426] 비-TAC 표 뒤의 host 저장 줄을 typeset 이 별도 문단 조각으로 남겼으면 그 조각이
+                // 자기 줄 높이·간격을 소비한다. 아래 '줄간격 ≤ 0 이면 줄 높이' 대체 간격은 그 줄
+                // 상자 자체이므로 같은 줄을 한 번 더 세게 된다(30396 9쪽: 공백 host 줄 lh 1300·
+                // ls -132 → 표 뒤 17.3px + 조각 15.6px). 양수 줄간격은 기존 계약대로 둔다.
+                let host_line_item_follows = !is_tac
+                    && host_line_item_follows_table(
+                        page_content,
+                        paragraphs,
+                        para_index,
+                        control_index,
+                    );
                 if let Some(seg) = para
                     .line_segs
                     .last()
@@ -14949,10 +15930,41 @@ impl LayoutEngine {
                         self.dpi,
                         para_index,
                     );
+                    // [#8554] 쪽·용지 기준 자리차지 표는 host 줄과 따로 놓인다. 빈 host 줄이
+                    // 저장 자리에서 그 표 띠에 걸려 띠 아래로 밀렸으면 그 줄은
+                    // 표가 대신한 줄이 아니라 띠 아래의 독립 줄이다 — 줄높이와 줄간격을 모두
+                    // 전진한다(조판 `pre_lines_h` 와 같은 값). 2913671 별지 1쪽: 표 띠 아래끝
+                    // 298.0 + 34.7 = 한컴 「2.」 332.7, 종전 줄간격만 315.3.
+                    let host_line_below_absolute_band = !is_tac
+                        && !para_has_visible_text(para)
+                        && para.line_segs.len() == 1
+                        && match para.controls.get(control_index) {
+                            Some(Control::Table(table)) => {
+                                crate::renderer::float_placement::absolute_topbottom_table_band_bottom_px(
+                                    table,
+                                    layout.body_area.y,
+                                    layout.body_area.height,
+                                    self.current_page_height.get(),
+                                    self.dpi,
+                                )
+                                .is_some_and(|band_bottom| {
+                                    // 저장 host 줄 위끝이 띠 아래끝 위(띠에 걸림)이고, 이 항목이
+                                    // 띠 아래끝에서 시작해야 「밀린 줄」이다. 저장 위치부터 띠 아래인
+                                    // 줄은 사다리 자리 그대로라 이 규칙의 대상이 아니다.
+                                    let stored_top = col_area.y
+                                        + hwpunit_to_px(seg.vertical_pos, self.dpi);
+                                    stored_top + 0.5 < band_bottom
+                                        && tac_table_y_before + 0.5 >= band_bottom
+                                })
+                            }
+                            _ => false,
+                        };
                     let gap = if square_reserved_above {
                         // [#4533 ⑥] 위-예약 Square: 앵커·후속 문단 vpos 가 동일
                         // (붕괴 사다리) — 후행 간격도 사다리가 0 으로 증언한다.
                         0
+                    } else if host_line_below_absolute_band {
+                        seg.line_height.max(0) + seg.line_spacing.max(0)
                     } else if let Some(ladder_gap) = stored_anchor_stack_gap {
                         ladder_gap
                     } else if suppress_empty_anchor_spacing {
@@ -14961,6 +15973,8 @@ impl LayoutEngine {
                         seg.line_spacing.max(0)
                     } else if seg.line_spacing > 0 {
                         seg.line_spacing
+                    } else if host_line_item_follows {
+                        0
                     } else {
                         seg.line_height
                     };
@@ -14985,13 +15999,20 @@ impl LayoutEngine {
                     // 표 하단보다 훨씬 위인 저장 위치는 재배치 또는 표 높이 변화일 수
                     // 있으므로 간격을 없애는 근거로 쓰지 않는다. 기존 0.5px 환산 오차만
                     // 양방향으로 허용하며, 근거가 불충분하면 종전 간격을 유지한다.
+                    //
+                    // [#8567] 어울림 표가 뒤 문단을 표 옆 띠로 흡수했으면 흐름상 다음 문단은
+                    // 마지막 흡수 문단 뒤다. 띠 끝(`square_wrap_paras_source_bottom`)이 이미
+                    // 그 문단의 저장 위치까지 흐름을 옮겼으므로 같은 사다리 판정을 그 문단으로 한다.
+                    let ladder_next_index =
+                        Self::square_wrap_flow_successor(wrap_around_paras, para_index)
+                            .unwrap_or(para_index + 1);
                     let ladder_already_at_flow = self.profile.get().hwp5_stored_pagination_layout()
                         && para
                             .line_segs
                             .first()
                             .zip(
                                 paragraphs
-                                    .get(para_index + 1)
+                                    .get(ladder_next_index)
                                     .and_then(|next| next.line_segs.first()),
                             )
                             .is_some_and(|(host_first, next_first)| {
@@ -15208,14 +16229,34 @@ impl LayoutEngine {
                 // 확정되므로, 여기서 줄간격을 다시 더하면 이중 적용된다(test_521: 이메일
                 // 박스 TAC 표 앞 그림 2개 → 한컴 간격은 호스트 줄간격 제외, gap≈20px).
                 // → 폴백은 표 앞 컨트롤이 전부 비가시일 때로 한정한다.
+                // 용지·쪽 기준 글 앞/뒤(InFrontOfText·BehindText) 비-TAC 개체는 host 줄과 무관한
+                // 겹침 장식이라 다음 문단 위치를 확정하지 않는다 — 표 줄의 줄간격(음수 포함)을
+                // 버릴 근거가 아니다(36369627 1쪽: 용지 기준 글앞 직선 뒤 TAC 표 줄 ls −252,
+                // 저장 다음 문단 16018 = 16270 − 252). 문단 기준 글앞 도형은 host 줄에 묶여
+                // 종전 계약을 따른다(aaaaaa 13쪽 pi=206: 저장 46326 = 13680 + 32546 + 100,
+                // ls −1100 미적용).
                 let only_invisible_before_tac = para.controls
                     [..control_index.min(para.controls.len())]
                     .iter()
                     .all(|c| {
-                        !matches!(
-                            c,
-                            Control::Table(_) | Control::Picture(_) | Control::Shape(_)
-                        )
+                        let overlay = |common: &crate::model::shape::CommonObjAttr| {
+                            !common.treat_as_char
+                                && matches!(
+                                    common.text_wrap,
+                                    TextWrap::InFrontOfText | TextWrap::BehindText
+                                )
+                                && matches!(
+                                    common.vert_rel_to,
+                                    crate::model::shape::VertRelTo::Paper
+                                        | crate::model::shape::VertRelTo::Page
+                                )
+                        };
+                        match c {
+                            Control::Shape(shape) => overlay(shape.common()),
+                            Control::Picture(picture) => overlay(&picture.common),
+                            Control::Table(_) => false,
+                            _ => true,
+                        }
                     });
                 // [#4622 · #4599 ⑦] control_index 를 seg 인덱스로 쓰는 폴백은 표 앞에 자기
                 // 줄이 있는 문단에서 어긋난다 — 36392662 p1 pi7: seg0(공백 줄,
@@ -15305,11 +16346,44 @@ impl LayoutEngine {
                                 _ => true,
                             })
                     });
+                // [#8418] 앞 가시 개체가 모두 표보다 앞 저장 줄에 있으면 표 줄을 공유하지
+                // 않는다. test_521 의 이중 가산 방지는 같은 줄의 개체가 다음 문단 위치를
+                // 이미 확정할 때의 계약이다 — 앞 줄의 도형 때문에 이 표 줄의 줄간격을
+                // 버리면 뒤 본문이 그만큼 당겨진다(30269 p12: 도형 두 개는 줄 0, 소제목
+                // 표는 줄 1 → ls 1352HU 누락, 조판은 이미 같은 간격을 수용).
+                // 음수 줄간격 표 줄은 아래 '문단 advance 리셋' 분기가 별도 계약을 가지므로
+                // 이 사영의 대상이 아니다(aaaaaa p21: 글앞 도형 + ls -1100 표 줄 반례).
+                // 앞 개체는 글자처럼 취급되어 자기 저장 줄 안에서만 흐름을 소비해야 한다.
+                // 비-TAC 개체는 스스로 흐름을 밀 수 있어 test_521 계약을 그대로 따른다
+                // (젠더폭력 보고서 p111: 자리차지 그림 + 2줄 뒤 TAC 표 반례).
+                let visible_before_tac_on_earlier_lines =
+                    control_line_seg_index(para, control_index).is_some_and(|owner| {
+                        owner > 0
+                            && para
+                                .line_segs
+                                .get(owner)
+                                .is_some_and(|seg| seg.line_spacing > 0)
+                            && para.controls[..control_index.min(para.controls.len())]
+                                .iter()
+                                .enumerate()
+                                .all(|(index, control)| {
+                                    let treat_as_char = match control {
+                                        Control::Table(table) => table.common.treat_as_char,
+                                        Control::Picture(picture) => picture.common.treat_as_char,
+                                        Control::Shape(shape) => shape.common().treat_as_char,
+                                        _ => return true,
+                                    };
+                                    treat_as_char
+                                        && control_line_seg_index(para, index)
+                                            .is_some_and(|line| line < owner)
+                                })
+                    });
                 let projected_seg = if (self.profile.get().hwp5_stored_pagination_layout()
                     || (self.profile.get().hwpx_stored_layout() && all_segs_stored))
                     && (only_invisible_before_tac
                         || continuous_stored_table_line
-                        || shared_row_float_before_tac)
+                        || shared_row_float_before_tac
+                        || visible_before_tac_on_earlier_lines)
                 {
                     let table_h = para.controls.get(control_index).and_then(|c| match c {
                         Control::Table(t) if t.common.height < 0x8000_0000 => {
@@ -15369,6 +16443,7 @@ impl LayoutEngine {
                                 seg,
                                 self.profile.get().hwpx_stored_layout(),
                                 native_stored_layout,
+                                !self.profile.get().hangul2024_layout(),
                                 self.dpi,
                             )
                         };
@@ -15797,7 +16872,21 @@ impl LayoutEngine {
             let ml = ps.map(|s| s.margin_left).unwrap_or(0.0);
             let ind = ps.map(|s| s.indent).unwrap_or(0.0);
             let mr = ps.map(|s| s.margin_right).unwrap_or(0.0);
-            (if ind > 0.0 { ml + ind } else { ml }, mr)
+            // 나뉜 조각도 온전한 표와 같은 host 여백을 쓴다. 문단 기준 자리차지 표의
+            // 원점은 문단 상자이며 첫 줄 들여쓰기는 표가 소유한 글줄에만 적용된다.
+            let ml = match para.controls.get(control_index) {
+                Some(Control::Table(table)) => table_host_margin_left(
+                    para,
+                    control_index,
+                    table,
+                    composed.get(para_index),
+                    (ml, ind, mr),
+                    col_area.width,
+                    self.dpi,
+                ),
+                _ => tac_picture_effective_margin_left(ml, ind),
+            };
+            (ml, mr)
         } else {
             (0.0, 0.0)
         };
@@ -16061,21 +17150,52 @@ impl LayoutEngine {
                             } else {
                                 0.0
                             };
-                            self.native_text_frame_terminal_successor_gap(
-                                para,
-                                next,
-                                table,
-                                col_area,
-                                y_offset + outer_bottom,
-                                styles,
-                            )
+                            let accepted = ctx
+                                .paragraph_float_placements
+                                .get(&(para_index, control_index))
+                                .and_then(|placement| placement.stored_successor_line_origin)
+                                .and_then(|line| {
+                                    let before = styles
+                                        .para_styles
+                                        .get(next.para_shape_id as usize)?
+                                        .spacing_before;
+                                    Some(col_area.y + line - before - y_offset - outer_bottom)
+                                });
+                            accepted.or_else(|| {
+                                self.native_text_frame_terminal_successor_gap(
+                                    para,
+                                    next,
+                                    table,
+                                    col_area,
+                                    y_offset + outer_bottom,
+                                    styles,
+                                )
+                            })
                         }
                         _ => None,
                     })
             } else {
                 None
             };
-            if let Some(para_style) = styles.para_styles.get(para_style_id) {
+            // [#8468] 끝 조각 뒤 host 글줄을 typeset 이 이 쪽 `PartialParagraph` 로 예약하고
+            // 조각 하단 아래 흐름(`host_push`)을 그 첫 줄의 확정 앞 간격으로 기록했으면,
+            // 배치는 조각 하단에서 다시 시작해 그 앞 간격만 한 번 더한다. 여기서 문단 뒤 간격·
+            // 종료 간격·바깥 아래 여백을 또 더하면 같은 흐름을 두 번 센다(경찰대학 중간보고서
+            // 97쪽: 정본 조각 하단 +1.2px, 이중 가산 +25.6px — 본문이 각주 영역과 겹쳤다).
+            let host_line_owns_trailing_flow = is_continuation
+                && !is_tac
+                && host_item_emitted
+                && ctx.float_pushed_line_spacings.contains_key(&para_index)
+                && end_cut.is_empty()
+                && para
+                    .controls
+                    .get(control_index)
+                    .is_some_and(|control| matches!(control, Control::Table(table) if end_row >= table.row_count as usize));
+            if let Some(para_style) = styles
+                .para_styles
+                .get(para_style_id)
+                .filter(|_| !host_line_owns_trailing_flow)
+            {
                 if is_tac {
                     if para_style.spacing_after > 0.0 {
                         y_offset += para_style.spacing_after;
@@ -16100,7 +17220,11 @@ impl LayoutEngine {
             // #2439: typeset reserves this margin for every proven native-HWP RowBreak
             // fragment.  Keep it outside `last_item_content_bottom`: it is trailing flow, not
             // painted content, and therefore must not trigger an overflow report.
-            if !is_tac && repeat_fragment_outer_margin && !computed_fragment_flow_end_consumed {
+            if !is_tac
+                && !host_line_owns_trailing_flow
+                && repeat_fragment_outer_margin
+                && !computed_fragment_flow_end_consumed
+            {
                 if let Some(Control::Table(table)) = para.controls.get(control_index) {
                     y_offset += hwpunit_to_px(table.outer_margin_bottom as i32, self.dpi);
                 }
@@ -16108,7 +17232,7 @@ impl LayoutEngine {
 
             // 저장 호스트 줄은 표 외곽이 아닌 마지막 조각 뒤의 흐름 공간이다.
             // 분할 조판이 예약한 같은 전진량을 실제 다음 문단 원점에 소비한다.
-            if end_cut.is_empty() {
+            if end_cut.is_empty() && !host_line_owns_trailing_flow {
                 if let Some(Control::Table(table)) = para.controls.get(control_index) {
                     if end_row >= table.row_count as usize {
                         if let Some(advance) = stored_unconsumed_rowbreak_host_advance_hu(
@@ -16259,6 +17383,27 @@ impl LayoutEngine {
         }
         let bottom = bottom?;
         (bottom > anchor_top).then(|| hwpunit_to_px(bottom - anchor_top, dpi))
+    }
+
+    /// [#8567] Square 어울림 표가 바로 뒤 문단들을 **통째로** 표 옆 띠에 흡수했을 때,
+    /// 흐름상 다음 문단(마지막 흡수 문단 바로 뒤)의 인덱스. 흡수가 없거나, 뒤 문단의
+    /// 앞 줄만 흡수(접두 흡수 — 나머지 줄이 같은 문단의 흐름으로 이어진다)했거나,
+    /// 흡수 문단이 host 뒤에 연속하지 않으면 `None` 이다.
+    fn square_wrap_flow_successor(
+        wrap_around_paras: &[super::pagination::WrapAroundPara],
+        table_para_index: usize,
+    ) -> Option<usize> {
+        let mut next = table_para_index + 1;
+        for wp in wrap_around_paras
+            .iter()
+            .filter(|wp| wp.table_para_index == table_para_index)
+        {
+            if wp.para_index != next || wp.start_line != 0 || wp.end_line != usize::MAX {
+                return None;
+            }
+            next += 1;
+        }
+        (next > table_para_index + 1).then_some(next)
     }
 
     /// 글상자(Shape) 2차 패스: z-order 정렬 후 렌더링.
@@ -16457,6 +17602,17 @@ impl LayoutEngine {
                 height: layout.page_height,
             };
 
+            let stored_frame_origin = col_content
+                .paragraph_float_placements
+                .get(&(para_index, control_index))
+                .filter(|placement| {
+                    placement.flow == super::float_placement::ParagraphFloatFlow::AbsolutePageFrame
+                })
+                .and_then(|placement| {
+                    placement
+                        .table_left
+                        .map(|left| (left, col_area.y + placement.table_top))
+                });
             if is_table_control {
                 // InFrontOfText/BehindText 표: paper 기준 절대 위치에 렌더링
                 if let Some(Control::Table(table)) = paragraphs
@@ -16632,18 +17788,6 @@ impl LayoutEngine {
                     temp_parent.children.drain(..).collect(),
                 );
             } else if is_paper_based {
-                let stored_frame_origin = col_content
-                    .paragraph_float_placements
-                    .get(&(para_index, control_index))
-                    .filter(|placement| {
-                        placement.flow
-                            == super::float_placement::ParagraphFloatFlow::AbsolutePageFrame
-                    })
-                    .and_then(|placement| {
-                        placement
-                            .table_left
-                            .map(|left| (left, col_area.y + placement.table_top))
-                    });
                 let mut temp_parent = RenderNode::new(
                     tree.next_id(),
                     RenderNodeType::Column(0),
@@ -16718,7 +17862,7 @@ impl LayoutEngine {
                     bin_data_content,
                     &overflow_map,
                     false,
-                    None,
+                    stored_frame_origin,
                 );
             }
             // [Task #525] 비-TAC Picture/Shape Square wrap 의 어울림 문단 렌더링은
@@ -16803,7 +17947,8 @@ impl LayoutEngine {
             None => return x_base,
         };
         let para_style = styles.para_styles.get(comp.para_style_id as usize);
-        let tab_width = para_style.map(|s| s.default_tab_width).unwrap_or(48.0);
+        let tab_width =
+            styles.default_tab_width(para_style.map(|s| s.default_tab_width).unwrap_or(48.0));
         let tab_stops = para_style.map(|s| s.tab_stops.clone()).unwrap_or_default();
         let auto_tab_right = para_style.map(|s| s.auto_tab_right).unwrap_or(false);
         let available_width = col_area.width - margin_left;

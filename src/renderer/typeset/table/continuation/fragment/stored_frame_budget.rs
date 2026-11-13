@@ -22,14 +22,25 @@ impl TypesetEngine {
         budget: &FragmentBudget,
         scan: &BlockTableRowScan,
     ) -> Option<(f64, f64)> {
+        // 일반 행은 앞 조각이 전달한 하단 여백을 따른다. 병합 블록도 예산이
+        // 원본 호스트·선언 상자에서 인증한 같은 종료선을 그대로 소비한다.
+        let has_source_bottom = input.start.stored_fragment_body_bottom_inset.is_some()
+            || (scan.split_block_start.is_some() && budget.source_frame_bottom.is_some());
+        if std::env::var_os("RHWP_DIAG_SCAN").is_some() && scan.split_block_start.is_some() {
+            eprintln!(
+                "DIAG_SCAN BLOCK_CLOSING_SOURCE rows={}..{} inset={:?} source={} start_block={} bottom={:?}",
+                input.start.cursor_row, scan.end_row,
+                input.start.stored_fragment_body_bottom_inset, has_source_bottom,
+                input.start.start_cut_is_block, budget.source_frame_bottom,
+            );
+        }
         if !input.start.is_continuation
-            || input.start.stored_fragment_body_bottom_inset.is_none()
+            || !has_source_bottom
             || input.start.start_cut_is_block
             || input.row_cursor_is_nested
             || st.current_height > 0.5
             || st.current_zone_y_offset != 0.0
             || scan.end_row <= input.start.cursor_row
-            || scan.split_block_start.is_some()
             || scan.split_end_limit <= 0.0
             || scan.split_end_cut.is_empty()
             || input.source.table.caption.is_some()
@@ -46,21 +57,38 @@ impl TypesetEngine {
         } else {
             &[]
         };
-        if !engine.row_has_original_plain_text_owners(table, row, &scan.split_end_cut)
-            || !(engine.row_cut_ends_at_original_plain_text_reset(
+        let closes_source_frame = if let Some(block_start) = scan.split_block_start {
+            let (_, block_end, _) = input.source.measured_table.row_block_for(block_start);
+            let start = if block_start == first {
+                input.start.start_cut.as_slice()
+            } else {
+                &[]
+            };
+            engine.row_block_cut_closes_original_text_frame(
                 table,
-                row,
+                (block_start, block_end),
+                scan.end_row,
                 start,
                 &scan.split_end_cut,
                 styles,
-            ) || engine.row_cut_ends_at_saved_zero_origin_frame(
-                table,
-                row,
-                start,
-                &scan.split_end_cut,
-                styles,
-            ))
-        {
+            )
+        } else {
+            engine.row_has_original_plain_text_owners(table, row, &scan.split_end_cut)
+                && (engine.row_cut_ends_at_original_plain_text_reset(
+                    table,
+                    row,
+                    start,
+                    &scan.split_end_cut,
+                    styles,
+                ) || engine.row_cut_ends_at_saved_zero_origin_frame(
+                    table,
+                    row,
+                    start,
+                    &scan.split_end_cut,
+                    styles,
+                ))
+        };
+        if !closes_source_frame {
             return None;
         }
         let top = budget.fragment_placement.map_or(
@@ -126,13 +154,37 @@ impl TypesetEngine {
         budget: &FragmentBudget,
         scan: &BlockTableRowScan,
     ) -> Option<(f64, f64)> {
-        let height = budget.stored_partial_frame_height?;
+        let height = budget.stored_partial_frame_height.or_else(|| {
+            // 원본 셀 높이 0은 행의 하한을 증명하지 못한다. 그러나 실제 저장
+            // 쪽 재시작 컷과 호스트 앵커가 같은 첫 상자를 인증하면 그 상자는
+            // 이미 스캔이 예약한 프레임이다. 완결 행의 추정으로 대체하지 않는다.
+            scan.split_block_start?;
+            let (height, _) = budget.saved_first_fragment_source_frame?;
+            let source = input
+                .prepared
+                .layout_engine
+                .stored_block_opening_frame_height(
+                    input.source.row_geometry_table,
+                    input.source.paragraph,
+                    scan.end_row,
+                    &scan.split_end_cut,
+                    input.source.styles,
+                )?;
+            (height == source).then_some(height)
+        })?;
+        let roundoff = f64::EPSILON
+            * (height.abs() + scan.consumed.abs()).max(1.0)
+            * (input.prepared.row_count + 4) as f64;
         if input.start.is_continuation
             || input.start.cursor_row != 0
             || !input.start.start_cut.is_empty()
             || scan.end_row == 0
             || scan.end_row >= input.prepared.row_count
-            || height <= scan.consumed + budget.header_overhead + 0.5
+            || height + roundoff < scan.consumed + budget.header_overhead
+            // 블록은 스캔에서 원본 첫 상자를 이미 예약했어도 마지막 행의
+            // 배분을 paint에 넘겨야 한다. 일반 행의 기존 확장 조건은 유지한다.
+            || (scan.split_block_start.is_none()
+                && height <= scan.consumed + budget.header_overhead + 0.5)
         {
             return None;
         }
@@ -223,7 +275,11 @@ impl TypesetEngine {
             };
             (before_last, selected_last)
         };
-        let last_height = height - budget.header_overhead - before_last;
+        // 첫 조각의 개체 상자에는 표 바깥 셀 간격도 포함된다.
+        // 마지막 행 상자에는 행 사이 간격만 이미 반영한 앞 행을 빼고,
+        // 바깥 간격을 다시 배정하지 않는다.
+        let outer = hwpunit_to_px(input.source.table.outer_cell_spacing_hu(), self.dpi);
+        let last_height = height - budget.header_overhead - before_last - outer;
         (before_last >= 0.0 && last_height >= selected_last).then_some((height, last_height))
     }
 
@@ -239,10 +295,10 @@ impl TypesetEngine {
         let engine = &input.prepared.layout_engine;
         let measured = input.source.measured_table;
         let (first, end, _) = measured.row_block_for(block_start);
-        if first != block_start || scan.end_row <= first || scan.end_row >= end {
+        if first != block_start || scan.end_row <= first || scan.end_row > end {
             return None;
         }
-        let source_height = engine.stored_complete_block_opening_frame_height(
+        let source_height = engine.stored_block_opening_frame_height(
             table,
             input.source.paragraph,
             scan.end_row,
@@ -255,7 +311,8 @@ impl TypesetEngine {
         // A block cut can encode a complete physical row without an empty
         // vector. Verify the exact measured-row owner used by paint; the unit
         // walk's consumed height alone does not include this row's blank band.
-        if !(0..scan.end_row).all(|row| {
+        let last = scan.end_row - 1;
+        if !(0..last).all(|row| {
             if row < first {
                 engine.whole_fragment_row_uses_measured_height(table, row)
             } else {
@@ -271,12 +328,42 @@ impl TypesetEngine {
         }) {
             return None;
         }
-        let last = scan.end_row - 1;
         let before = measured.row_heights.get(..last)?.iter().sum::<f64>()
             + measured.cell_spacing * last as f64;
-        let selected = scan
-            .end_row_height_override
-            .unwrap_or(*measured.row_heights.get(last)?);
+        let selected = if engine.row_block_cut_uses_measured_height(
+            table,
+            (first, end),
+            last,
+            &[],
+            &scan.split_end_cut,
+            styles,
+        ) {
+            scan.end_row_height_override
+                .unwrap_or(*measured.row_heights.get(last)?)
+        } else {
+            // 끝 행이 부분 내용이면 실제 저장 재시작 컷만 그 첫 상자를 소유한다.
+            // 뒤쪽 내용을 다시 예약하지 않고 같은 선택 유닛의 요구 높이를 하한으로 쓴다.
+            if !engine.row_block_cut_closes_original_text_frame(
+                table,
+                (first, end),
+                scan.end_row,
+                &[],
+                &scan.split_end_cut,
+                styles,
+            ) {
+                return None;
+            }
+            let content = engine.row_block_cut_row_content_height(
+                table,
+                first,
+                end,
+                last,
+                &[],
+                &scan.split_end_cut,
+                styles,
+            );
+            scan.end_row_height_override.unwrap_or(content).max(content)
+        };
         Some((before, selected))
     }
 
@@ -303,7 +390,11 @@ impl TypesetEngine {
         // The existing saved-frame producer authenticates the host origin and
         // available body space. The raw row lower bound independently proves
         // this object box is only a fragment. Its units still need a real cut.
-        let height = saved_frame?.0.min(available);
+        let outer = hwpunit_to_px(source.table.outer_cell_spacing_hu(), self.dpi);
+        // 저장 상자는 바깥 간격을 포함하고 `available`은 이미 그 간격을 뺀
+        // 행 예산이다. 같은 단위로 제한한 뒤 전체 조각 상자를 복원한다.
+        let row_capacity = (saved_frame?.0 - outer).max(0.0).min(available);
+        let height = row_capacity + outer;
         let mut before = 0.0;
         let mut complete_last_row = None;
         let mut carried_band_row = None;
@@ -311,8 +402,8 @@ impl TypesetEngine {
             if row > 0 {
                 before += input.prepared.cell_spacing;
             }
-            if before + row_height > height {
-                let remaining = height - before;
+            if before + row_height > row_capacity {
+                let remaining = row_capacity - before;
                 // A declared row can include unused space. All of its units
                 // may fit in the source remainder even when that box does not.
                 // The complete-row minimum covers owners starting in this row.

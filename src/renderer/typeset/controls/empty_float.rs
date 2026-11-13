@@ -174,6 +174,7 @@ pub(super) fn prepare(
                 rewound_host_origin.unwrap_or(para_start_height),
                 para_style.map_or(0.0, |style| style.spacing_before),
                 ft.effective_height,
+                false,
                 dpi,
             )
         })
@@ -400,7 +401,7 @@ pub(super) fn prepare(
         || table.col_count != 1
         || table.cells.len() != 1
         || !matches!(
-            table.page_break,
+            table.layout_page_break(),
             crate::model::table::TablePageBreak::RowBreak
         )
         || single_rowbreak_declared_height_is_trustworthy;

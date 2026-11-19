@@ -96,6 +96,12 @@ pub(super) struct TypefaceCatalog {
     families: HashMap<String, Vec<Typeface>>,
     // name ID 6은 특정 face의 식별자이며 family 별칭으로 등록하지 않는다.
     postscript_faces: HashMap<String, Typeface>,
+    // DWrite exposes table copies, and CoreText may repack a TTC as standalone
+    // SFNT. Preserve the source kind while the original bytes are available.
+    program_orders: HashMap<u32, u8>,
+    // CoreText는 같은 메모리 face를 재적재할 때 OS/2와 다른 굵기를 보고할 수 있다.
+    // 정적 TrueType 공급 프로그램의 CSS 매칭은 원본 스타일을 보존한다.
+    program_styles: HashMap<u32, FontStyle>,
 }
 
 impl TypefaceCatalog {
@@ -215,11 +221,51 @@ impl TypefaceCatalog {
             for (name, face) in source_catalog.postscript_faces {
                 catalog.postscript_faces.entry(name).or_insert(face);
             }
+            for (id, order) in source_catalog.program_orders {
+                catalog
+                    .program_orders
+                    .entry(id)
+                    .and_modify(|existing| *existing = (*existing).min(order))
+                    .or_insert(order);
+            }
+            for (id, style) in source_catalog.program_styles {
+                catalog.program_styles.entry(id).or_insert(style);
+            }
         }
         catalog
     }
 
     fn insert_face(&mut self, data: &[u8], face_index: u32, face: Typeface) {
+        let order = super::font_program::program_order(data, face_index);
+        if let Ok(source) = ttf_parser::Face::parse(data, face_index) {
+            // CFF·가변 글꼴은 기존 OS 스타일·축 해석을 유지한다. OS/2가 없는
+            // 프로그램에도 임의의 Regular 스타일을 만들어 주지 않는다.
+            if source.tables().glyf.is_some()
+                && !source.is_variable()
+                && source.tables().os2.is_some()
+            {
+                use skia_safe::font_style::Slant;
+                let slant = if source.is_oblique() {
+                    Slant::Oblique
+                } else if source.is_italic() {
+                    Slant::Italic
+                } else {
+                    Slant::Upright
+                };
+                self.program_styles.insert(
+                    face.unique_id(),
+                    FontStyle::new(
+                        i32::from(source.weight().to_number()).into(),
+                        i32::from(source.width().to_number()).into(),
+                        slant,
+                    ),
+                );
+            }
+        }
+        self.program_orders
+            .entry(face.unique_id())
+            .and_modify(|existing| *existing = (*existing).min(order))
+            .or_insert(order);
         if let Some(name) = face.post_script_name() {
             self.postscript_faces.entry(name).or_insert(face.clone());
         }
@@ -261,7 +307,16 @@ impl TypefaceCatalog {
             if let Some(faces) = self.families.get(&family.to_lowercase()) {
                 let mut faces = faces.clone();
                 // Stable sorting keeps the first supplied program on a tie.
-                faces.sort_by_key(|face| supplied_style_rank(style, face.font_style()));
+                faces.sort_by_key(|face| {
+                    (
+                        supplied_style_rank(
+                            style,
+                            self.program_style(face)
+                                .unwrap_or_else(|| face.font_style()),
+                        ),
+                        self.program_order(face),
+                    )
+                });
                 result.extend(faces);
             } else if let Some(face) = self.postscript_faces.get(family) {
                 // 명시적 face 요청에는 다른 굵기의 같은 family를 대입하지 않는다.
@@ -269,6 +324,14 @@ impl TypefaceCatalog {
             }
         }
         result
+    }
+
+    pub fn program_order(&self, face: &Typeface) -> Option<u8> {
+        self.program_orders.get(&face.unique_id()).copied()
+    }
+
+    pub fn program_style(&self, face: &Typeface) -> Option<FontStyle> {
+        self.program_styles.get(&face.unique_id()).copied()
     }
 }
 

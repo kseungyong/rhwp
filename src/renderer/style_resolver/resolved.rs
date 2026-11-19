@@ -33,6 +33,7 @@ pub struct ResolvedCharStyle {
     /// 독립 Print로 굵기 전진 계약을 확인한 원본 HFT 프로그램이다.
     pub font_families_verified_hft_bold_tracking: Vec<bool>,
     pub font_families_hft_print_frame: Vec<bool>,
+    pub font_families_print_text_device_frame: Vec<bool>,
     /// 세션이 명시적으로 선택한 프로그램의 자연 윤곽 폭을 보존한다.
     pub font_families_preserve_glyph_ink: Vec<bool>,
     /// 언어 슬롯별 명시적인 자연 전진 선택. paint의 윤곽 보존과 구분한다.
@@ -152,6 +153,7 @@ impl Default for ResolvedCharStyle {
             font_families_primary_program: Vec::new(),
             font_families_verified_hft_bold_tracking: Vec::new(),
             font_families_hft_print_frame: Vec::new(),
+            font_families_print_text_device_frame: Vec::new(),
             font_families_preserve_glyph_ink: Vec::new(),
             font_families_natural_program_metrics: Vec::new(),
             font_families_hft_fullwidth_dot: Vec::new(),
@@ -312,6 +314,20 @@ impl ResolvedCharStyle {
             .unwrap_or(false)
     }
 
+    pub fn print_text_device_frame_for_lang(&self, lang_index: usize) -> bool {
+        let slot = if lang_index < self.font_families.len()
+            && !self.font_families[lang_index].is_empty()
+        {
+            lang_index
+        } else {
+            0
+        };
+        self.font_families_print_text_device_frame
+            .get(slot)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// 대체되지 않은 HFT 기호 슬롯의 원본 전각 전진을 보존한다.
     pub fn hft_fullwidth_dot_for_lang(&self, lang_index: usize) -> bool {
         let slot = if lang_index < self.font_families.len()
@@ -450,6 +466,9 @@ pub struct ResolvedParaStyle {
     pub keep_lines: bool,
     /// 문단 앞에서 항상 쪽 나눔 — attr1 bit 19
     pub page_break_before: bool,
+    /// 문단 "한 줄로 입력"(HWPX `lineWrap="SQUEEZE"`, ParaShape attr2 bits 0..1 == 1).
+    /// 글이 폭을 넘어도 줄을 나누지 않고 한 줄에 둔다.
+    pub line_wrap_squeeze: bool,
 }
 
 impl Default for ResolvedParaStyle {
@@ -482,6 +501,7 @@ impl Default for ResolvedParaStyle {
             keep_with_next: false,
             keep_lines: false,
             page_break_before: false,
+            line_wrap_squeeze: false,
         }
     }
 }
@@ -493,7 +513,7 @@ pub struct ResolvedBorderStyle {
     pub borders: [BorderLine; 4],
     /// 배경 채우기 색상 (None이면 채우기 없음)
     pub fill_color: Option<ColorRef>,
-    /// 패턴 채우기 (pattern_type > 0일 때)
+    /// 패턴 채우기 (무늬 0~5일 때)
     pub pattern: Option<PatternFillInfo>,
     /// 그라데이션 채우기 (fill_color보다 우선)
     pub gradient: Option<Box<GradientFillInfo>>,
@@ -558,6 +578,9 @@ pub struct ResolvedStyleSet {
     pub(crate) section_tab_width_bits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 원본 HWP3 또는 그 HWPX 변환의 글꼴 꾸밈 출처.
     pub(crate) source_hwp3_native: bool,
+    /// 문서의 호환 대상이 MS 워드인가(HWP5 `HWPTAG_COMPATIBLE_DOCUMENT` 값 2, HWPX
+    /// `targetProgram="MS_WORD"`). 한/글 문서와 다른 흐름 규칙을 고른다.
+    pub(crate) word_compat_target: bool,
     /// 문서 지정 대체가 있어도 현재 선택은 자기 메트릭을 가진 원본 TTF인 슬롯.
     /// 값은 문서가 선언한 대체 프로그램의 해소 결과다. 저장 줄 전체가 이 대체
     /// 프로그램의 채움과 일치하고 현재 원본 프로그램과 다른 경우에만 사용한다.
@@ -763,12 +786,12 @@ impl Drop for SectionTabScope {
     }
 }
 
-crate::storage::clone_fields!(ResolvedCharStyle, {text_paint, font_family, font_families, font_families_metric_trusted, font_families_glyph_fallback_advance_explicit, font_families_hft_hangul, font_families_source_hft, font_families_source_ttf, font_families_primary_program, font_families_verified_hft_bold_tracking, font_families_hft_print_frame, font_families_preserve_glyph_ink, font_families_natural_program_metrics, font_families_hft_fullwidth_dot, ascii_punct_latin_slot, explicit_latin_slot, font_families_metric_face, font_families_original_glyph_metric_face, font_space_em, font_size, font_sizes, font_positions, bold, italic, text_color, underline, underline_color, strike_color, strikethrough, letter_spacing, letter_spacings, ratio, ratios, border_fill_id, outline_type, shadow_type, shadow_color, shadow_offset_x, shadow_offset_y, emboss, engrave, superscript, subscript, emphasis_dot, underline_shape, strike_shape, kerning, shade_color});
+crate::storage::clone_fields!(ResolvedCharStyle, {text_paint, font_family, font_families, font_families_metric_trusted, font_families_glyph_fallback_advance_explicit, font_families_hft_hangul, font_families_source_hft, font_families_source_ttf, font_families_primary_program, font_families_verified_hft_bold_tracking, font_families_hft_print_frame, font_families_print_text_device_frame, font_families_preserve_glyph_ink, font_families_natural_program_metrics, font_families_hft_fullwidth_dot, ascii_punct_latin_slot, explicit_latin_slot, font_families_metric_face, font_families_original_glyph_metric_face, font_space_em, font_size, font_sizes, font_positions, bold, italic, text_color, underline, underline_color, strike_color, strikethrough, letter_spacing, letter_spacings, ratio, ratios, border_fill_id, outline_type, shadow_type, shadow_color, shadow_offset_x, shadow_offset_y, emboss, engrave, superscript, subscript, emphasis_dot, underline_shape, strike_shape, kerning, shade_color});
 
-crate::storage::clone_fields!(ResolvedParaStyle, {alignment, vertical_alignment, line_spacing, line_spacing_type, margin_left, margin_right, indent, spacing_before, spacing_after, head_type, para_level, numbering_id, border_fill_id, border_spacing, border_connect, border_ignore_margin, default_tab_width, tab_stops, auto_tab_left, auto_tab_right, condense_min_space, english_break_unit, korean_break_unit, widow_orphan, keep_with_next, keep_lines, page_break_before});
+crate::storage::clone_fields!(ResolvedParaStyle, {alignment, vertical_alignment, line_spacing, line_spacing_type, margin_left, margin_right, indent, spacing_before, spacing_after, head_type, para_level, numbering_id, border_fill_id, border_spacing, border_connect, border_ignore_margin, default_tab_width, tab_stops, auto_tab_left, auto_tab_right, condense_min_space, english_break_unit, korean_break_unit, widow_orphan, keep_with_next, keep_lines, page_break_before, line_wrap_squeeze});
 
 crate::storage::clone_fields!(ResolvedBorderStyle, {borders, fill_color, pattern, gradient, image_fill, diagonal_attr, break_cell_separate_line, diagonal, center_line});
 
-crate::storage::clone_fields!(ResolvedStyleSet, {section_tab_width_bits, script_metrics, source_hwp3_native, source_program_projection_slots, native_pua_fonts, display_only_otf_slots, inferred_ttf_requires_selection, unsubstituted_font_slots, char_overlap_size_bounds, source_char_shapes, resolved_dpi, isolated_jamo_font, page_number_char_style_id, page_number_font_is_hft, supplemental_metrics, style_char_shapes, char_styles, para_styles, border_styles, numberings, bullets, hwp3_variant, hft_ascii_halfwidth, kerning_measurement_context, horizontal_shaping_context});
+crate::storage::clone_fields!(ResolvedStyleSet, {section_tab_width_bits, script_metrics, source_hwp3_native, word_compat_target, source_program_projection_slots, native_pua_fonts, display_only_otf_slots, inferred_ttf_requires_selection, unsubstituted_font_slots, char_overlap_size_bounds, source_char_shapes, resolved_dpi, isolated_jamo_font, page_number_char_style_id, page_number_font_is_hft, supplemental_metrics, style_char_shapes, char_styles, para_styles, border_styles, numberings, bullets, hwp3_variant, hft_ascii_halfwidth, kerning_measurement_context, horizontal_shaping_context});
 
 crate::storage::clone_fields!(ResolvedImageFill, {bin_data_id, fill_mode, brightness, contrast, effect});

@@ -280,11 +280,6 @@ fn break_before_text_token(
     {
         return true;
     }
-    // A'·AA'의 prime/닫는 따옴표는 여는 작은따옴표와 문자값이 같다.
-    // 실제 앞 글자를 확인해 닫힌 낱말 뒤 한글 경계를 허용한다. 공백 뒤의
-    // 여는 따옴표와 방향이 명시된 여는 괄호/따옴표는 기존 금칙을 유지한다.
-    let closing_apostrophe =
-        previous == '\'' && start_idx >= 2 && text_chars[start_idx - 2].is_alphanumeric();
     // 독립 한컴 Print의 `<개정 ...>`은 여는 꺾쇠와 다음 글자가 한 줄을
     // 소유한다. 단독 `<`는 비교·리다이렉션 연산자로 줄 끝에 올 수 있으므로
     // 뒤에 공백 없이 이어지는 짝 닫힘이 확인된 경우에만 이 계약을 쓴다.
@@ -301,9 +296,7 @@ fn break_before_text_token(
         && start_idx > line_start_idx
         && text_chars.get(start_idx).is_some_and(|c| is_hangul(*c))
         && text_chars.get(start_idx - 1).is_some_and(|prev| {
-            !prev.is_whitespace()
-                && !paired_angle_open
-                && (!is_line_end_forbidden(*prev) || closing_apostrophe)
+            !prev.is_whitespace() && !paired_angle_open && !is_line_end_forbidden(*prev)
         })
 }
 
@@ -323,14 +316,14 @@ fn can_break_after_text_token(ch: char, korean_break_unit: u8) -> bool {
 }
 
 pub(crate) fn is_line_end_forbidden(ch: char) -> bool {
-    // ASCII 큰따옴표는 여는/닫는 모양이 같아 문자값만으로 줄끝 금칙으로
-    // 분류할 수 없다. 독립 Print에서도 큰따옴표 뒤 한글 경계가 줄끝이 된다.
+    // ASCII 작은/큰따옴표는 여는/닫는 모양이 같아 문자값만으로 줄끝 금칙으로
+    // 분류할 수 없다. 독립2020 Print의 공백 뒤 여는 ASCII 따옴표도 줄끝에
+    // 남고, 다음 한글은 다음 줄로 간다. A' 같은 기존 닫는 prime 경계도 유지한다.
     // 방향이 명시된 여는 따옴표·괄호와 기존 줄머리 금칙은 별도로 유지한다.
     matches!(
         ch,
         '(' | '['
             | '{'
-            | '\''
             | '\u{300A}'
             | '\u{300C}'
             | '\u{300E}'
@@ -2050,6 +2043,9 @@ struct TabFill<'a> {
     /// 첫 줄·다음 줄의 줄 상자 시작 (단 시작 기준 px) — 문단 왼쪽 여백 + 그 줄의 들여쓰기.
     line_origin_px: [f64; 2],
     available_width_px: f64,
+    /// 다음 명시 정지가 줄 오른쪽 끝 밖이면 탭 앞뒤 글을 다른 줄로 나누는가(한/글 문서 규칙).
+    /// 워드 호환 문서는 줄 나눔이 달라 끈다.
+    stop_overflow_wraps: bool,
 }
 
 impl<'a> TabFill<'a> {
@@ -2060,6 +2056,7 @@ impl<'a> TabFill<'a> {
             auto_tab_right: false,
             line_origin_px: [0.0, 0.0],
             available_width_px: 0.0,
+            stop_overflow_wraps: false,
         }
     }
 
@@ -2080,7 +2077,14 @@ impl<'a> TabFill<'a> {
                 style.margin_left + (-indent_px).max(0.0),
             ],
             available_width_px,
+            stop_overflow_wraps: false,
         }
+    }
+
+    /// 한/글 문서(워드 호환 아님)에서만 줄 밖 명시 정지 줄 나눔을 켠다.
+    fn with_stop_overflow_wraps(mut self, styles: &ResolvedStyleSet) -> Self {
+        self.stop_overflow_wraps = !styles.word_compat_target;
+        self
     }
 
     fn default_width(&self) -> f64 {
@@ -2108,6 +2112,27 @@ impl<'a> TabFill<'a> {
             0 | 3 => to_hwp(position - origin).max(lw_hwp),
             _ => to_hwp(((lw_px / self.default_width()).floor() + 1.0) * self.default_width()),
         }
+    }
+
+    /// 줄 안 위치 `lw_hwp` 다음의 명시적 왼쪽·가운데·소수점 정지가 줄 오른쪽 끝(`line_width_hwp`)
+    /// 밖에 있는가. 정지 좌표는 단 시작 기준이고 줄 오른쪽 끝은 줄 상자 시작 + 줄 폭이다.
+    fn explicit_stop_beyond_line(
+        &self,
+        lw_hwp: i32,
+        first_line: bool,
+        origin_override: Option<f64>,
+        line_width_hwp: i32,
+    ) -> bool {
+        if !self.stop_overflow_wraps {
+            return false;
+        }
+        let origin = origin_override.unwrap_or(self.line_origin_px[usize::from(!first_line)]);
+        let x = origin + lw_hwp as f64 / 75.0;
+        let right_edge = origin + line_width_hwp as f64 / 75.0;
+        self.stops
+            .iter()
+            .find(|stop| stop.position > x + 0.5)
+            .is_some_and(|stop| stop.tab_type != 1 && stop.position > right_edge + 0.5)
     }
 }
 
@@ -2379,6 +2404,47 @@ fn fill_one_interval(
                     });
                 if *max_font_size > cursor.line_max_fs {
                     cursor.line_max_fs = *max_font_size;
+                }
+
+                // 다음 명시적 왼쪽·가운데 정지가 줄 오른쪽 끝 밖이고 탭 뒤에 글이 이어지면, 한컴은
+                // 탭 앞의 글과 탭 뒤의 글을 같은 줄에 두지 않는다(웹한글기안기 인쇄: 줄 폭 5500 HU 에
+                // 정지 8840 HU, `가`+탭+`X` 는 `가` / 탭 / `X` 세 줄이고 `X` 는 줄 처음). 탭 앞에 글이
+                // 있으면 탭을 다음 줄로 보내고, 줄 처음의 탭이면 탭 뒤에서 줄을 끝낸다. 탭만 있는
+                // 문단·문단 끝 탭은 그대로 둔다. 워드 호환 문서는 줄 나눔이 달라 대상에서 뺀다
+                // (`TabFill::stop_overflow_wraps`).
+                if auto_left_target.is_none()
+                    && tokens.len() > ti + 1
+                    && tabs.explicit_stop_beyond_line(
+                        cursor.lw,
+                        cursor.is_first_line,
+                        origin_override,
+                        eff_w(cursor.is_first_line),
+                    )
+                {
+                    let tab_leads_line = cursor.line_start_idx == *idx;
+                    let end_idx = if tab_leads_line { *idx + 1 } else { *idx };
+                    let result = LineBreakResult {
+                        start_idx: cursor.line_start_idx,
+                        end_idx,
+                        max_font_size: cursor.line_max_fs,
+                        has_line_break: false,
+                    };
+                    cursor.line_start_idx = end_idx;
+                    cursor.lw = 0;
+                    cursor.line_space_savings = 0;
+                    cursor.line_max_fs = 0.0;
+                    cursor.is_first_line = false;
+                    cursor.last_break_token_idx = None;
+                    if tab_leads_line {
+                        // 탭은 이 줄에 남는다. 탭 앞에 글이 있던 경우는 탭을 다음 줄 처음에서
+                        // 다시 읽어 위 규칙(줄 처음의 탭)으로 끝낸다.
+                        cursor.token_index += 1;
+                    }
+                    cursor.emitted_any = true;
+                    return Some(FilledInterval {
+                        line: result,
+                        termination: FillTermination::IntervalFull,
+                    });
                 }
 
                 if next_tab_hwp > eff_w(cursor.is_first_line) && cursor.line_start_idx < *idx {
@@ -4652,6 +4718,9 @@ enum FrameStart {
     SourceUtf16(u32),
 }
 
+/// "한 줄로 입력" 문단의 줄 채움 폭. 어떤 글도 넘지 않을 만큼 크고 HWPUNIT 환산에서 넘치지 않는다.
+const UNBROKEN_LINE_WIDTH_PX: f64 = 1.0e6;
+
 fn try_layout_paragraph_in_frame_impl<S: Storage>(
     para: &Paragraph,
     frame: &mut LayoutFrame,
@@ -4747,6 +4816,7 @@ fn try_layout_paragraph_in_frame_impl<S: Storage>(
         ),
     );
     tab_fill.default_width_px = styles.default_tab_width(tab_fill.default_width_px);
+    tab_fill.stop_overflow_wraps = !styles.word_compat_target;
     let english_break_unit = para_style
         .map(|style| style.english_break_unit)
         .unwrap_or(0);
@@ -4997,7 +5067,15 @@ fn try_layout_paragraph_in_frame_impl<S: Storage>(
                     .then_some(terminal_inline_spacing_height)
                     .flatten();
                 let mut row_terminated = false;
+                // "한 줄로 입력" 문단은 글이 구간 폭을 넘어도 줄을 나누지 않는다.
+                let line_wrap_squeeze = styles
+                    .para_styles
+                    .get(para.para_shape_id as usize)
+                    .is_some_and(|style| style.line_wrap_squeeze);
                 let interval_width = |index: usize, interval: &std::ops::Range<i32>| {
+                    if line_wrap_squeeze {
+                        return UNBROKEN_LINE_WIDTH_PX;
+                    }
                     let width = crate::renderer::hwpunit_to_px(
                         interval.end.saturating_sub(interval.start),
                         dpi,
@@ -6172,6 +6250,19 @@ fn try_reflow_line_segs_impl<S: Storage>(
     if !paragraph_box.is_usable() {
         return Ok(false);
     }
+    // 입력 편집으로 무효화한 줄만 이전 RIGHT 전진을 버린다. Undo가 원래
+    // 문단 메타를 복원한 뒤 줄을 구성하는 경우까지 캐시를 지우면 안 된다.
+    // 실제 탭에 대응하는 폭의 두 워드만 비우며 정렬·채움·순번과 남는
+    // 원본 메타는 보존한다. 새 전진은 현재 문단 TabDef로 계산한다.
+    if para.stored_text_partition_is_dirty() {
+        let tab_count = para.text.chars().filter(|&ch| ch == '\t').count();
+        for extension in para.tab_extended.iter_mut().take(tab_count) {
+            if extension[2] >> 8 == 2 {
+                extension[0] = 0;
+                extension[1] = 0;
+            }
+        }
+    }
     // [#4677] 줄을 다시 계산하면 이전에 붙여 둔 조판 전용 보강 줄은 사라진다 — 표식을
     // 남겨 두면 실제 줄을 저장에서 잘라 내게 된다.
     para.layout_only_fill_lines = 0;
@@ -6192,6 +6283,13 @@ fn try_reflow_line_segs_impl<S: Storage>(
     };
     let (marker_hang_px, indent_px) = list_marker_breaker_box(para, styles, indent_px);
     let available_width_px = (paragraph_box.width_px(dpi) - marker_hang_px).max(1.0);
+    // "한 줄로 입력" 문단은 글이 폭을 넘어도 줄을 나누지 않는다.
+    let line_wrap_squeeze = para_style.is_some_and(|style| style.line_wrap_squeeze);
+    let available_width_px = if line_wrap_squeeze {
+        UNBROKEN_LINE_WIDTH_PX
+    } else {
+        available_width_px
+    };
 
     if !split_stale_cell_reflow
         && (supports_inline_picture_frame_controls(para)
@@ -6276,11 +6374,16 @@ fn try_reflow_line_segs_impl<S: Storage>(
         // 차지하므로, 컨트롤 인덱스를 그대로 쓰면 둘째 줄이 첫 제어문자 블록 한가운데(=1)를
         // 가리킨다. 한글 2022 는 그런 문서를 열 때 본문을 통째로 버리고 빈 1쪽으로 연다
         // (10k 전수 스윕의 x2h 본문 소실군 — 저장본은 rhwp 재파싱만 통과하는 함정).
+        // [#9058] 줄 시작은 제어 위치(`control_source_positions`)와 같은 축으로 센다. 제어 앞에
+        // 놓인 `controls[]` 밖 슬롯(누름틀 끝·제목 차례 표시)을 빼면 그 뒤 개체가 저장 줄보다
+        // 8유닛 앞에서 시작하고, 제어 위치와 비교할 때 한 줄 뒤로 판정된다.
         let inline_sizes = storage.collect(
             para.controls
                 .iter()
-                .scan(0u32, |utf16_pos, ctrl| {
-                    let start = *utf16_pos;
+                .enumerate()
+                .scan(0u32, |utf16_pos, (index, ctrl)| {
+                    let start = *utf16_pos
+                        + para.trailing_auxiliary_slots_before(index) * CTRL_CHAR_CODE_UNITS;
                     if ctrl.occupies_ctrl_char_slot() {
                         *utf16_pos += CTRL_CHAR_CODE_UNITS;
                     }
@@ -6297,7 +6400,16 @@ fn try_reflow_line_segs_impl<S: Storage>(
                 }),
         )?;
         if inline_sizes.iter().any(|(_, occupied)| occupied.is_some()) {
-            let max_line_width = seg_width_hwp.max(1);
+            // 개체만 있는 줄도 본문과 같은 들여쓰기/내어쓰기 폭을 소비한다.
+            // 게시 segment_width는 유지하고 줄 나눔의 가용 폭에서만 뺀다.
+            let max_line_width = |line_index: usize| {
+                let indent = if line_index == 0 {
+                    indent_px.max(0.0)
+                } else {
+                    (-indent_px).max(0.0)
+                };
+                px_to_hwpunit((available_width_px - indent).max(1.0), dpi)
+            };
             let mut line_specs: Vec<(u32, i32, i32)> = Vec::new();
             let mut line_start = 0u32;
             let mut line_width = 0i32;
@@ -6312,7 +6424,9 @@ fn try_reflow_line_segs_impl<S: Storage>(
                 // 폭 없는 앵커도 이미 넘친 개체 뒤에는 새 줄에 속한다.
                 // 앞 앵커만 남기고 뒤 앵커를 건너뛰면 말미의 정상 글자 줄을 잃는다.
                 let (ctrl_width, ctrl_height) = occupied.unwrap_or((0, 0));
-                if (line_width > 0 || line_has_anchor) && line_width + ctrl_width > max_line_width {
+                if (line_width > 0 || line_has_anchor)
+                    && line_width + ctrl_width > max_line_width(line_specs.len())
+                {
                     storage.push(&mut line_specs, (line_start, line_width, line_height))?;
                     line_start = utf16_start;
                     line_width = 0;
@@ -6381,6 +6495,13 @@ fn try_reflow_line_segs_impl<S: Storage>(
                 seg.vertical_pos = vpos;
                 vpos += seg.line_height.saturating_add(seg.line_spacing);
             }
+            mark_indented_lines(
+                &mut new_line_segs,
+                0,
+                para_style,
+                &orig_line_segs,
+                seg_width_hwp,
+            );
             para.replace_line_segs(new_line_segs);
         } else {
             // 빈 문단도 활성 글자 모양의 크기로 줄을 만든다. 앞 문단 LINE_SEG의
@@ -6599,7 +6720,8 @@ fn try_reflow_line_segs_impl<S: Storage>(
         &text_chars,
         available_width_px,
         indent_px,
-        TabFill::for_paragraph(para_style, indent_px, available_width_px),
+        TabFill::for_paragraph(para_style, indent_px, available_width_px)
+            .with_stop_overflow_wraps(styles),
         korean_break_unit,
         condense_min_space,
         &try_resolved_paragraph_letter_spacing(
@@ -6630,7 +6752,8 @@ fn try_reflow_line_segs_impl<S: Storage>(
             &text_chars,
             available_width_px,
             indent_px,
-            TabFill::for_paragraph(para_style, indent_px, available_width_px),
+            TabFill::for_paragraph(para_style, indent_px, available_width_px)
+                .with_stop_overflow_wraps(styles),
             korean_break_unit,
             condense_min_space,
             &try_resolved_paragraph_letter_spacing(

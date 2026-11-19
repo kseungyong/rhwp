@@ -19,13 +19,16 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `ai-settings.test.mjs` | 상시 | active | AI 모델·키 설정·동의·암호화 저장·잠금·삭제 | 빈 문서 | npm e2e:ai-settings | Anthropic 응답 가로채기, 실제 키·외부 API 미사용 |
 | `side-panel.test.mjs` | 상시 | active | AI 도우미 패널 열기·닫기·폭·눈금자·선택문 보존 | 합성 문서 | npm e2e:side-panel | 실제 Studio DOM·키 입력 |
 | `canvaskit-periodic-borders-issue7998.test.mjs` | 상시 | active | #7998 주기 괘선의 CanvasKit dash 소비와 투명 프레임 무출력 | issue7998/periodic-borders/native-dot-widths.hwpx | 수동 | 실제 software CanvasKit·독립 Print 주기 대조 |
-| `continuous-highlighter.test.mjs` | 상시 | active | 연속 형광펜 모드: 블록 없이 색 선택 시 진입·드래그마다 칠·undo 단계·Esc/버튼 재클릭 종료·블록 있으면 즉시 적용 | 새 문서 | npm e2e:continuous-highlighter | dev server 필요 — run-with-vite.mjs 경유 |
+| `continuous-highlighter.test.mjs` | 상시 | active | 연속 형광펜 모드: 블록 없이 색 선택 시 진입·드래그마다 칠·undo 단계·Esc/버튼 재클릭 종료·블록 있으면 즉시 적용·같은 색 다시 칠하면 지움(넓은 블록은 전체 칠함, 다른 색은 덮어씀, 본문·셀 안 선택) | 새 문서 | npm e2e:continuous-highlighter | dev server 필요 — run-with-vite.mjs 경유 |
 | `web-font-deadline.test.mjs` | 상시 | active | #8614 정상·실패·무응답 초기화와 문서 열기·늦은 완료·후속 편집 | 합성 문서·번들 테스트 글꼴·네트워크 응답 주입 | npm e2e:web-font-deadline | 자체 Vite·Chrome, output 아래 프로필 |
 | `command-error-contract.test.mjs` | 상시 | active | #8104 오류 복구·호스트 전달 계약 | 빈 문서·실패 주입 | 수동 | 내용·선택·history·dirty·후속 편집·MessagePort·세션 교체 |
 | `cell-target-issue8102.test.mjs` | 상시 | active | #8102 생성·클릭·키보드·undo 진입 선택 삭제, 다중 문단·중첩·인접 셀·invalid target | 편집 API 합성 | npm e2e:issue-8102 | fresh WASM·Studio 실제 입력 |
 | `automation-commands.test.mjs` | 상시 | active | studio 자동화 표면 — 커맨드 질의·실행·메뉴 모델·드리프트 가드·다이얼로그 정책·`insert:field` 매개변수 삽입 | — | npm e2e:automation |  |
 | `enter-caret-reveal-issue7486.test.mjs` | 상시 | active | #7486 본문 Enter 새 쪽의 DOM 캐럿·viewport 및 Undo/Redo, 100%/66% 배율·160/200/300% 줄간격 | 편집 API 합성 | npm e2e:enter-caret | 추가 입력 없이 layout 완료 경계 검사 |
 | `issue8174-modal-focus.test.mjs` | 상시 | active | #8174 암호 모달·중첩 모달의 입력 소유 보존 | 빈 문서 | 수동 | 늦은 편집기 focus가 암호 입력을 빼앗지 않음 |
+| `about-dialog-issue8905.test.mjs` | 상시 | active | #8905 낮거나 좁은 화면의 제품 정보 창 — 화면 안 배치·본문 스크롤·닫기 버튼·배경·Escape 닫기 | 문서 없음 | npm e2e:issue-8905 | dev server 필요 — run-with-vite.mjs 경유, 800x360·360x640·1280x900 |
+| `dialog-viewport-issue9133.test.mjs` | 상시 | active | #9133 공통 창 11종·66개 화면 조합의 제목/버튼·본문/탭/목록 스크롤, resize 입력 보존, F7 확인·Undo/Redo·취소 | 새 문서·합성 표/그림·복구 metadata | npm e2e:dialog-viewport | run-with-vite.mjs 경유, 767/768px 경계·320x240·가로/세로·데스크톱 |
+| `initial-page-render-issue9164.test.mjs` | 상시 | active | 최초 페이지 렌더 완료와 성공 표시 순서, 글꼴 갱신·준비 실패·빠른 문서 교체 | 기존 합성 HWP·HWPX | 수동 | 같은 실행의 정상 대조군과 첫 페이지 대조 |
 | `selection-layout-issue8103.test.mjs` | 상시 | active | #8103 Canvas2D/auto의 400문단 Undo/Redo 선택·focus 원점, smooth zoom·scroll·배치·지연 중 새 선택·문서 교체 보존 | plain-text paste 합성 | npm e2e:selection-layout | 첫/중간/마지막 쪽 관계 검사, 명시 CanvasKit·원본 font cache 옵션 |
 | `canvaskit-periodic-borders-issue7998.test.mjs` | 상시 | active | 기존 CanvasKit 주기 테두리의 실제 dash 소비와 잉크 검사 | pdf/issue7998/periodic-borders/native-dot-widths.hwpx | 수동 | 기준 devel의 목록 누락 보완, 테스트 구현 변경 없음 |
 | `autosave-recovery.test.mjs` | 상시 | active | Task #1448 — 미저장 문서 자동 백업 복구 E2E | — | 수동 |  |
@@ -34,9 +37,11 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `bridge-lifecycle.test.mjs` | 상시 | active | Studio Bridge — 부모 페이지에서 createStudio 로 chrome·커맨드·hwpctrl 제어와 destroy 회수 | table-001.hwp | npm e2e:bridge |  |
 | `bridge-perf.test.mjs` | 상시 | active | 브리지 성능 게이트 — 배치 RPC 1왕복·배치 이득·undo 1스텝·수명 잔여 (계획서 §6) | table-001.hwp | npm e2e:bridge-perf |  |
 | `canvas-render-diff.test.mjs` | 상시 | active | Browser canvas visual diff between the legacy PageRenderTree path  | — | npm+CI |  |
+| `canvas-font-alias-issue9077.test.mjs` | 상시 | active | #9077 미공급/공급된 TTF·intrinsic 별칭의 실제 Studio font setter·measureText·fillText 선택 | 라이선스 확인 RHWPHostFixture TTF | npm e2e:issue-9077 | 웹/로컬 공급을 원시 Canvas와 픽셀·폭 비교; 문서 조판 golden 아님 |
 | `canvas-metric-recovery.test.mjs` | 상시 | active | #7084 실제 CanvasView descriptor 오류의 1회 자동 복구·지속 오류 제한·오래된 view 거부·일반 오류 분리 | issue3587/c-form-labnote-001-stage11-filled.hwp/.hwpx | npm e2e:canvas-metric-recovery | 통제 오류 주입, 자연 발생 폰트 장애와 구분 |
 | `canvaskit-font-coverage.test.mjs` | 상시 | active | CanvasKit 번들 폰트와 exact TTC GlyphRun 등록/픽셀 replay 검증 | — | npm+CI |  |
 | `canvaskit-font-preparation-issue7688.test.mjs` | 상시 | active | #7688 명시 CanvasKit의 문서 글꼴 준비·Regular/Bold 실제 outline 선택·자원 실패 Canvas2D fallback | group-drawing-02.hwp, 번들 NotoSerifKR | npm e2e:issue-7688-fonts | software surface, 두 face 공급 순서와 screen/print 대조 |
+| `canvaskit-local-face-identity.test.mjs` | 상시 | active | 표시 이름이 같은 두 local face를 고유 PostScript 식별자로 준비하고 실제 replay를 대조 | 공개 NotoSerifKR·NotoSansSymbols2, 합성 Local Font Access 메타데이터 | 수동 | 설치 글꼴에 의존하지 않으며 두 실제 프로그램의 직접 공급과 비교 |
 | `canvaskit-font-family-fallback-issue7445.test.mjs` | 상시 | active | #7445 선언 글꼴 후보의 glyph coverage·선택 순서·기본 face 소유·결측 진단 | 합성 LayerTree, 공개 NotoSansKR/Pretendard/NanumGothic | npm e2e:issue-7445-font-family | 실제 software CanvasKit의 screen/print를 독립 face 대조군과 비교 |
 | `footnote-marker-replay-contract.mjs` | 유틸 | active | 각주 표식의 저장 기준선과 기존 fallback 소비 계약 | 합성 footnoteMarker | 수동 | `renderer-contract.test.mjs`에서 간접 import |
 | `pattern-image-replay-api.mjs` | 유틸 | active | 반복 이미지 shader의 생성·소유·해제 계약용 API 모형 | 합성 pattern image | 수동 | `renderer-contract.test.mjs`에서 간접 import |
@@ -205,6 +210,7 @@ e2e 스크립트의 **단일 권위 목록**이다. 파일 추가/변경/폐기 
 | `hyperlink-ui-issue6963.test.mjs` | 상시 | active | #6963 한컴형 링크 UI·우클릭·방문 색·undo/redo·드래그 선택 | 새 문서 | 수동 | 실제 WASM 필요 |
 | `memo-delete-undo.test.mjs` | 상시 | active | #8017 메모 기준 글자 Backspace·Delete 삭제와 Ctrl+Z·Ctrl+Y의 메모·범위 복원, 떨어진 삭제 병합 유지 | 새 문서 | npm e2e:memo-delete-undo | 실제 Studio 키 입력·fresh WASM |
 
+| `host-font-input-issue9165.test.mjs` | 상시 | active | #9165 셀 입력의 호스트 글꼴 페이지 조회와 입력 지연 | 합성 3쪽 표·RHWPHostFixture | npm e2e:issue-9165 | Canvas2D, 공급자 3조건 |
 | `host-font-provider-issue7403.test.mjs` | 상시 | active | #7403 호스트 face 선택·동명 교체·실패 복구·저장 이름/dirty 보존 | 새 문서·합성 TTC·번들 Noto·basic/issue2007_nested_cell_pagination_42065.hwp | npm e2e:issue-7403 / e2e:issue-7403-canvas2d | 명시적 CanvasKit/Canvas2D, 측정·paint·SVG 경계 포함 |
 
 | `issue-7593-dyad-display.test.mjs` | 상시 | active | dyad와 복합 수식의 실제 표시·CanvasKit 누락 방지 | `samples/issue7593/` 2개 | 수동 | `VITE_URL=… node e2e/issue-7593-dyad-display.test.mjs --mode=headless`; Native/fresh WASM 전쪽90% 선행 확인; 실제 WASM 바이트·내용·replay 진단 |

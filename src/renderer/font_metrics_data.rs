@@ -53,6 +53,7 @@ mod symbol_slot_chars;
 mod nimbus_roman;
 
 pub(crate) use legacy_hft::{
+    centered_bar_advance_em as original_hft_centered_bar_advance_em,
     is_metric_face as is_legacy_hft_metric_face, metric_face_name as legacy_hft_metric_face,
 };
 
@@ -221,8 +222,13 @@ pub(crate) fn verified_missing_glyph_supplier(
         ("GulimChe", 1024, false, false, '\u{2024}') => Some("Haansoft Batang"),
         // [#8419] batang.ttc(SHA 51d9a8d4…c9d8)의 Batang cmap에도 U+2024가 없다.
         // 10645 운영지침의 독립 한컴2022 Print는 바탕 사이의 `․`만 Haansoft Batang
-        // CID 글꼴로 출력한다. U+2027과 다른 weight/style은 확인하지 않아 바꾸지 않는다.
-        ("Batang", 1024, false, false, '\u{2024}') => Some("Haansoft Batang"),
+        // CID 글꼴로 출력한다. U+2027도 화학 원본의 독립2020 Print에서 같은
+        // 공급자와 178/1024em 전진을 확인했다. 다른 weight/style은 추정하지 않는다.
+        ("Batang", 1024, false, false, '\u{2024}' | '\u{2027}') => Some("Haansoft Batang"),
+        // H2GTRE.TTF(ca822120…5c234)에는 U+2027이 없다. 화학 원본의
+        // 독립 한컴2020 Print는 견고딕 제목 사이의 이 문자만 HBATANG
+        // glyph7(178/1024em)로 출력한다. HFT·다른 스타일은 별개다.
+        ("HYGothic-Extra", 1024, false, false, '\u{2027}') => Some("Haansoft Batang"),
         // 법원 서식 Print의 Haansoft Dotum CID 3과 HDOTUM hmtx의 대응.
         ("Gulim", 1024, false, false, '\u{2024}' | '\u{2027}') => Some("Haansoft Dotum"),
         // [#8619] gulim.ttc(SHA 05a38ff2…ee12)의 Dotum cmap에도 U+2024가 없다.
@@ -506,6 +512,13 @@ pub(crate) fn find_metric_decision_for_character<'a>(
     character: char,
 ) -> Option<MetricLookupDecision<'a>> {
     let mut decision = find_metric_decision(name, bold, italic)?;
+    // 부분 HFT 표에 새로 확인한 일반 glyph를 굵게·기울임의 공급 근거로
+    // 상속하지 않는다. 확인하지 않은 서식은 기존 표시 대체 조회가 폭을 소유한다.
+    if legacy_hft::is_metric_face(decision.metric.name)
+        && legacy_hft::rejects_regular_bar_style(decision.metric.name, bold, italic, character)
+    {
+        return None;
+    }
     if character.is_whitespace() {
         return Some(decision);
     }

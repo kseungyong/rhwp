@@ -336,3 +336,121 @@ test('일반 글리프 대체 face를 준비해도 문서의 주 글꼴 가용�
       ['Host Only', 'Missing Source'], '글리프 대체 face로 미등록 주 글꼴을 등록된 것처럼 처리하지 않는다');
   } finally { await setHostFontProvider(null); }
 });
+
+test('layout participation is explicit and scoped to the provider connection', async () => {
+  const f = fixture();
+  const source = new HostFontSource();
+  await source.setProvider(f.provider);
+  assert.equal(source.layoutEnabled, false);
+  await source.setProvider(f.provider, { layout: true });
+  assert.equal(source.layoutEnabled, true);
+  f.replace({ ...f.snapshot(), revision: 'next' });
+  await source.ready();
+  assert.equal(source.layoutEnabled, true);
+  await source.setProvider(f.provider);
+  assert.equal(source.layoutEnabled, false);
+  await source.setProvider(f.provider, { layout: true });
+  await source.setProvider(null, { layout: true });
+  assert.equal(source.layoutEnabled, false);
+});
+
+test('layout consumers reuse the same selected bytes until the provider generation changes', async () => {
+  const f = fixture();
+  const source = new HostFontSource();
+  await source.setProvider(f.provider, { layout: true });
+  const reference = source.references()[0];
+  await source.read(reference);
+  await source.read(reference);
+  assert.equal(f.reads(), 1);
+  f.replace({ ...f.snapshot(), revision: 'next' });
+  await source.ready();
+  assert.equal(await source.read(reference), null);
+  await source.read(source.references()[0]);
+  assert.equal(f.reads(), 2);
+  await source.setProvider(f.provider, { layout: false });
+  const legacy = source.references()[0];
+  await source.read(legacy);
+  await source.read(legacy);
+  assert.equal(f.reads(), 4);
+});
+
+test('declared host programs keep file identity and reject results from a replaced connection', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { createHash } = await import('node:crypto');
+  const { prepareDeclaredHostFontPrograms } = await import('../src/core/declared-host-font-programs.ts');
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'FontFace');
+  const fixtureBytes = readFileSync(new URL('../../tests/fixtures/fonts/RHWPBitmapSvgGlyphSmoke.ttf', import.meta.url));
+  const bytes = Uint8Array.from(fixtureBytes).buffer;
+  const sha = createHash('sha256').update(fixtureBytes).update(new Uint8Array(4)).digest('hex');
+  Object.defineProperty(globalThis, 'FontFace', {
+    configurable: true, value: class { async load() { return this; } },
+  });
+  const f = fixture();
+  f.provider.readFace = async () => ({ bytes, faceIndex: 0 });
+  const plan = { environmentId: null, requests: [
+    { source: '호스트전용', primary: ['호스트전용'], substitute: [] },
+  ] };
+  try {
+    await setHostFontProvider(f.provider, { layout: true });
+    const result = await prepareDeclaredHostFontPrograms(plan, () => true);
+    assert.equal(result.programs.length, 1);
+    assert.equal(result.programs[0].programId, sha);
+    assert.equal(result.programs[0].family, '호스트전용');
+    assert.equal(result.programs[0].trueType, true);
+    assert.equal(result.programs[0].openTypeCff, false);
+    assert.deepEqual((await prepareDeclaredHostFontPrograms({
+      ...plan, embeddedFamilies: ['호스트전용'],
+    }, () => true)).programs, []);
+    const regular = f.snapshot().faces[0];
+    f.replace({ revision: 'split-programs', faces: [regular, {
+      ...regular, id: 'split-second', postscriptName: 'HostOnly-Second', fullName: 'Host Only Second',
+    }] });
+    const split = await prepareDeclaredHostFontPrograms(plan, () => true);
+    assert.equal(split.programs.length, 1, 'one query has one declared identity even with split face coverage');
+    assert.equal(split.programs[0].programId, sha);
+    const slow = deferred<{ bytes: ArrayBuffer }>();
+    f.provider.readFace = () => slow.promise;
+    await setHostFontProvider(f.provider, { layout: true });
+    const preparing = prepareDeclaredHostFontPrograms(plan, () => true);
+    await new Promise(resolve => setImmediate(resolve));
+    await setHostFontProvider(null);
+    slow.resolve({ bytes });
+    assert.deepEqual((await preparing).programs, []);
+  } finally {
+    await setHostFontProvider(null);
+    if (original) Object.defineProperty(globalThis, 'FontFace', original);
+    else Reflect.deleteProperty(globalThis, 'FontFace');
+  }
+});
+
+// 관계형: OS 글꼴·고정 좌표 없이 실제 family/style 후보의 준비 소유와 중복 제거를 보호한다.
+test('같은 family/style 분할 프로그램은 단일 선택을 강제하지 않고 모두 준비한다', async () => {
+  let reads = 0;
+  const faces: HostFontSnapshot['faces'] = [
+    { id: 'latin', family: 'Original Split', fullName: 'Original Split Latin',
+      postscriptName: 'OriginalSplit-Latin', style: 'Regular', weight: 400, slant: 'normal', aliases: ['원본나눔'] },
+    { id: 'hangul', family: 'Original Split', fullName: 'Original Split Hangul',
+      postscriptName: 'OriginalSplit-Hangul', style: 'Regular', weight: 400, slant: 'normal', aliases: ['원본나눔'] },
+    { id: 'bold', family: 'Original Split', fullName: 'Original Split Bold',
+      postscriptName: 'OriginalSplit-Bold', style: 'Bold', weight: 700, slant: 'normal', aliases: ['원본나눔'] },
+  ];
+  const provider: HostFontProvider = {
+    getSnapshot: async () => ({ revision: 'split-1', faces }),
+    readFace: async () => { reads++; return null; },
+    subscribe: () => () => {},
+  };
+  const bounds = { x: 0, y: 0, width: 200, height: 50 };
+  const run = (bold: boolean) => ({ type: 'textRun' as const, bbox: bounds, text: '한A', baseline: 12,
+    style: { fontFamily: '"원본나눔"', fontSize: 12, color: '#000000', bold } });
+  const tree: PageLayerTree = { pageWidth: 200, pageHeight: 100,
+    root: { kind: 'leaf', bounds, ops: [run(false), run(false), run(true)] } };
+  try {
+    await setHostFontProvider(provider);
+    assert.equal(resolveRendererLocalFont('원본나눔', { weight: 400, slant: 'normal' }), null,
+      '분할 프로그램 중 임의의 한 개를 고르지 않는다');
+    const ids = collectHostFontRequests(tree).map(record => record.hostReference?.face.id);
+    assert.deepEqual(ids, ['latin', 'hangul', 'bold'],
+      '같은 style의 원본 두 프로그램과 실제 굵은 슬롯을 함께 준비한다');
+    assert.equal(reads, 0, '준비 목록 수집은 실제 글꼴 바이트를 읽지 않는다');
+  } finally { await setHostFontProvider(null); }
+});

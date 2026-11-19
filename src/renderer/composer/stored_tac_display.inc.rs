@@ -42,6 +42,52 @@ pub(crate) fn stored_first_tac_line(para: &Paragraph) -> Option<&LineSeg> {
         .then_some(first)
 }
 
+/// 가시 텍스트 없는 문단에서 TAC 표 하나가 혼자 차지한 저장 줄과 그 번호다.
+/// [`stored_first_tac_line`]과 같은 원본 조건을 쓰되, 여러 표가 각자의 저장 줄을
+/// 소유한 문단의 둘째 이후 줄(쪽을 넘겨 vpos 를 되감은 줄 포함)도 수용한다.
+/// 같은 줄의 다른 글자 취급 개체가 있으면 그 줄은 이 표 혼자의 상자가 아니다.
+pub(crate) fn stored_owned_tac_line(
+    para: &Paragraph,
+    control_index: usize,
+) -> Option<(usize, &LineSeg)> {
+    if para.stored_text_partition_dirty
+        || para
+            .line_segs
+            .iter()
+            .any(|line| line.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0)
+        || para
+            .text
+            .chars()
+            .any(|c| !c.is_whitespace() && c > '\u{001f}' && c != '\u{fffc}')
+    {
+        return None;
+    }
+    let Control::Table(table) = para.controls.get(control_index)? else {
+        return None;
+    };
+    if !table.common.treat_as_char || table.caption.is_some() {
+        return None;
+    }
+    let owner = control_line_seg_index(para, control_index)?;
+    let line = para.line_segs.get(owner)?;
+    let shares_line = para.controls.iter().enumerate().any(|(index, control)| {
+        index != control_index
+            && match control {
+                Control::Table(other) => other.common.treat_as_char,
+                Control::Picture(picture) => picture.common.treat_as_char,
+                Control::Shape(shape) => shape.common().treat_as_char,
+                _ => false,
+            }
+            && control_line_seg_index(para, index) == Some(owner)
+    });
+    (!shares_line
+        && i64::from(line.line_height)
+            == i64::from(table.common.height)
+                + i64::from(table.outer_margin_top)
+                + i64::from(table.outer_margin_bottom))
+    .then_some((owner, line))
+}
+
 /// Ordinary whitespace rows before an object in the same stored fragment.
 /// A vpos reset has a different continuation owner; its prefix cannot be
 /// emitted again beside the object after that owner advances the page.
@@ -322,6 +368,27 @@ pub(crate) fn caption_height_px_in_context_with_storage<S: crate::storage::Stora
 }
 
 /// 도형 캡션 선택은 실제 배치와 흐름 측정이 같은 속성을 소비한다.
+/// 글줄이 예약하는 글자처럼 취급 도형의 가로 폭.
+///
+/// 왼쪽·오른쪽 캡션은 개체 옆에 자기 상자(폭 + 개체와의 간격)를 갖고, 한/글은 개체와 캡션을
+/// 합친 폭을 한 글자처럼 줄에 놓는다. 위·아래 캡션은 가로 폭을 늘리지 않는다.
+pub(crate) fn inline_shape_width_hu(shape: &ShapeObject) -> i32 {
+    let width = shape.common().width as i32;
+    match shape_caption_for_layout(shape) {
+        Some(caption)
+            if matches!(
+                caption.direction,
+                CaptionDirection::Left | CaptionDirection::Right
+            ) =>
+        {
+            width
+                .saturating_add(caption.width as i32)
+                .saturating_add(i32::from(caption.spacing))
+        }
+        _ => width,
+    }
+}
+
 pub(crate) fn shape_caption_for_layout(shape: &ShapeObject) -> Option<Caption> {
     match shape {
         ShapeObject::Line(s) => s.drawing.caption.clone(),

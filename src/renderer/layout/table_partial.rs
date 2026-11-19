@@ -1416,6 +1416,65 @@ impl LayoutEngine {
                     resolved_row_heights,
                 )
             });
+            // 분할 행: [Task #993/#1025] start_cut/end_cut(유닛 컷)으로 표시할 줄 범위 계산.
+            // 블록 분할이면 블록-셀 (row,col) 인덱스, 그 외는 행내 row_span==1 col 인덱스.
+            let cut_units: Option<(usize, usize)> = if let Some(cut) = straddle_page_bands
+                .iter()
+                .find(|carry| carry.cell_index == cell_idx)
+                .and_then(|carry| carry.fragment_cut)
+            {
+                Some(cut)
+            } else if is_in_split_row {
+                let (mut su, mut eu) = cell_cut_window(
+                    table,
+                    cell,
+                    start_cut_is_block,
+                    is_block_split,
+                    is_split_start_row,
+                    split_start_block,
+                    is_split_end_row,
+                    split_end_block,
+                    start_cut,
+                    end_cut,
+                    None,
+                    start_row,
+                    end_row.saturating_sub(1),
+                );
+                // 조각의 종료 BlockCut이 이 병합 셀을 소유하더라도 시작 RowCut은 소유하지 않는다.
+                // 종료 슬롯을 보존하고, 예약과 동일한 물리 시작 앞부분을 소비한다.
+                if straddle_start_uncovered && !start_cut_is_block {
+                    if let Some((physical_start, _)) = straddle_cut_units {
+                        su = su.max(physical_start);
+                    }
+                }
+                // 시작 행의 걸침 셀도 수용 단계와 같은 상자·원본 유닛 컷을 쓴다.
+                // 옆 셀의 RowCut 높이로 끝을 다시 추정하면 병합 내용이 누락·반복된다.
+                if eu == usize::MAX && cell.row_span > 1 && cell_end_row > render_range_end {
+                    let (_, accepted_end) = self.rowbreak_straddle_cut_units(
+                        table,
+                        cell,
+                        start_row,
+                        render_range_end,
+                        start_cut,
+                        start_cut_is_block,
+                        start_row_height_override,
+                        end_cut,
+                        is_block_split,
+                        end_row_height_override,
+                        cell_h,
+                        resolved_row_heights,
+                        straddle_page_bands,
+                        styles,
+                    );
+                    eu = accepted_end.max(su);
+                }
+                Some((su, eu))
+            } else if is_rowbreak_straddle {
+                straddle_cut_units
+            } else {
+                None
+            };
+
             // 저장 텍스트 병합 셀의 마지막 조각은 남은 소유 유닛을 최종 물리 셀 상자 안에서 정렬한다.
             // 연속된 원본 줄 위치도 포함하며, 선택한 컷을 아래 줄 구성과 실제 그리기에 재사용한다.
             let stored_restart_span_frame_owns_alignment = !is_in_split_row
@@ -1641,10 +1700,12 @@ impl LayoutEngine {
             let stored_span_frame_owns_alignment = accepted_block_frame_owns_alignment
                 || completed_block_frame_owns_alignment
                 || stored_restart_span_frame_owns_alignment
-                || is_rowbreak_straddle
+                // 실제 선택한 유닛 범위의 정렬 소유는 RowCut/BlockCut 표현과 무관하다.
+                // 같은 원본 프레임을 읽는 블록 컷도 줄 선택과 최종 원점에서 이 범위를 공유한다.
+                || (is_in_split_row || is_rowbreak_straddle)
                     && cell.row_span > 1
                     && cell.vertical_align != crate::model::table::VerticalAlign::Top
-                    && straddle_cut_units.is_some_and(|(start, end)| {
+                    && cut_units.is_some_and(|(start, end)| {
                         self.stored_span_cut_owns_alignment(cell, table, styles, start, end)
                             || (start < end
                                 && self.current_program_span_owns_alignment(table, cell))
@@ -1727,64 +1788,6 @@ impl LayoutEngine {
                     || cut_frame_owns_alignment
                     || stored_span_frame_owns_alignment
                     || original_restart_span_owns_alignment);
-            // 분할 행: [Task #993/#1025] start_cut/end_cut(유닛 컷)으로 표시할 줄 범위 계산.
-            // 블록 분할이면 블록-셀 (row,col) 인덱스, 그 외는 행내 row_span==1 col 인덱스.
-            let cut_units: Option<(usize, usize)> = if let Some(cut) = straddle_page_bands
-                .iter()
-                .find(|carry| carry.cell_index == cell_idx)
-                .and_then(|carry| carry.fragment_cut)
-            {
-                Some(cut)
-            } else if is_in_split_row {
-                let (mut su, mut eu) = cell_cut_window(
-                    table,
-                    cell,
-                    start_cut_is_block,
-                    is_block_split,
-                    is_split_start_row,
-                    split_start_block,
-                    is_split_end_row,
-                    split_end_block,
-                    start_cut,
-                    end_cut,
-                    None,
-                    start_row,
-                    end_row.saturating_sub(1),
-                );
-                // 조각의 종료 BlockCut이 이 병합 셀을 소유하더라도 시작 RowCut은 소유하지 않는다.
-                // 종료 슬롯을 보존하고, 예약과 동일한 물리 시작 앞부분을 소비한다.
-                if straddle_start_uncovered && !start_cut_is_block {
-                    if let Some((physical_start, _)) = straddle_cut_units {
-                        su = su.max(physical_start);
-                    }
-                }
-                // 시작 행의 걸침 셀도 수용 단계와 같은 상자·원본 유닛 컷을 쓴다.
-                // 옆 셀의 RowCut 높이로 끝을 다시 추정하면 병합 내용이 누락·반복된다.
-                if eu == usize::MAX && cell.row_span > 1 && cell_end_row > render_range_end {
-                    let (_, accepted_end) = self.rowbreak_straddle_cut_units(
-                        table,
-                        cell,
-                        start_row,
-                        render_range_end,
-                        start_cut,
-                        start_cut_is_block,
-                        start_row_height_override,
-                        end_cut,
-                        is_block_split,
-                        end_row_height_override,
-                        cell_h,
-                        resolved_row_heights,
-                        straddle_page_bands,
-                        styles,
-                    );
-                    eu = accepted_end.max(su);
-                }
-                Some((su, eu))
-            } else if is_rowbreak_straddle {
-                straddle_cut_units
-            } else {
-                None
-            };
             let saved_frame_needs_alignment =
                 (align_saved_opening_frame && cell_row + 1 == end_row || frame_owns_alignment)
                     && cell.vertical_align != crate::model::table::VerticalAlign::Top;
@@ -2541,16 +2544,81 @@ impl LayoutEngine {
             // 정본은 늘어난 상자 안에서 그 조각을 정렬한다(hwpx_sample2 19쪽: 상자
             // 89.91..1081.39 안에서 칸 내용이 95.06 — 상자 위에서 5.15px).
             let align_inner_height = (cell_h - pad_top - pad_bottom).max(0.0);
+            // 남은 내용 전체를 담은 꼬리 조각의 상자가 그 유닛 점유만으로 닫혔다면
+            // 상자에는 나눌 여분이 없다. 유닛 원장이 마지막 줄 뒤 간격까지 상자에
+            // 넣었으므로 정렬 내용도 같은 점유를 쓴다. 줄간격만큼 짧은 가시 높이로
+            // 다시 가운데 정렬하면 그 절반만큼 내용이 저장 줄 위치보다 내려간다.
+            let centered_content_height = if complete_suffix_frame
+                && atomic_suffix_content_height.is_none()
+                && stored_picture_cut_frame.is_none()
+            {
+                let units = self.cell_units(cell, table, styles);
+                cut_units
+                    .map(|(start, end)| {
+                        let (start, end) = (start.min(units.len()), end.min(units.len()));
+                        units[start..end]
+                            .iter()
+                            .map(|unit| unit.height)
+                            .sum::<f64>()
+                            + self.nested_continuation_header_height(cell, &units, start, styles)
+                    })
+                    .filter(|&occupied| occupied + 0.5 >= align_inner_height)
+                    .map_or(centered_content_height, |occupied| {
+                        centered_content_height.max(occupied.min(align_inner_height))
+                    })
+            } else {
+                centered_content_height
+            };
             let first_source_band_owns_position = first_source_lead > 0.0
                 && matches!(effective_align, VerticalAlign::Top)
                 && !matches!(cell.vertical_align, VerticalAlign::Top);
+            // 온전한 칸의 흐름 자리 개체(도장 등)는 정렬로 내려가도 칸 아래를 넘지 않는다
+            // (일반 표 경로와 같은 계약). 잘린 조각은 문단 원점이 이 조각에 없으므로 제외한다.
+            // 글자 없는 문단의 글자처럼 취급한 그림은 줄로 그려지는 흐름 내용이라 정렬 높이에 든다.
+            let (flow_offset_limit, inline_flow_bottom) = if cell_was_split || is_rowbreak_straddle
+            {
+                (f64::INFINITY, 0.0)
+            } else {
+                let flow_heights = self.no_ls_cell_paragraph_flow_heights(
+                    composed_store.eager_slice(),
+                    &cell.paragraphs,
+                    styles,
+                );
+                let bottom = self.calc_cell_flow_objects_bottom_height(
+                    &cell.paragraphs,
+                    styles,
+                    flow_heights.as_deref(),
+                    super::table_layout::FlowObjectScope::PaintedWithText,
+                );
+                let inline_bottom = self.calc_cell_flow_objects_bottom_height(
+                    &cell.paragraphs,
+                    styles,
+                    flow_heights.as_deref(),
+                    super::table_layout::FlowObjectScope::InlineOnly,
+                );
+                let limit = if bottom > 0.0 {
+                    (align_inner_height - bottom).max(0.0)
+                } else {
+                    f64::INFINITY
+                };
+                (limit, inline_bottom)
+            };
             let text_y_start = match effective_align {
                 VerticalAlign::Top => cell_y + pad_top,
                 VerticalAlign::Center => {
-                    cell_y + pad_top + (align_inner_height - centered_content_height).max(0.0) / 2.0
+                    cell_y
+                        + pad_top
+                        + ((align_inner_height - centered_content_height.max(inline_flow_bottom))
+                            .max(0.0)
+                            / 2.0)
+                            .min(flow_offset_limit)
                 }
                 VerticalAlign::Bottom => {
-                    cell_y + pad_top + (align_inner_height - total_content_height).max(0.0)
+                    cell_y
+                        + pad_top
+                        + (align_inner_height - total_content_height.max(inline_flow_bottom))
+                            .max(0.0)
+                            .min(flow_offset_limit)
                 }
             };
             let text_y_start = stored_empty_picture_frame
@@ -2727,6 +2795,8 @@ impl LayoutEngine {
                     .unwrap_or(0)
             });
             let mut para_y = text_y_start;
+            // [#8576 후속] 쌓인 그림 아래로 같은 칸 뒤 글줄을 내린다(높이 측정과 같은 규칙).
+            let mut square_stack_floor = super::table_layout::CellSquareStackTextFloor::default();
             let mut has_preceding_text = false;
             // [#8686] 흐름을 전진시키지 않은 칸 안 자리차지 표의 바깥 상자 띠.
             let mut cell_float_bands: Vec<std::ops::Range<f64>> = Vec::new();
@@ -3017,6 +3087,21 @@ impl LayoutEngine {
                 let source_controls = &para.controls;
                 let frame_paragraph = composed.paragraph_with_frame_geometry(para);
                 let para = frame_paragraph.as_ref();
+                // 칸 맨 앞부터 그리는 조각만 칸 원점이 이어지는 흐름과 같다.
+                let square_stack_text_top =
+                    cut_units.is_none_or(|(start, _)| start == 0).then(|| {
+                        let sequential_y = para_y;
+                        let top = square_stack_floor.paragraph_top(
+                            self.dpi,
+                            &cell.paragraphs,
+                            styles,
+                            cp_idx,
+                            composed,
+                            para,
+                            para_y,
+                        );
+                        (sequential_y, top)
+                    });
 
                 let stored_host_flow =
                     self.stored_nested_host_physical_flow(cell, table, styles, cp_idx, cut_units);
@@ -3411,6 +3496,12 @@ impl LayoutEngine {
                         )
                         .stored_lead
                             > 0.0;
+                    // 쌓인 그림 때문에 실제로 내려간 문단만 고친다(다른 문단의 앵커는 그대로).
+                    if let Some((sequential_y, top)) = square_stack_text_top {
+                        if top > sequential_y {
+                            para_y = para_y.max(top);
+                        }
+                    }
                     let picture_closing_line = self
                         .stored_partitioned_picture_closing_line(cell, table, styles, cut_units);
                     let lines_before = cell_node.children.len();
@@ -3903,6 +3994,18 @@ impl LayoutEngine {
                                         && crate::renderer::float_placement::parallel_cell_picture_band_height(
                                             para, self.dpi,
                                         ).is_some();
+                                    // 저장 줄 없는 칸에서 뒤 글줄을 그림 아래로 내리는 호스트의 그림.
+                                    let square_floor_host_picture = square_stack_text_top.is_some()
+                                        && !pic.common.treat_as_char
+                                        && matches!(
+                                            pic.common.text_wrap,
+                                            crate::model::shape::TextWrap::Square
+                                        )
+                                        && crate::renderer::para_has_no_stored_line_segs(para)
+                                        && crate::renderer::float_placement::cell_paragraph_square_text_obstacles(
+                                            &cell.paragraphs, cp_idx, self.dpi,
+                                        )
+                                        .is_some();
                                     let anchor_y = if parallel_picture_owner
                                         || empty_top_anchored_square_with_inline_sibling
                                     {
@@ -3967,6 +4070,11 @@ impl LayoutEngine {
                                         // 그림을 줄 높이만큼 끌어내렸다 — 한/글 2024 PDF
                                         // 36308670 2쪽 빈 문단 1100HU=14.67px.
                                         top
+                                    } else if square_floor_host_picture {
+                                        // 저장 줄 없는 칸에서 뒤 글줄을 그림 아래로 내리는 호스트의
+                                        // 그림은 문단 위가 원점이다(뒤 글은 위 바닥 규칙이 민다).
+                                        // 구성 뒤 `para_y` 는 호스트 빈 줄 하나를 지난 자리다.
+                                        para_y_before_compose
                                     } else if start_line == 0
                                         && end_line == 0
                                         && uncut_control_only_nested_table
@@ -3996,6 +4104,27 @@ impl LayoutEngine {
                                         super::table_inline_picture_origin::rendered_overlay_picture_origin(
                                             &cell_node, para, ctrl_idx, section_index, cp_idx, anchor_y,
                                         ).unwrap_or(anchor_y);
+                                    // 음수 세로 오프셋은 칸 내용 위까지 그림을 올린다(높이 측정과 같은 값).
+                                    let single_square_picture = source_controls
+                                        .iter()
+                                        .filter(|c| matches!(c, Control::Picture(p) if !p.common.treat_as_char))
+                                        .count()
+                                        == 1;
+                                    let anchor_y = if square_floor_host_picture
+                                        && single_square_picture
+                                    {
+                                        let room_above = square_stack_floor
+                                            .content_top()
+                                            .map_or(0.0, |top| para_y_before_compose - top);
+                                        anchor_y
+                                            + crate::renderer::float_placement::cell_square_host_picture_lift(
+                                                &pic.common,
+                                                room_above,
+                                                self.dpi,
+                                            )
+                                    } else {
+                                        anchor_y
+                                    };
                                     // 칸 문단 기준 어울림 개체의 음수 오프셋은 측정 프레임 위
                                     // 공간을 만들지 않는다 — 일반 표 경로와 같은 계약
                                     // (`cell_wrap_vertical_offset_hu`).
@@ -4038,13 +4167,24 @@ impl LayoutEngine {
                                     let picture_box = paragraph_picture_band
                                         .as_ref()
                                         .and_then(|band| band.boxes.get(ctrl_idx));
-                                    let paragraph_owned_picture = picture_box.is_some()
+                                    // 저장 줄이 없는 글자 없는 문단도 앞 내용 뒤에 놓이면 그 문단 원점이
+                                    // 곧 자리차지 그림의 자리다(일반 표 경로와 같은 계약).
+                                    let no_ls_paragraph_owned_picture = top_and_bottom_para
+                                        && pic.common.flow_with_text
+                                        && pic.common.vert_align
+                                            == crate::model::shape::VertAlign::Top
+                                        && crate::renderer::para_has_no_stored_line_segs(para)
+                                        && para.text.trim().is_empty()
+                                        && owns_paragraph_entry
+                                        && start_line == 0;
+                                    let paragraph_owned_picture = ((picture_box.is_some()
                                         && owns_paragraph_entry
                                         && start_line == 0
                                         && end_line > start_line
                                         && crate::renderer::float_placement::signed_hwpunit(
                                             pic.common.vertical_offset,
-                                        ) >= 0
+                                        ) >= 0)
+                                        || no_ls_paragraph_owned_picture)
                                         && crate::renderer::float_placement::picture_host_follows_cell_content(
                                             &cell.paragraphs, cp_idx,
                                         );
@@ -4078,7 +4218,7 @@ impl LayoutEngine {
                                         // 저장 전체 셀 vpos나 셀 상단으로 덮어쓰지 않는다.
                                         para_first_line_top.unwrap_or(para_y_before_compose)
                                             + hwpunit_to_px(
-                                                pic.common.vertical_offset as i32,
+                                                crate::renderer::float_placement::topbottom_flow_vertical_offset_hu(&pic.common),
                                                 self.dpi,
                                             )
                                     } else if top_and_bottom_para

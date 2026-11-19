@@ -123,39 +123,98 @@ impl TypesetEngine {
         // 저장 줄 없는 빈 문단이 비-TAC 어울림 그림·도형만 앵커한 칸은 cell_units 가
         // 400HU 자리 줄·개체 높이(오프셋 제외)·뒤 줄을 세로로 쌓는다. 측정과 그리기는
         // 같은 칸을 `max(글줄, 개체 바닥)` 으로 잰다(height_measurer 의 wrap_bottom).
-        // 온전한 행 높이를 쌓기 값으로 예약하면 표 뒤 흐름이 그 차이만큼 내려간다.
-        // 칸 안에서 앵커 문단 뒤에 다른 문단이 이어질 때만 그 뒤 줄이 개체 옆에 놓여
-        // 쌓기가 과대해진다. 앵커 문단 하나뿐인 그림 앵커 칸은 쌓기 예약을 유지한다 —
-        // 줄이면 다음 작은 표의 머리행이 쪽 끝에 홀로 남는다.
+        // 온전한 행 높이를 쌓기 값으로 예약하면 표 뒤 흐름이 그 차이만큼 내려가고, 쪽을
+        // 넘는 표는 그린 행보다 큰 예약 때문에 들어갈 행을 다음 쪽으로 넘긴다.
+        // 측정 높이를 쓰는 행은 두 가지다.
+        //  1. 앵커 문단 뒤에 다른 문단이 이어지는 칸: 그 뒤 줄이 개체 옆에 놓여 쌓기가
+        //     과대해진다(표를 둔 문단도 저장 줄 없는 빈 문단일 때).
+        //  2. 칸의 선언 높이가 앵커한 개체의 바닥과 안 여백을 이미 담는 칸(사진 칸): 파일이
+        //     적은 칸 높이가 `개체 바닥 + 안 여백` 이상이므로 자리 줄을 개체 위에 쌓은 높이는
+        //     그 칸의 높이가 아니다. 웹한글기안기는 그 행을 선언 높이로 그리고 그 높이로 쪽
+        //     끝까지 행을 담는다. 표를 둔 문단의 글자 유무는 칸 높이와 무관하다.
+        // 선언 높이가 개체를 담지 못하는 칸(개체가 행을 키우는 도장 칸, 한 줄에 그림 여러
+        // 장을 둔 칸)은 종전 쌓기 예약을 유지한다 — 그 행만 측정 높이로 바꾸면 행을 가르는
+        // 장부(cell_units)와 높이가 어긋나 그림이 두 쪽에 나뉘어 그려지거나 빠지고, 작은
+        // 표의 머리 행이 쪽 끝에 홀로 남는다.
+        let is_unstored_square_object_anchor = |cell_para: &crate::model::paragraph::Paragraph| {
+            crate::renderer::para_has_no_stored_line_segs(cell_para)
+                && cell_para.text.trim().is_empty()
+                && cell_para.controls.iter().any(|control| {
+                    let common = match control {
+                        Control::Picture(pic) => &pic.common,
+                        Control::Shape(shape) => shape.common(),
+                        _ => return false,
+                    };
+                    !common.treat_as_char
+                        && matches!(common.text_wrap, crate::model::shape::TextWrap::Square)
+                })
+        };
+        // 칸의 선언 높이가 문단에 매인 모든 개체의 바닥(문단 기준 세로 오프셋 + 높이)과
+        // 위아래 안 여백을 담는가.
+        let declared_height_holds_objects =
+            |cell: &crate::model::table::Cell, cell_para: &crate::model::paragraph::Paragraph| {
+                let padding =
+                    i64::from(cell.effective_vertical_padding_hu(&row_geometry_table.padding));
+                cell_para.controls.iter().all(|control| {
+                    let common = match control {
+                        Control::Picture(pic) => &pic.common,
+                        Control::Shape(shape) => shape.common(),
+                        _ => return true,
+                    };
+                    let top = if matches!(common.vert_rel_to, crate::model::shape::VertRelTo::Para)
+                    {
+                        i64::from(
+                            crate::renderer::float_placement::cell_wrap_vertical_offset_hu(common),
+                        )
+                    } else {
+                        0
+                    };
+                    top + i64::from(common.height) + padding <= i64::from(cell.height)
+                })
+            };
         let unstored_stamp_table = !row_geometry_table.common.treat_as_char
             && crate::renderer::para_has_no_stored_line_segs(para)
             && para.text.trim().is_empty();
+        let not_inline_table = !row_geometry_table.common.treat_as_char;
         let row_has_unstored_square_object_anchor = |row: usize| {
-            unstored_stamp_table
-                && layout_engine
-                    .cells_starting_on_row(row_geometry_table, row)
-                    .any(|cell| {
-                        cell.row as usize == row
-                            && cell.row_span == 1
+            layout_engine
+                .cells_starting_on_row(row_geometry_table, row)
+                .any(|cell| {
+                    cell.row as usize == row
+                        && cell.row_span == 1
+                        && ((unstored_stamp_table
                             && cell.paragraphs.split_last().is_some_and(|(_, anchors)| {
-                                anchors.iter().any(|cell_para| {
-                                    crate::renderer::para_has_no_stored_line_segs(cell_para)
-                                        && cell_para.text.trim().is_empty()
-                                        && cell_para.controls.iter().any(|control| {
-                                            let common = match control {
-                                                Control::Picture(pic) => &pic.common,
-                                                Control::Shape(shape) => shape.common(),
-                                                _ => return false,
-                                            };
-                                            !common.treat_as_char
-                                                && matches!(
-                                                    common.text_wrap,
-                                                    crate::model::shape::TextWrap::Square
-                                                )
-                                        })
-                                })
-                            })
-                    })
+                                anchors
+                                    .iter()
+                                    .any(|cell_para| is_unstored_square_object_anchor(cell_para))
+                            }))
+                            || (not_inline_table
+                                && cell.paragraphs.iter().any(|cell_para| {
+                                    is_unstored_square_object_anchor(cell_para)
+                                        && declared_height_holds_objects(cell, cell_para)
+                                })))
+                })
+        };
+        // 저장 줄 없는 칸의 어울림 그림 바닥 규칙이 글줄을 그림 아래로 실제로 내린 칸이 든
+        // 행(사진 아래 이름표)도 측정 높이를 쓴다. 배치와 높이 측정은 같은 바닥 규칙
+        // (`CellSquareStackTextFloor`)으로 글줄을 그림 아래에 두므로 측정 높이가 곧 그린
+        // 높이다. 칸 유닛은 줄 단위로 더해 그 이동을 모르므로 쓰지 않는다. 바닥 규칙의
+        // 호스트(저장 줄 없는 빈 문단의 비-TAC 어울림 그림)는 위 빈 앵커 문단 조건의 칸에
+        // 들므로, 겹치는 행은 두 조건 모두 같은 측정 높이를 쓴다. 이 조건이 더 덮는 것은
+        // 글자처럼 취급한 표의 행뿐이다. 바닥 규칙이 아무것도 옮기지 않는 그런 행은 종전
+        // 유닛 높이를 그대로 쓴다.
+        let row_has_square_floor_moved_text = |row: usize| {
+            layout_engine
+                .cells_starting_on_row(row_geometry_table, row)
+                .any(|cell| {
+                    cell.row as usize == row
+                        && cell.row_span == 1
+                        && layout_engine.cell_square_floor_moves_text(
+                            cell,
+                            row_geometry_table,
+                            styles,
+                        )
+                })
         };
         let cut_row_h: Vec<f64> = (0..row_count)
             .map(|r| {
@@ -164,6 +223,7 @@ impl TypesetEngine {
                     .any(|c| c.row_span == 1);
                 let row_cut_h = if row_has_stored_square_picture_flow(r)
                     || row_has_unstored_square_object_anchor(r)
+                    || row_has_square_floor_moved_text(r)
                 {
                     // native HWP5 RowBreak stores the adjacent text LINE_SEG ladder as
                     // the authoritative row height. Recomputing this whole row from
@@ -694,18 +754,19 @@ impl TypesetEngine {
                 let host_trailing_spacing =
                     fmt.line_spacings.last().copied().unwrap_or(0.0).max(0.0);
                 st.record_pre_emitted_host_height(para_idx, host_h, host_h - host_trailing_spacing);
-                if let Some(table_top) = fragment_host_placement.as_ref().map(|p| p.table_top) {
-                    self.fill_float_band_gap_successors(
-                        st,
-                        para_idx,
-                        para,
-                        table,
-                        table_top,
-                        paragraphs_all,
-                        composed_all,
-                        styles,
-                    );
-                }
+            }
+            // host 줄을 같은 문단의 앞 형제(글자처럼 취급 표 등)가 이미 냈어도 표 위 틈은 같다.
+            if let Some(table_top) = fragment_host_placement.as_ref().map(|p| p.table_top) {
+                self.fill_float_band_gap_successors(
+                    st,
+                    para_idx,
+                    para,
+                    table,
+                    table_top,
+                    paragraphs_all,
+                    composed_all,
+                    styles,
+                );
             }
             st.mark_pre_emitted_host(para_idx);
         }
@@ -1156,11 +1217,33 @@ impl TypesetEngine {
             };
             // NO_LS 블록 호스트의 작은 글자 상자는 자식 첫 유닛의 수용 근거가
             // 아니다. 실제 컷이 요구하는 높이까지 들어가야 현재 쪽을 유지한다.
-            let min_content = min_content.max(
-                layout_engine
-                    .reflow_row_opening_cut_height(row_geometry_table, 0, styles)
-                    .unwrap_or(0.0),
-            );
+            let opening_cut_height = layout_engine
+                .reflow_row_opening_cut_height(row_geometry_table, 0, styles)
+                .unwrap_or(0.0);
+            // 측정한 첫 줄 높이는 줄간격을 포함한다. 칸의 저장 줄이 첫 유닛 뒤에서 쪽을 다시
+            // 시작하면(행 스캐너가 그 저장 재시작에서 멈춘다) 한/글이 그 유닛을 앞 쪽 끝에 뒀다는
+            // 기록이다. 쪽 끝에 남는 줄은 줄간격을 요구하지 않으므로(#8464 쪽 끝 행 수용 규칙),
+            // 이때는 스캐너가 같은 남은 공간에서 고른 첫 유닛의 내용 높이와 칸 안 여백으로 수용을
+            // 판정한다. 저장 재시작이 없는 표는 기존 판정 그대로다(통째로 다음 쪽에서 시작).
+            let opening_unit_fits_here =
+                first_row_splittable && remaining_on_page_for_first_unit >= opening_cut_height && {
+                    let (res, _) = layout_engine.advance_row_cut_for_physical_band(
+                        row_geometry_table,
+                        0,
+                        &[],
+                        remaining_on_page_for_first_unit,
+                        styles,
+                    );
+                    res.hit_hard_break
+                        && !res.fully_consumed
+                        && res.consumed_height > 0.0
+                        && res.end_cut.iter().any(|&units| units > 0)
+                        && layout_engine.row_content_fits_page_rest(
+                            res.consumed_height + mt.max_padding_for_row(0),
+                            remaining_on_page_for_first_unit,
+                        )
+                };
+            let min_content = min_content.max(opening_cut_height);
             // [Task #1046 Stage 3] 다행(多行) 표의 비분할 첫 행/블록이 잔여공간엔 안
             // 들어가지만 fresh 페이지엔 통째 들어가면 다음 페이지로 이월한다. 첫 행은
             // 행 내부 분할이 안 되고(=is_row_splittable=false) 표에 후속 행 경계가 있어
@@ -1273,7 +1356,7 @@ impl TypesetEngine {
             }
             if stored_page_top_tac_table
                 || (!first_row_splittable && !first_row_force_splittable)
-                || remaining_on_page_for_first_unit < min_content
+                || (remaining_on_page_for_first_unit < min_content && !opening_unit_fits_here)
                 || multirow_clean_defer
             {
                 // [#8652] 저장 vpos 가 되감긴 호스트(`host_starts_new_stored_page`)는 한/글이

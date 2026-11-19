@@ -946,12 +946,15 @@ fn parse_para_shape(
         }
     }
 
+    let mut plain_line_spacing = false;
     if !is_empty_event(e) {
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref ce)) => {
-                    parse_para_shape_child(ce, &mut ps);
+                    if parse_para_shape_child(ce, &mut ps) == ParaShapeChildKind::LineSpacing {
+                        plain_line_spacing = true;
+                    }
                 }
                 Ok(Event::Start(ref ce)) => {
                     match parse_para_shape_child(ce, &mut ps) {
@@ -967,6 +970,7 @@ fn parse_para_shape(
                             // HwpUnitChar case를 우선 적용, 없으면 default 사용
                             parse_para_shape_switch(reader, &mut ps, physical_plain_margin)?;
                         }
+                        ParaShapeChildKind::LineSpacing => plain_line_spacing = true,
                         ParaShapeChildKind::Other => {}
                     }
                 }
@@ -982,6 +986,17 @@ fn parse_para_shape(
             }
             buf.clear();
         }
+    }
+
+    // switch 밖 평문 `<hh:lineSpacing>` 의 고정·최소·여백 값은 평문 여백과 같은 단위 계약을 따른다.
+    // 패키지 xmlVersion 1.4 이상은 물리 HWPUNIT 이라 공통 IR(2× 스케일)로 올리고, 이전 판본은
+    // 저장 IR 값 그대로다. 웹한글기안기 인쇄 실측: 고정 2000 은 1.4 에서 20pt, 1.2 에서 10pt,
+    // 여백 500 은 1.4 에서 5pt, 1.2 에서 2.5pt 를 띄운다(HWP5 저장값 4000 → 20pt 와 같은 IR).
+    if plain_line_spacing
+        && physical_plain_margin
+        && ps.line_spacing_type != LineSpacingType::Percent
+    {
+        ps.line_spacing = ps.line_spacing.saturating_mul(2);
     }
 
     // [Task #1058 후속] line_spacing_v2 (UINT32, 5.0.2.5 이상) 보정.
@@ -1010,6 +1025,7 @@ fn parse_para_shape(
 enum ParaShapeChildKind {
     Margin,
     Switch,
+    LineSpacing,
     Other,
 }
 
@@ -1078,7 +1094,7 @@ fn parse_para_shape_child(
                     _ => {}
                 }
             }
-            ParaShapeChildKind::Other
+            ParaShapeChildKind::LineSpacing
         }
         b"border" => {
             for attr in ce.attributes().flatten() {
@@ -1726,10 +1742,10 @@ fn parse_border_fill(
                             for attr in ce.attributes().flatten() {
                                 match attr.key.as_ref().as_bytes() {
                                     b"faceColor" => {
-                                        if attr_str(&attr).eq_ignore_ascii_case("none") {
-                                            face_is_none = true;
-                                        }
                                         solid.background_color = parse_color(&attr);
+                                        // 한글 2018은 같은 색 없음 값을 #FFFFFFFF로 저장한다.
+                                        face_is_none = solid.background_color == 0xffff_ffff
+                                            || attr_str(&attr).eq_ignore_ascii_case("none");
                                     }
                                     b"hatchColor" => solid.pattern_color = parse_color(&attr),
                                     b"hatchStyle" => {
@@ -3457,30 +3473,33 @@ mod tests {
   </hh:refList>
 </hh:head>"##;
 
-        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
-        let bf = &doc_info.border_fills[0];
+        for color in ["none", "#FFFFFFFF", "#ffffffff"] {
+            let xml = xml.replace("faceColor=\"none\"", &format!("faceColor=\"{color}\""));
+            let (doc_info, _) = parse_hwpx_header(&xml).unwrap();
+            let bf = &doc_info.border_fills[0];
 
-        // 렌더는 빈 채우기.
-        assert_eq!(
-            bf.fill.fill_type,
-            FillType::None,
-            "빈 winBrush 는 렌더상 채움 없음"
-        );
-        // 직렬화 복원을 위해 solid 데이터는 보존.
-        let solid = bf
-            .fill
-            .solid
-            .as_ref()
-            .expect("winBrush solid 데이터 보존 필요");
-        assert_eq!(
-            solid.background_color, 0xFFFF_FFFF,
-            "faceColor=none 센티넬 보존"
-        );
-        assert_eq!(
-            solid.pattern_color, 0xFF00_0000,
-            "hatchColor=#FF000000 보존"
-        );
-        assert_eq!(solid.pattern_type, -1, "무늬 없음");
+            // 렌더는 빈 채우기.
+            assert_eq!(
+                bf.fill.fill_type,
+                FillType::None,
+                "빈 winBrush 는 렌더상 채움 없음"
+            );
+            // 직렬화 복원을 위해 solid 데이터는 보존.
+            let solid = bf
+                .fill
+                .solid
+                .as_ref()
+                .expect("winBrush solid 데이터 보존 필요");
+            assert_eq!(
+                solid.background_color, 0xFFFF_FFFF,
+                "faceColor=none 센티넬 보존"
+            );
+            assert_eq!(
+                solid.pattern_color, 0xFF00_0000,
+                "hatchColor=#FF000000 보존"
+            );
+            assert_eq!(solid.pattern_type, -1, "무늬 없음");
+        }
     }
 
     #[test]

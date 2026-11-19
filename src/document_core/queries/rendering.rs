@@ -3615,7 +3615,7 @@ impl DocumentCore {
             "\"borderRight\":{\"type\":0,\"width\":0,\"color\":\"#000000\"},",
             "\"borderTop\":{\"type\":0,\"width\":0,\"color\":\"#000000\"},",
             "\"borderBottom\":{\"type\":0,\"width\":0,\"color\":\"#000000\"},",
-            "\"fillType\":\"none\",\"fillColor\":\"#ffffff\",\"patternColor\":\"#000000\",\"patternType\":0"
+            "\"fillType\":\"none\",\"fillColor\":\"#ffffff\",\"patternColor\":\"#000000\",\"patternType\":-1"
         )
         .to_string();
 
@@ -5936,13 +5936,16 @@ impl DocumentCore {
                 storage,
             )?;
 
-            // 구역 간 page_number_pos 상속: 이 구역에 PageNumberPos가 없으면 이전 구역 값 사용
-            let section_has_own_pnp = result.pages.iter().any(|p| p.page_number_pos.is_some());
-            if !section_has_own_pnp {
-                if let Some(ref prev_pnp) = carry_page_number_pos {
-                    for page in &mut result.pages {
-                        page.page_number_pos = Some(crate::storage::try_clone(prev_pnp, storage)?);
-                    }
+            // 새 구역의 첫 위치 선언이 실제로 적용되기 전까지는 앞 구역 설정을 잇는다.
+            // 구역 뒤쪽에 선언이 있다는 이유로 그 앞 쪽들의 쪽번호를 지우지 않는다.
+            // 명시적인 위치 0도 Some이므로, 첫 선언 이후의 표시/감추기는 그대로 보존한다.
+            if let Some(ref prev_pnp) = carry_page_number_pos {
+                for page in result
+                    .pages
+                    .iter_mut()
+                    .take_while(|page| page.page_number_pos.is_none())
+                {
+                    page.page_number_pos = Some(crate::storage::try_clone(prev_pnp, storage)?);
                 }
             }
 
@@ -6394,6 +6397,7 @@ impl DocumentCore {
                     storage,
                 )?;
             let text_metrics = if !profile.hwp3_layout() {
+                let owned_hwp5_cells = self.owns_section_line_cache(idx);
                 crate::renderer::render_normalization::stored_text_metrics::normalize_with_storage(
                     math_textboxes
                         .as_deref()
@@ -6402,6 +6406,7 @@ impl DocumentCore {
                     &self.styles,
                     self.dpi,
                     profile.hwpx_stored_layout() && !profile.hwp5_origin_hwpx(),
+                    owned_hwp5_cells,
                     storage,
                 )?
             } else {
@@ -8770,8 +8775,13 @@ impl DocumentCore {
 
     /// 페이지에 렌더된 텍스트를 줄 단위로 추출한다.
     ///
-    /// TextLine 노드의 시각적 순서를 유지하며 TextRun/각주 마커/양식 텍스트를 합친다.
+    /// 렌더 트리 순서로 TextLine과 독립 TextRun/수식/각주 마커/양식 텍스트를 합친다.
     pub fn extract_page_text_native(&self, page_num: u32) -> Result<String, HwpError> {
+        let tree = self.build_page_tree(page_num)?;
+        Ok(Self::extract_render_tree_text(&tree.root))
+    }
+
+    fn extract_render_tree_text(root: &crate::renderer::render_tree::RenderNode) -> String {
         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
 
         fn collect_line_text(node: &RenderNode, out: &mut String, has_token: &mut bool) {
@@ -8818,10 +8828,63 @@ impl DocumentCore {
             }
         }
 
+        struct Fragment<'a> {
+            node: &'a RenderNode,
+            owner: (Option<usize>, Option<usize>),
+            run: Option<&'a TextRunNode>,
+        }
+
+        impl<'a> Fragment<'a> {
+            fn from_node(node: &'a RenderNode) -> Option<Self> {
+                let (owner, run) = match &node.node_type {
+                    RenderNodeType::TextRun(run) => {
+                        ((run.section_index, run.para_index), Some(run))
+                    }
+                    RenderNodeType::FootnoteMarker(marker) => {
+                        ((Some(marker.section_index), Some(marker.para_index)), None)
+                    }
+                    RenderNodeType::FormObject(form) => {
+                        ((Some(form.section_index), Some(form.para_index)), None)
+                    }
+                    RenderNodeType::Equation(eq) => ((eq.section_index, eq.para_index), None),
+                    _ => return None,
+                };
+                Some(Self { node, owner, run })
+            }
+
+            fn same_line(&self, next: &Self) -> bool {
+                if self.owner != next.owner {
+                    return false;
+                }
+                if let (Some(a), Some(b)) = (self.run, next.run) {
+                    // 같은 줄의 런은 조판에서 공유한 원점·기준선을 보존한다.
+                    return a.cell_context == b.cell_context
+                        && a.is_vertical == b.is_vertical
+                        && if a.is_vertical {
+                            self.node.bbox.x == next.node.bbox.x
+                        } else {
+                            self.node.bbox.y + a.baseline == next.node.bbox.y + b.baseline
+                        };
+                }
+                // 기준선이 다른 위첨자 참조와 수식·양식은 같은 줄 상자 안에서 이어진다.
+                let a = self.node.bbox;
+                let b = next.node.bbox;
+                if self.run.or(next.run).is_some_and(|run| run.is_vertical) {
+                    a.x.max(b.x) < (a.x + a.width).min(b.x + b.width)
+                } else {
+                    a.y.max(b.y) < (a.y + a.height).min(b.y + b.height)
+                }
+            }
+        }
+
         fn collect_page_lines(node: &RenderNode, lines: &mut Vec<String>) {
             if matches!(
                 node.node_type,
-                RenderNodeType::TextLine(_) | RenderNodeType::Equation(_)
+                RenderNodeType::TextLine(_)
+                    | RenderNodeType::TextRun(_)
+                    | RenderNodeType::Equation(_)
+                    | RenderNodeType::FootnoteMarker(_)
+                    | RenderNodeType::FormObject(_)
             ) {
                 let mut line = String::new();
                 let mut has_token = false;
@@ -8834,15 +8897,57 @@ impl DocumentCore {
                 return;
             }
 
+            let mut line = String::new();
+            let mut has_token = false;
+            let mut anchor: Option<Fragment<'_>> = None;
+            let mut ended = false;
             for child in &node.children {
-                collect_page_lines(child, lines);
+                if let Some(fragment) = Fragment::from_node(child) {
+                    let new_line = ended
+                        || anchor
+                            .as_ref()
+                            .is_some_and(|prev| !prev.same_line(&fragment));
+                    if new_line {
+                        if has_token {
+                            lines.push(std::mem::take(&mut line));
+                            has_token = false;
+                        }
+                        anchor = None;
+                    }
+                    collect_line_text(child, &mut line, &mut has_token);
+                    ended = fragment
+                        .run
+                        .is_some_and(|run| run.is_para_end || run.is_line_break_end);
+                    // 첫 본문 런의 기준선을 유지해 큰 인라인 개체가 다음 줄까지 묶지 않게 한다.
+                    if anchor
+                        .as_ref()
+                        .is_none_or(|prev| prev.run.is_none() && fragment.run.is_some())
+                    {
+                        anchor = Some(fragment);
+                    }
+                } else {
+                    let mut child_lines = Vec::new();
+                    collect_page_lines(child, &mut child_lines);
+                    // 배경·테두리 같은 비텍스트 노드는 같은 줄의 런을 가르지 않는다.
+                    if !child_lines.is_empty() {
+                        if has_token {
+                            lines.push(std::mem::take(&mut line));
+                            has_token = false;
+                        }
+                        anchor = None;
+                        ended = false;
+                        lines.extend(child_lines);
+                    }
+                }
+            }
+            if has_token {
+                lines.push(line);
             }
         }
 
-        let tree = self.build_page_tree(page_num)?;
         let mut lines = Vec::new();
-        collect_page_lines(&tree.root, &mut lines);
-        Ok(lines.join("\n"))
+        collect_page_lines(root, &mut lines);
+        lines.join("\n")
     }
 
     /// 페이지를 Markdown으로 추출한다.
@@ -9270,6 +9375,7 @@ fn table_summary_json(
 /// 2. reset 발견: reset 직전 줄의 vpos + line_height (HWP 가 단을 끊은 위치)
 /// 3. reset 미발견: 단의 마지막 처리 줄 (FullParagraph: 마지막, PartialParagraph: end_line-1)
 /// 4. Table/Shape 만 있는 항목은 추정 불가 (None)
+/// 5. 단이 rhwp 임시 줄(bit 31, `TAG_IMPLEMENTATION_PROPERTY`)을 읽으면 한컴 근거가 아니므로 None
 fn compute_hwp_used_height(
     cc: &crate::renderer::pagination::ColumnContent,
     paragraphs: &[Paragraph],
@@ -9277,6 +9383,13 @@ fn compute_hwp_used_height(
 ) -> Option<f64> {
     use crate::renderer::hwpunit_to_px;
     use crate::renderer::pagination::PageItem;
+
+    // [Task #9142] rhwp 가 계산해 넣은 임시 줄(bit 31)은 한컴이 저장한 값이 아니다. 그런 줄을 근거로
+    // 추정하면 조판이 맞아도 가짜 diff 가 나오므로, 이 단은 추정 불가로 둔다.
+    // #8939 이후 IR 의 bit 31 은 rhwp 합성 표지만 뜻한다(한/글 저장 비트는 파서가 지움).
+    if column_reads_synthetic_lines(cc, paragraphs) {
+        return None;
+    }
 
     // [Task #1612] vpos 는 다페이지에서 누적값(예: page2 vpos≈66568~127587 HU)이므로, per-page
     // `used_height` 와 비교하려면 이 페이지 시작 오프셋을 빼야 한다. 차감하지 않으면 페이지마다
@@ -9375,6 +9488,35 @@ fn compute_hwp_used_height(
     let seg = p.line_segs.get(line_idx)?;
     let bottom_hwpu = seg.vertical_pos + seg.line_height + seg.line_spacing;
     Some(hwpunit_to_px((bottom_hwpu - base_top).max(0), dpi))
+}
+
+/// 단이 읽는 줄 가운데 rhwp 임시 줄(bit 31)이 하나라도 있는지.
+fn column_reads_synthetic_lines(
+    cc: &crate::renderer::pagination::ColumnContent,
+    paragraphs: &[Paragraph],
+) -> bool {
+    use crate::model::paragraph::LineSeg;
+    use crate::renderer::pagination::PageItem;
+
+    cc.items.iter().any(|item| {
+        let (para_index, lines) = match item {
+            PageItem::FullParagraph { para_index } => (*para_index, 0..usize::MAX),
+            PageItem::PartialParagraph {
+                para_index,
+                start_line,
+                end_line,
+            } => (*para_index, *start_line..*end_line),
+            PageItem::Table { para_index, .. } | PageItem::PartialTable { para_index, .. } => {
+                (*para_index, 0..1)
+            }
+            _ => return false,
+        };
+        paragraphs.get(para_index).is_some_and(|p| {
+            p.line_segs.iter().enumerate().any(|(i, seg)| {
+                lines.contains(&i) && seg.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+            })
+        })
+    })
 }
 
 /// [#3697] vpos 범위 분석 결과 — 텍스트(`format_vpos_range`)/JSON(`vpos_range_json`)
@@ -10592,7 +10734,7 @@ mod tests {
                 "borderRight":{"type":1,"width":1,"color":"#000000"},
                 "borderTop":{"type":1,"width":1,"color":"#000000"},
                 "borderBottom":{"type":1,"width":1,"color":"#000000"},
-                "fillType":"solid","fillColor":"#ffffff","patternColor":"#000000","patternType":0,
+                "fillType":"solid","fillColor":"#ffffff","patternColor":"#000000","patternType":-1,
                 "fillArea":"paper","applyPage":"all"}"##,
             )
             .expect("page border fill should update");

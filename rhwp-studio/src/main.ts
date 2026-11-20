@@ -1,4 +1,6 @@
 import { DocumentOpenSession } from './core/document-open-session';
+import { isDesktopRuntime } from '@/command/desktop-file-system';
+import { scheduleStartupUpdateCheck } from '@/command/desktop-updater';
 import { setLinkHostHandler } from './core/link-navigation';
 import { RecoveryCipher, sameRecoveryDraft } from './recovery/recovery-crypto';
 import { setFormActionsEnabled } from './core/form-action-policy';
@@ -2308,6 +2310,11 @@ void initPromise.then(() => {
   // 실패해도 편집기는 그대로 쓸 수 있어야 하므로 로그만 남긴다.
   if (__RHWP_AI__ && sidePanels && window.parent === window) {
     plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
+  }
+  // 데스크톱 셸: 숨겨둔 전용 메뉴("업데이트 확인")를 드러내고 시작 시 1회 조용히 업데이트를 확인한다.
+  if (isDesktopRuntime()) {
+    document.querySelectorAll<HTMLElement>('[data-desktop-only]').forEach((el) => { el.hidden = false; });
+    scheduleStartupUpdateCheck();
   }
 });
 

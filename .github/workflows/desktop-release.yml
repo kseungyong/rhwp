@@ -1,0 +1,132 @@
+# RHWP Studio 데스크톱 릴리스 — 사내 포털 자동 게시
+#
+# `studio-v<버전>` 태그를 push하면 Windows(NSIS)·macOS(dmg) 설치 파일과 자동 업데이트
+# 패키지를 빌드해 portal.kdsys.co.kr 다운로드 센터로 올린다. 직원 PC의 RHWP Studio는
+# 포털의 latest.json을 보고 스스로 업그레이드한다.
+#
+# 필요한 저장소 secrets:
+# - TAURI_SIGNING_PRIVATE_KEY   업데이트 패키지 minisign 개인키 (암호 없음)
+# - PORTAL_UPLOAD_TOKEN         포털 업로드 토큰 (포털 서버의 DOWNLOADS_UPLOAD_TOKEN과 동일)
+# - WINDOWS_CERT_CER_B64        (선택) 사내 배포용 공개 인증서(.cer) base64 — 없으면
+#                               CI가 1회용 인증서를 만들어 번들 리소스 요건만 채운다.
+name: Desktop Release
+
+on:
+  push:
+    tags: ['studio-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            bundle-paths: |
+              rhwp-studio/src-tauri/target/release/bundle/nsis/*.exe
+              rhwp-studio/src-tauri/target/release/bundle/nsis/*.exe.sig
+          - os: macos-latest
+            name: macos
+            bundle-paths: |
+              rhwp-studio/src-tauri/target/release/bundle/dmg/*.dmg
+              rhwp-studio/src-tauri/target/release/bundle/macos/*.app.tar.gz
+              rhwp-studio/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 태그와 tauri.conf.json 버전 일치 확인
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#studio-v}"
+          conf_ver="$(node -p "require('./rhwp-studio/src-tauri/tauri.conf.json').version")"
+          if [ "$ver" != "$conf_ver" ]; then
+            echo "태그 버전($ver)과 tauri.conf.json 버전($conf_ver)이 다릅니다." >&2
+            exit 1
+          fi
+
+      - name: 배포 인증서 준비
+        shell: bash
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_CER_B64 }}
+        run: |
+          mkdir -p rhwp-studio/src-tauri/packaging/cert
+          dest="rhwp-studio/src-tauri/packaging/cert/rhwp-studio-cert.cer"
+          if [ -n "$CERT_B64" ]; then
+            printf '%s' "$CERT_B64" | base64 -d > "$dest"
+            echo "secrets의 사내 인증서를 사용합니다."
+          else
+            # 번들 리소스 요건만 채우는 1회용 인증서 — 설치 훅의 certutil 등록이
+            # 실패해도 설치는 계속되므로(installer-hooks.nsh) 무해하다.
+            openssl req -x509 -newkey rsa:2048 -keyout /tmp/ci-cert-key.pem \
+              -out /tmp/ci-cert.pem -days 30 -nodes -subj "/CN=RHWP Studio CI" 2>/dev/null
+            openssl x509 -in /tmp/ci-cert.pem -outform der -out "$dest"
+            echo "secrets에 인증서가 없어 1회용 인증서를 만들었습니다."
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            rhwp-studio/src-tauri -> rhwp-studio/src-tauri/target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: rhwp-studio/package-lock.json
+
+      - name: wasm-pack 설치
+        shell: bash
+        run: npm install -g wasm-pack
+
+      - name: WASM 빌드
+        shell: bash
+        run: bash scripts/wasm-pack-locked.sh --target web --out-dir pkg
+
+      - name: 프런트엔드 의존성 설치
+        working-directory: rhwp-studio
+        run: npm ci
+
+      - name: Tauri 번들 빌드 (업데이트 패키지 서명 포함)
+        working-directory: rhwp-studio
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npm run tauri:build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}
+          path: ${{ matrix.bundle-paths }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 포털 다운로드 센터에 게시
+        env:
+          PORTAL_UPLOAD_TOKEN: ${{ secrets.PORTAL_UPLOAD_TOKEN }}
+        run: |
+          node scripts/desktop-release/publish-to-portal.mjs \
+            --version "${GITHUB_REF_NAME#studio-v}" --dir dist

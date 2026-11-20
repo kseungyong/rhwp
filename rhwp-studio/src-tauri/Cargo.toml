@@ -29,3 +29,8 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
+tauri-plugin-process = "2"
+
+# updater는 데스크톱 전용 — mobile 타깃에는 존재하지 않는 플러그인이라 분리한다.
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-updater = "2"

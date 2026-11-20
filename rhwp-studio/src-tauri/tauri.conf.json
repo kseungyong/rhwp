@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "RHWP Studio",
-  "version": "0.8.3",
+  "version": "0.9.1",
   "identifier": "com.rhwp.studio",
   "build": {
     "frontendDist": "../dist",
@@ -26,9 +26,21 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDczOUExRjYzOTIyNDcxMDcKUldRSGNTU1NZeCthYzlDV2VSSDFTZ3k3Y0JxQ0gvbjFmUllPK3MvZ3RqSzNMRjFVYWJ0Mm9zVVQK",
+      "endpoints": [
+        "https://portal.kdsys.co.kr/api/downloads/rhwp-studio/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "app", "dmg"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -45,6 +45,8 @@
           <div class="md-item disabled" data-cmd="file:print"><span class="md-icon icon-print"></span><span class="md-label" data-i18n="command.file.print.label">인쇄</span><span class="md-shortcut">Ctrl+P</span></div>
           <div class="md-sep"></div>
           <div class="md-item" data-cmd="file:about"><span class="md-icon icon-help"></span><span class="md-label" data-i18n="command.file.about.label">제품 정보</span></div>
+          <!-- 데스크톱 셸 전용 — 웹 빌드에서는 숨긴 채로 두고 Tauri 런타임에서만 main.ts가 드러낸다. -->
+          <div class="md-item" data-cmd="file:check-update" data-desktop-only hidden><span class="md-icon"></span><span class="md-label" data-i18n="command.file.checkUpdate.label">업데이트 확인</span></div>
         </div>
       </div>
       <!-- ── 편집 ── -->

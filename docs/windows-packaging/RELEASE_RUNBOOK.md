@@ -3,8 +3,45 @@
 사내 배포용 Windows 데스크톱 앱(`RHWP Studio`) 설치 파일을 만드는 절차다. 설계 배경은
 [Windows 패키징 설계 스펙](../superpowers/specs/2026-08-06-rhwp-windows-packaging-design.md)을 따른다.
 
-이 절차는 **전부 Windows 머신에서 실행한다** — Tauri의 NSIS 번들러가 Windows에서만 최종 `.exe`를
-만든다. CI 자동화는 범위 밖이므로 릴리스 담당자가 아래를 순서대로 수동 실행한다.
+> **2026-11-20부터 기본 경로는 자동 릴리스다** — 아래 [자동 릴리스](#자동-릴리스-github-actions--사내-포털) 참고.
+> 이 문서의 수동 절차는 CI를 쓸 수 없을 때의 대체 경로로 유지한다.
+
+## 자동 릴리스 (GitHub Actions → 사내 포털)
+
+macOS 작업 머신의 저장소 루트에서:
+
+```sh
+scripts/desktop-release/cut-release.sh <버전>   # 예: 0.9.2
+```
+
+이 한 번으로 다음이 이어진다.
+
+1. `rhwp-studio/package.json`·`src-tauri/tauri.conf.json`의 version을 맞춰 커밋하고
+   `studio-v<버전>` 태그를 fork(kseungyong/rhwp)에 push한다.
+2. fork의 GitHub Actions(`.github/workflows/desktop-release.yml`)가 Windows(NSIS
+   x64 설치 파일)와 macOS(dmg + .app.tar.gz 업데이트 패키지)를 빌드하고 minisign으로
+   서명한 뒤, `scripts/desktop-release/publish-to-portal.mjs`로
+   `portal.kdsys.co.kr/api/downloads/rhwp-studio/v<버전>/` 아래에 올린다.
+   latest.json은 모든 파일이 올라간 뒤 마지막에 올라간다.
+3. 직원 PC의 RHWP Studio는 시작 시(그리고 파일 메뉴의 "업데이트 확인"으로) 포털의
+   latest.json을 확인해 새 버전을 내려받아 설치한다. 포털 메인의
+   "RHWP Studio 설치 (Windows/macOS)" 카드는 항상 최신 설치 파일로 리다이렉트된다.
+
+필요한 fork 저장소 secrets (최초 1회):
+
+- `TAURI_SIGNING_PRIVATE_KEY` — 업데이트 서명 개인키(`~/.tauri/rhwp-studio-updater.key`,
+  암호 없음). **분실하면 기존 설치본에 업데이트를 배포할 수 없다** — 백업 필수.
+- `PORTAL_UPLOAD_TOKEN` — 포털 서버의 `DOWNLOADS_UPLOAD_TOKEN` 환경변수와 같은 값.
+- `WINDOWS_CERT_CER_B64` — (선택) 사내 배포용 공개 인증서(.cer)의 base64. 없으면 CI가
+  1회용 인증서로 번들 리소스 요건만 채운다(설치 훅의 certutil 등록 실패는 무해).
+
+버전은 semver 비교로 업데이트 판단을 하므로 **직전 릴리스보다 커야 한다**. 업스트림
+버전(0.9.x)과 같은 흐름을 유지하되, 앱만 다시 내보낼 때는 patch를 한 단계 올린다.
+
+---
+
+이하 수동 절차는 **전부 Windows 머신에서 실행한다** — Tauri의 NSIS 번들러가 Windows에서만 최종 `.exe`를
+만든다. 릴리스 담당자가 아래를 순서대로 수동 실행한다.
 
 빌드 머신이 **ARM64 Windows**(예: Apple Silicon Mac 위의 Parallels VM)라면 본문에 더해
 [부록 A](#부록-a-arm64-빌드-머신에서-x64-설치-파일-만들기)를 함께 따른다 — 기본 명령만 실행하면

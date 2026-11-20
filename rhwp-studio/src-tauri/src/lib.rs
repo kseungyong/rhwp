@@ -10,7 +10,13 @@ pub fn run() {
     // fs 런타임 스코프에 등록하므로 별도 정적 스코프 설정은 두지 않는다.
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_fs::init())
+    // 자동 업데이트 — 앱 시작 시 프런트엔드(desktop-updater.ts)가 GitHub Releases의
+    // latest.json을 확인해 새 버전을 내려받아 설치한다. process 플러그인은 설치 후
+    // 재시작(relaunch)에 쓴다.
+    .plugin(tauri_plugin_process::init())
     .setup(|app| {
+      #[cfg(desktop)]
+      app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()

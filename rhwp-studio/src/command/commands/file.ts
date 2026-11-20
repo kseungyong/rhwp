@@ -62,7 +62,8 @@ import {
   type SaveDocumentResult,
 } from '@/command/file-system-access';
 import { openDocumentViaPicker } from '../file-open-picker';
-import { getFileSystemWindow } from '@/command/desktop-file-system';
+import { getFileSystemWindow, isDesktopRuntime } from '@/command/desktop-file-system';
+import { checkForUpdates } from '@/command/desktop-updater';
 import { singleFlight } from '@/command/single-flight';
 import { PdfPrintDialog } from '@/ui/pdf-print-dialog';
 import { userSettings } from '@/core/user-settings';
@@ -935,6 +936,15 @@ export const fileCommands: CommandDef[] = [
     icon: 'icon-help',
     execute() {
       new AboutDialog().show();
+    },
+  },
+  {
+    // 데스크톱 셸 전용 — 웹에서는 메뉴 항목 자체가 숨겨진다(index.html hidden + main.ts).
+    id: 'file:check-update',
+    label: t('command.file.checkUpdate.label'),
+    canExecute: () => isDesktopRuntime(),
+    async execute() {
+      await checkForUpdates(false);
     },
   },
 ];

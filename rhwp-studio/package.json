@@ -113,13 +113,13 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
     "@types/chrome": "^0.3.7",
+    "ajv": "file:../vendor/npm/ajv",
     "cross-env": "^10.1.0",
     "puppeteer-core": "^25.17.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
     "vite-plugin-pwa": "^2.0.0",
-    "workbox-window": "^7.4.1",
-    "ajv": "file:../vendor/npm/ajv"
+    "workbox-window": "^7.4.1"
   },
   "overrides": {
     "serialize-javascript": "7.0.5",
@@ -134,6 +134,8 @@
     "@noble/hashes": "^2.4.0",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-fs": "^2.5.1",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
     "canvaskit-wasm": "^0.42.0",
     "pixelmatch": "^8.0.0",
     "pngjs": "^7.0.0"

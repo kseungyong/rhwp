@@ -55,6 +55,8 @@ jobs:
         shell: bash
         env:
           CERT_B64: ${{ secrets.WINDOWS_CERT_CER_B64 }}
+          # Git Bash(Windows)가 "/CN=..." 인자를 Windows 경로로 바꿔치기하지 않게 한다.
+          MSYS_NO_PATHCONV: '1'
         run: |
           mkdir -p rhwp-studio/src-tauri/packaging/cert
           dest="rhwp-studio/src-tauri/packaging/cert/rhwp-studio-cert.cer"
@@ -64,9 +66,10 @@ jobs:
           else
             # 번들 리소스 요건만 채우는 1회용 인증서 — 설치 훅의 certutil 등록이
             # 실패해도 설치는 계속되므로(installer-hooks.nsh) 무해하다.
-            openssl req -x509 -newkey rsa:2048 -keyout /tmp/ci-cert-key.pem \
-              -out /tmp/ci-cert.pem -days 30 -nodes -subj "/CN=RHWP Studio CI" 2>/dev/null
-            openssl x509 -in /tmp/ci-cert.pem -outform der -out "$dest"
+            openssl req -x509 -newkey rsa:2048 -keyout ci-cert-key.pem \
+              -out ci-cert.pem -days 30 -nodes -subj "/CN=RHWP Studio CI"
+            openssl x509 -in ci-cert.pem -outform der -out "$dest"
+            rm -f ci-cert-key.pem ci-cert.pem
             echo "secrets에 인증서가 없어 1회용 인증서를 만들었습니다."
           fi
 

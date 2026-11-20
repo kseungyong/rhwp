@@ -1,12 +1,14 @@
-# RHWP Studio 데스크톱 릴리스 — 사내 포털 자동 게시
+# RHWP Studio 데스크톱 릴리스 빌드
 #
 # `studio-v<버전>` 태그를 push하면 Windows(NSIS)·macOS(dmg) 설치 파일과 자동 업데이트
-# 패키지를 빌드해 portal.kdsys.co.kr 다운로드 센터로 올린다. 직원 PC의 RHWP Studio는
-# 포털의 latest.json을 보고 스스로 업그레이드한다.
+# 패키지를 빌드·서명해 workflow artifacts로 남긴다.
+#
+# 포털(portal.kdsys.co.kr)은 사내 DNS 전용이라 GitHub 러너가 접근할 수 없다 —
+# 게시는 사내 작업 머신에서 scripts/desktop-release/publish-from-ci.sh가 이 run의
+# artifacts를 내려받아 수행한다 (cut-release.sh가 태그 push 후 자동으로 이어서 실행).
 #
 # 필요한 저장소 secrets:
 # - TAURI_SIGNING_PRIVATE_KEY   업데이트 패키지 minisign 개인키 (암호 없음)
-# - PORTAL_UPLOAD_TOKEN         포털 업로드 토큰 (포털 서버의 DOWNLOADS_UPLOAD_TOKEN과 동일)
 # - WINDOWS_CERT_CER_B64        (선택) 사내 배포용 공개 인증서(.cer) base64 — 없으면
 #                               CI가 1회용 인증서를 만들어 번들 리소스 요건만 채운다.
 name: Desktop Release
@@ -108,25 +110,3 @@ jobs:
           name: desktop-${{ matrix.name }}
           path: ${{ matrix.bundle-paths }}
           if-no-files-found: error
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: 포털 다운로드 센터에 게시
-        env:
-          PORTAL_UPLOAD_TOKEN: ${{ secrets.PORTAL_UPLOAD_TOKEN }}
-        run: |
-          node scripts/desktop-release/publish-to-portal.mjs \
-            --version "${GITHUB_REF_NAME#studio-v}" --dir dist

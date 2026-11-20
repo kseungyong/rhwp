@@ -47,5 +47,7 @@ fi
 
 git tag "studio-v${ver}"
 git push fork "$(git rev-parse --abbrev-ref HEAD)" "studio-v${ver}"
-echo "완료 — fork의 GitHub Actions에서 빌드·게시가 진행됩니다:"
-echo "  https://github.com/kseungyong/rhwp/actions"
+echo "태그 push 완료 — fork의 GitHub Actions 빌드를 기다렸다가 포털에 게시합니다."
+echo "  (진행 상황: https://github.com/kseungyong/rhwp/actions)"
+
+exec "$root/scripts/desktop-release/publish-from-ci.sh" "$ver"

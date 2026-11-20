@@ -28,8 +28,11 @@ echo "태그 ${tag}의 빌드 run을 찾는 중..."
 run_id=""
 i=0
 while [ -z "$run_id" ]; do
-  run_id="$(gh run list -R "$repo" --workflow desktop-release.yml --branch "$tag" \
-    --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+  # --workflow <파일명> 조회는 워크플로가 저장소 기본 브랜치에 있어야만 동작한다(404).
+  # 태그에서 트리거된 run은 workflowName으로 걸러 찾는다.
+  run_id="$(gh run list -R "$repo" --branch "$tag" --limit 10 \
+    --json databaseId,workflowName \
+    --jq '[.[] | select(.workflowName == "Desktop Release")][0].databaseId // empty')"
   [ -n "$run_id" ] && break
   i=$((i + 1))
   [ "$i" -ge 30 ] && { echo "run이 생기지 않습니다 — 태그 push가 됐는지 확인하세요." >&2; exit 1; }

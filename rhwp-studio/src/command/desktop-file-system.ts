@@ -182,6 +182,17 @@ export function createDesktopFileSystemWindow(
   };
 }
 
+/**
+ * 다이얼로그를 거치지 않고 알려진 경로(파일 연결로 전달된 문서 등)의 핸들을 만든다.
+ * Tauri 셸이 해당 경로를 fs 스코프에 미리 등록했을 때만 읽기/쓰기가 허용된다.
+ */
+export function createDesktopFileHandle(
+  path: string,
+  bridge: TauriFileSystemBridge = tauriPluginBridge,
+): DesktopFileHandle {
+  return new DesktopFileHandle(path, bridge);
+}
+
 let desktopWindow: FileSystemWindowLike | null = null;
 
 /**

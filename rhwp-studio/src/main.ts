@@ -47,7 +47,8 @@ import { insertCommands } from '@/command/commands/insert';
 import { tableCommands } from '@/command/commands/table';
 import { pageCommands } from '@/command/commands/page';
 import { toolCommands } from '@/command/commands/tool';
-import { installPwaFileHandling, type FileHandlingWindowLike } from '@/command/pwa-file-handling';
+import { installPwaFileHandling, type FileHandlingWindowLike, type OpenDocumentBytesPayload } from '@/command/pwa-file-handling';
+import { installDesktopLaunchFileHandling } from '@/command/desktop-launch-file';
 import {
   isSupportedDocumentFileName,
   documentFileInputAccept,
@@ -932,23 +933,30 @@ async function initialize(): Promise<void> {
       if (chromeMode !== 'embed') await offerAutosaveRecoveryIfIdle();
       await openBlankDocumentIfIdle();
     })();
-    // embed 프로파일: PWA launch queue로 문서를 넘겨받는 진입도 문서 교체 경로이므로
-    // 설치하지 않는다.
+    // embed 프로파일: PWA launch queue/파일 연결로 문서를 넘겨받는 진입도 문서 교체
+    // 경로이므로 설치하지 않는다.
     if (chromeMode !== 'embed') {
-      installPwaFileHandling(window as FileHandlingWindowLike, {
-        openDocumentBytes(payload) {
+      const launchFileCallbacks = {
+        openDocumentBytes(payload: OpenDocumentBytesPayload) {
           eventBus.emit('open-document-bytes', payload);
         },
-        notifyUnsupportedFile(fileName) {
+        notifyUnsupportedFile(fileName: string) {
           showLoadError(new Error(`지원하지 않는 파일 형식입니다: ${fileName}. HWP/HWPX/HML 파일만 지원합니다.`));
         },
-        notifyError(error) {
+        notifyError(error: unknown) {
           showLoadErrorUnlessCancelled(error);
         },
-        notifyMultipleFiles(count) {
-          console.warn(`[pwa-file-handling] 여러 파일(${count}개)이 전달되어 첫 번째 파일만 엽니다.`);
+        notifyMultipleFiles(count: number) {
+          console.warn(`[launch-file] 여러 파일(${count}개)이 전달되어 첫 번째 파일만 엽니다.`);
         },
-      });
+      };
+      if (isDesktopRuntime()) {
+        // 데스크톱 셸: 파일 연결(더블클릭)로 전달된 경로를 Tauri 셸 큐/이벤트로 받는다.
+        installDesktopLaunchFileHandling(launchFileCallbacks)
+          .catch((error) => console.error('[launch-file] 파일 연결 열기 설치 실패', error));
+      } else {
+        installPwaFileHandling(window as FileHandlingWindowLike, launchFileCallbacks);
+      }
     }
 
     // E2E 테스트용 전역 노출 (개발 모드 전용)

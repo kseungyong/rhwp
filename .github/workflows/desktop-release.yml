@@ -28,18 +28,30 @@ jobs:
         include:
           - os: windows-latest
             name: windows
+            checkout-clean: true
+            rust-targets: wasm32-unknown-unknown
+            tauri-build-args: ''
             bundle-paths: |
               rhwp-studio/src-tauri/target/release/bundle/nsis/*.exe
               rhwp-studio/src-tauri/target/release/bundle/nsis/*.exe.sig
+          # macOS는 universal(arm64+x86_64) 단일 번들로 빌드한다 — Apple Silicon과
+          # 인텔 맥 모두 같은 dmg/업데이트 패키지를 쓴다.
           - os: macos-latest
             name: macos
+            checkout-clean: true
+            rust-targets: wasm32-unknown-unknown,x86_64-apple-darwin,aarch64-apple-darwin
+            tauri-build-args: '--target universal-apple-darwin'
             bundle-paths: |
-              rhwp-studio/src-tauri/target/release/bundle/dmg/*.dmg
-              rhwp-studio/src-tauri/target/release/bundle/macos/*.app.tar.gz
-              rhwp-studio/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+              rhwp-studio/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              rhwp-studio/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+              rhwp-studio/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 셀프호스티드(Windows): 이전 빌드의 target/·node_modules를 지우지 않고
+          # 재사용한다. 추적 파일은 fetch+reset으로 태그 시점과 일치한다.
+          clean: ${{ matrix.checkout-clean }}
 
       - name: 태그와 tauri.conf.json 버전 일치 확인
         shell: bash
@@ -75,7 +87,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: ${{ matrix.rust-targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -106,7 +118,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
-        run: npm run tauri:build
+        run: npm run tauri:build -- ${{ matrix.tauri-build-args }}
 
       - uses: actions/upload-artifact@v4
         with:

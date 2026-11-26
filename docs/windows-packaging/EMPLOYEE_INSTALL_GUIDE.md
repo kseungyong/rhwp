@@ -9,7 +9,8 @@ RHWP Studio는 한/글(HWP·HWPX) 문서를 여닫고 편집할 수 있는 사�
 사용 중인 PC에 맞는 카드를 클릭하면 최신 설치 파일이 바로 다운로드됩니다.
 
 - **RHWP Studio 설치 (Windows)** — `RHWP Studio_<버전>_x64-setup.exe`
-- **RHWP Studio 설치 (macOS)** — `RHWP Studio_<버전>_aarch64.dmg`
+- **RHWP Studio 설치 (macOS)** — `RHWP Studio_<버전>_universal.dmg`
+  (Apple Silicon·인텔 맥 공용)
 
 > macOS에서 처음 실행할 때 "확인되지 않은 개발자" 안내가 나오면, 응용 프로그램
 > 폴더에서 앱을 **마우스 오른쪽 클릭 → 열기**로 한 번만 실행해 주세요.

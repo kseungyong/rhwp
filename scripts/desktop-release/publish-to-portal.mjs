@@ -98,10 +98,15 @@ if (winSetup) {
 }
 if (macUpdate) {
   uploads.push([`${storePrefix}/${basename(macUpdate)}`, macUpdate]);
-  latest.platforms['darwin-aarch64'] = {
+  // universal(arm64+x86_64) 단일 패키지 — Tauri 업데이터는 darwin-<자기 아키텍처>
+  // 키를 먼저 찾으므로, 같은 패키지를 세 키 모두에 등록해 어느 맥에서도 찾게 한다.
+  const macPlatform = {
     signature: (await readFile(macSig, 'utf-8')).trim(),
     url: publicUrl(basename(macUpdate)),
   };
+  latest.platforms['darwin-aarch64'] = macPlatform;
+  latest.platforms['darwin-x86_64'] = macPlatform;
+  latest.platforms['darwin-universal'] = macPlatform;
 }
 if (macDmg) {
   uploads.push([`${storePrefix}/${basename(macDmg)}`, macDmg]);

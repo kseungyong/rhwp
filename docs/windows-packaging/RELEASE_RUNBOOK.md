@@ -19,8 +19,10 @@ scripts/desktop-release/cut-release.sh <버전>   # 예: 0.9.2
 1. `rhwp-studio/package.json`·`src-tauri/tauri.conf.json`의 version을 맞춰 커밋하고
    `studio-v<버전>` 태그를 fork(kseungyong/rhwp)에 push한다.
 2. fork의 GitHub Actions(`.github/workflows/desktop-release.yml`)가 Windows(NSIS
-   x64 설치 파일)와 macOS(dmg + .app.tar.gz 업데이트 패키지)를 빌드하고 minisign으로
-   서명해 workflow artifacts로 남긴다.
+   x64 설치 파일)와 macOS(universal dmg + .app.tar.gz 업데이트 패키지, Apple
+   Silicon·인텔 공용)를 빌드하고 minisign으로 서명해 workflow artifacts로 남긴다.
+   latest.json의 macOS 업데이트 키는 같은 universal 패키지를
+   `darwin-aarch64`/`darwin-x86_64`/`darwin-universal` 세 키에 모두 등록한다.
 3. 같은 명령이 이어서 `scripts/desktop-release/publish-from-ci.sh`를 실행한다 —
    빌드 완료를 기다려 artifacts를 내려받고 `publish-to-portal.mjs`로
    `portal.kdsys.co.kr/api/downloads/rhwp-studio/v<버전>/` 아래에 올린다.

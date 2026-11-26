@@ -26,9 +26,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # Windows는 사내 셀프호스티드 러너에서 빌드한다 — GitHub 호스티드 러너의
+          # 콜드 캐시 때문에 매 릴리스 20~40분이 걸리던 것을 줄이기 위함.
+          # 작업 디렉터리를 유지(checkout-clean: false)해 Cargo/target 증분 빌드를
+          # 재사용하므로 rust-cache 업로드도 생략한다.
+          - os: [self-hosted, Windows, X64]
             name: windows
-            checkout-clean: true
+            checkout-clean: false
             rust-targets: wasm32-unknown-unknown
             tauri-build-args: ''
             bundle-paths: |
@@ -90,6 +94,8 @@ jobs:
           targets: ${{ matrix.rust-targets }}
 
       - uses: Swatinem/rust-cache@v2
+        # 셀프호스티드 러너는 작업 디렉터리의 target이 그대로 남으므로 캐시가 불필요하다.
+        if: matrix.name == 'macos'
         with:
           workspaces: |
             . -> target

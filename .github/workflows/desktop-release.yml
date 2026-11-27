@@ -93,6 +93,14 @@ jobs:
         with:
           targets: ${{ matrix.rust-targets }}
 
+      # 저장소의 rust-toolchain.toml이 버전을 고정하므로, 위 액션이 stable에 설치한
+      # 타깃은 실제 빌드에 쓰이지 않는다 — 고정 툴체인에도 타깃을 추가한다.
+      - name: 고정 툴체인에 빌드 타깃 추가
+        shell: bash
+        env:
+          RUST_TARGETS: ${{ matrix.rust-targets }}
+        run: rustup target add ${RUST_TARGETS//,/ }
+
       - uses: Swatinem/rust-cache@v2
         # 셀프호스티드 러너는 작업 디렉터리의 target이 그대로 남으므로 캐시가 불필요하다.
         if: matrix.name == 'macos'
